@@ -10,8 +10,9 @@ joint keeps its sign when its counterpart's axis equals the reflected axis and f
 joints flip, pitch joints keep); signs are read from the model's joint axes, not typed in. Observations
 (Unitree deploy layout, see tasks/g1_tensor_math.deploy_observation): angular velocity (−x, y, −z), gravity
 (x, −y, z), command (vx, −vy, −yaw rate), gait phase half a cycle later (−sin, −cos: the right foot runs half a
-cycle after the left), joint positions, velocities and last action by the joint map; critic extras: linear
-velocity (x, −y, z) and height.
+cycle after the left), joint positions, velocities and last action by the joint map; the height command as it is,
+the upper-body slot's flag as it is and its waist and arm targets by the joint map; critic extras: linear velocity
+(x, −y, z) and height.
 """
 import numpy as np
 import torch
@@ -46,16 +47,30 @@ class Mirror:
         raw = env.unwrapped
         if not getattr(raw, 'real_robot', False):
             raise ValueError('Зеркальная потеря есть только для профиля real_robot (раскладка наблюдений Unitree)')
+        from .tasks import g1_tensor_math as task
         permutation, signs = joint_mirror(env)
         n = len(permutation)
         index, sign = list(range(11)), [-1, 1, -1, 1, -1, 1, 1, -1, -1, -1, -1]
         for block in range(3):  # joint positions, joint velocities, last action
             index += list(11 + block * n + permutation)
             sign += list(signs)
+        for name, size in getattr(raw, 'extra_terms', ()):  # task_config height_command, upper_body_slot
+            start = len(index)
+            if name == task.HEIGHT_TERM:  # a height is the same on either side
+                index.append(start)
+                sign.append(1)
+            elif name == task.UPPER_BODY_TERM and size == 1 + n - task.UPPER_BODY_FIRST and all(
+                    permutation[task.UPPER_BODY_FIRST:] >= task.UPPER_BODY_FIRST):
+                index.append(start)  # the flag
+                sign.append(1)
+                for joint in range(task.UPPER_BODY_FIRST, n):  # waist and arm targets relative to home, as joints
+                    index.append(start + 1 + int(permutation[joint]) - task.UPPER_BODY_FIRST)
+                    sign.append(signs[joint])
+            else:
+                raise ValueError(f'Зеркало не знает терма {name}')
         history = getattr(raw, 'history', 1)
         if history > 1:  # each term holds its frames oldest first (task.history_observation); mirror every frame
-            from .tasks.g1_tensor_math import history_index
-            position = history_index(n, history)
+            position = task.history_index(n, history, getattr(raw, 'extra_sizes', ()))
             frame_index, frame_sign = index, sign
             index, sign = [0] * (history * len(frame_index)), [0] * (history * len(frame_index))
             for frame in range(history):

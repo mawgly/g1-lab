@@ -66,7 +66,9 @@ def make_learner(config, stage=None):
         for group in model.policy.optimizer.param_groups:
             group['lr'] = config['learning_rate']
         env = backends().make(robot_id, task_id, 'full_gpu', n_envs=config['envs'], seed=config['seed'], **task_config)
-        norm = TensorNormalize(env.observation_space.shape, config['envs'], env.device, config['gamma'])
+        # Columns with set statistics (G1 height_command / upper_body_slot terms) stay frozen.
+        norm = TensorNormalize(env.observation_space.shape, config['envs'], env.device, config['gamma'],
+                               fixed=getattr(base.envs[0].unwrapped, 'fixed_normalization', None))
         if stage:
             norm.import_normalizer(export)
         model.n_envs = config['envs']

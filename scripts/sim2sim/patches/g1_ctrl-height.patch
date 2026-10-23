@@ -1,0 +1,39 @@
+--- a/deploy/include/isaaclab/envs/mdp/observations/observations.h
++++ b/deploy/include/isaaclab/envs/mdp/observations/observations.h
+@@ -122,6 +122,36 @@ REGISTER_OBSERVATION(velocity_commands)
+     return obs;
+ }
+
++// sim2sim patch (humanoid_sim iteration 28, task_config height_command / upper_body_slot): the pelvis height command
++// c = nominal + (nominal - lowest) * min(0, ry) from the right stick's vertical axis (free: velocity_commands reads
++// ly, lx and rx; the SDK's Axis smooths it by 0.03 as the left stick), at least walking_lowest while the velocity
++// command's norm is at least walking_norm (a walking crouch only down to there); the term reads c - nominal, 0 with
++// the stick centred or up. Params from humanoid_sim.export_g1.height_params (deploy.yaml).
++REGISTER_OBSERVATION(height_command)
++{
++    const float nominal = params["nominal"].as<float>(0.78f);
++    const float lowest = params["lowest"].as<float>(0.64f);
++    const float walking_lowest = params["walking_lowest"].as<float>(0.70f);
++    const float walking_norm = params["walking_norm"].as<float>(0.1f);
++    auto & joystick = env->robot->data.joystick;
++    float height = nominal + (nominal - lowest) * std::min(0.0f, static_cast<float>(joystick->ry()));
++    auto cmd = isaaclab::mdp::velocity_commands(env, params);
++    float cmd_norm = std::sqrt(cmd[0] * cmd[0] + cmd[1] * cmd[1] + cmd[2] * cmd[2]);
++    if (cmd_norm >= walking_norm)
++    {
++        height = std::max(height, walking_lowest);
++    }
++    height = std::clamp(height, lowest, nominal);
++    return std::vector<float>{height - nominal};
++}
++
++// sim2sim patch: the reserved upper-body slot of task_config upper_body_slot (a flag and the 17 waist and arm
++// targets), always 0 in this contract.
++REGISTER_OBSERVATION(upper_body_command)
++{
++    return std::vector<float>(params["size"].as<int>(18), 0.0f);
++}
++
+ REGISTER_OBSERVATION(gait_phase)
+ {
+     float period = params["period"].as<float>();

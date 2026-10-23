@@ -12,9 +12,11 @@ def test_catalog_describes_task_fields_and_defaults():
     from humanoid_sim.tasks.config import G1_COMMANDS, G1_GAIT, G1_REWARD_WEIGHTS
     assert [f['key'] for f in fields]==['real_robot', 'critic_extras', 'history', 'training_realism', 'heading_hold',
                                          'stand_heading_hold', 'side_heading_hold', 'phase_stop', 'sole_contact',
-                                         'feet_flat_stance', 'random_phase', 'action_delay', 'arm_perturb', 'force_push',
+                                         'feet_flat_stance', 'random_phase', 'action_delay', 'arm_perturb',
+                                         'arm_perturb_radians', 'arm_perturb_contact_mask', 'force_push',
                                          'motor_friction', 'lock_wrists', 'knee_floor', 'foot_collision',
-                                         'action_limit', *G1_COMMANDS, *G1_GAIT, *G1_REWARD_WEIGHTS]
+                                         'height_command', 'upper_body_slot', 'action_limit', *G1_COMMANDS, *G1_GAIT,
+                                         *G1_REWARD_WEIGHTS]
     assert fields[0]['type']=='bool' and fields[0]['default'] is False  # simulation profile by default
     assert fields[1]['type']=='bool' and fields[1]['default'] is False
     assert fields[2]['default']==1 and fields[2]['min']==1 and fields[2]['max']==10  # no history by default
@@ -28,18 +30,23 @@ def test_catalog_describes_task_fields_and_defaults():
     assert fields[10]['type']=='bool' and fields[10]['default'] is True  # new runs: episodes start on either foot
     assert fields[11]['default']==0 and fields[11]['min']==0 and fields[11]['max']==.05  # no action delay unless asked
     assert fields[12]['default']==0 and fields[12]['min']==0 and fields[12]['max']==.5  # no arm perturbation unless asked
-    assert fields[13]['default']==0 and fields[13]['min']==0 and fields[13]['max']==2  # no force pushes unless asked
-    assert fields[14]['default']==0 and fields[14]['min']==0 and fields[14]['max']==2  # measured motor friction unless asked
-    assert fields[15]['type']=='bool' and fields[15]['default'] is False  # the policy drives the wrists unless asked
+    # The original arm poses (±0.4 rad) and every arm contact charged unless asked.
+    assert fields[13]['default']==.4 and fields[13]['min']==.1 and fields[13]['max']==1.6
+    assert fields[14]['type']=='bool' and fields[14]['default'] is False
+    assert fields[15]['default']==0 and fields[15]['min']==0 and fields[15]['max']==2  # no force pushes unless asked
+    assert fields[16]['default']==0 and fields[16]['min']==0 and fields[16]['max']==2  # measured motor friction unless asked
+    assert fields[17]['type']=='bool' and fields[17]['default'] is False  # the policy drives the wrists unless asked
     # No knee floor unless asked: a number field the browser may leave empty (null).
-    assert 'type' not in fields[16] and fields[16]['default'] is None and (fields[16]['min'],fields[16]['max'])==(0,1)
-    assert fields[17]['type']=='bool' and fields[17]['default'] is False  # the feet pass through each other unless asked
-    assert fields[18]['group'] is None and fields[18]['default']==1  # the original action contract by default
+    assert 'type' not in fields[18] and fields[18]['default'] is None and (fields[18]['min'],fields[18]['max'])==(0,1)
+    assert fields[19]['type']=='bool' and fields[19]['default'] is False  # the feet pass through each other unless asked
+    # No height command and no upper-body slot unless asked (the original observation layout).
+    assert all(fields[k]['type']=='bool' and fields[k]['default'] is False for k in (20, 21))
+    assert fields[22]['group'] is None and fields[22]['default']==1  # the original action contract by default
     assert next(f for f in fields if f['key']=='action_change')['default']==.01
     assert next(f for f in fields if f['key']=='torso')['default']==2  # recommended for new experiments
-    weights=fields[19+len(G1_COMMANDS)+len(G1_GAIT):]
+    weights=fields[23+len(G1_COMMANDS)+len(G1_GAIT):]
     assert all(f['group']=='reward_weights' and f['min']==0 and f['max']==100 for f in weights)
-    assert [(f['group'],f['default']) for f in fields[19:19+len(G1_COMMANDS)]]==[('commands',v) for v in G1_COMMANDS.values()]
+    assert [(f['group'],f['default']) for f in fields[23:23+len(G1_COMMANDS)]]==[('commands',v) for v in G1_COMMANDS.values()]
     assert next(r for r in robots if r['robot_id']=='so101')['tasks'][0]['parameters']==[]
 
 
@@ -72,9 +79,11 @@ def test_task_config_rejects_unknown_nonfinite_and_wrong_task_parameters():
                                                   'real_robot':False,'critic_extras':False,'training_realism':1.,
                                                   'history':1,'stand_heading_hold':True,'phase_stop':False,
                                                   'sole_contact':False,'random_phase':False,'action_delay':0.,
-                                                  'arm_perturb':0.,'lock_wrists':False,'knee_floor':None,
+                                                  'arm_perturb':0.,'arm_perturb_radians':.4,
+                                                  'arm_perturb_contact_mask':False,'lock_wrists':False,'knee_floor':None,
                                                   'force_push':0.,'feet_flat_stance':False,'foot_collision':False,
-                                                  'side_heading_hold':True,'motor_friction':0.}
+                                                  'side_heading_hold':True,'motor_friction':0.,
+                                                  'height_command':False,'upper_body_slot':False}
     for history in (0, 2.5, 11):  # whole frames in [1, 10], and only for the real-robot profile
         with pytest.raises(ValueError):
             validate_config({**base,'task_config':{'real_robot':True,'history':history}})
@@ -89,7 +98,8 @@ def test_task_config_rejects_unknown_nonfinite_and_wrong_task_parameters():
         validate_config({**base,'task_config':{'heading_hold':1}})
     narrowed=validate_config({**base,'task_config':{'commands':{'min_speed':.3,'max_speed':1}}})['task_config']
     assert narrowed['commands']=={'min_speed':.3,'max_speed':1.,'stand_probability':.2,'lateral_speed':0.,'yaw_rate':0.,
-                                  'straight_probability':0.,'side_share':0.,'side_stop':0.,'side_speed':0.}
+                                  'straight_probability':0.,'side_share':0.,'side_stop':0.,'side_speed':0.,
+                                  'crouch_share':[0.,0.],'crouch_min':[.64,.70],'crouch_speed':1.}
     for commands in ({'min_speed':1.2,'max_speed':1.}, {'max_speed':2.5}, {'stand_probability':-.1}, {'min_speed':-1.5},
                      {'max_speed':float('inf')}, {'turn':1}):
         with pytest.raises(ValueError):

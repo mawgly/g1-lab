@@ -5,6 +5,7 @@ Torch dispatch between steps is deliberately retained for correctness first.
 """
 import numpy as np
 import torch
+from .tasks.config import CROUCH_HEIGHTS
 from .tasks.g1_velocity import G1VelocityEnv
 from .tasks import g1_tensor_math as task
 from .tasks.g1_tensor_math import observation, reward_components, pd_torque, body_velocity
@@ -31,7 +32,8 @@ class TensorG1Env:
                  randomize=None, critic_extras=False, training_realism=1., history=1, stand_heading_hold=True,
                  phase_stop=False, sole_contact=False, random_phase=False, action_delay=0., arm_perturb=0.,
                  lock_wrists=False, knee_floor=None, force_push=0., feet_flat_stance=False, foot_collision=False,
-                 side_heading_hold=True, motor_friction=0.):
+                 side_heading_hold=True, motor_friction=0., height_command=False, upper_body_slot=False,
+                 arm_perturb_radians=task.ARM_PERTURB_RADIANS, arm_perturb_contact_mask=False):
         if type(n_envs) is not int or n_envs < 1 or type(max_episode_steps) is not int or max_episode_steps < 1:
             raise ValueError('n_envs and max_episode_steps must be positive integers')
         if not torch.cuda.is_available():
@@ -52,7 +54,9 @@ class TensorG1Env:
                                              arm_perturb=arm_perturb, lock_wrists=lock_wrists, knee_floor=knee_floor,
                                              force_push=force_push, feet_flat_stance=feet_flat_stance,
                                              foot_collision=foot_collision, side_heading_hold=side_heading_hold,
-                                             motor_friction=motor_friction)
+                                             motor_friction=motor_friction, height_command=height_command,
+                                             upper_body_slot=upper_body_slot, arm_perturb_radians=arm_perturb_radians,
+                                             arm_perturb_contact_mask=arm_perturb_contact_mask)
         # Warp gets the reference's model (put_model below), so foot_collision's capsules, their contact filter and
         # the sole spheres are the CPU task's; a foot-foot contact is a robot-robot one for self_contact.
         # Curriculum: 0 = no noise, randomisation or pushes; 1 = Unitree's full training setup.
@@ -134,6 +138,9 @@ class TensorG1Env:
         self.perturb_action = torch.zeros((n_envs,ref.model.nu),device=self.device)
         self._arm_perturb_sum = torch.zeros((),device=self.device)  # perturbed world-steps, for rollout_metrics
         self._arm_perturb_count = 0
+        # arm_perturb_contact_mask: per world, whether this control step's arms follow a segment, so the contacts
+        # touching an arm link leave its self_contact share (task.self_contact_pairs; the CPU task's arm_contacts_masked).
+        self.arm_contacts_masked = torch.zeros(n_envs,dtype=torch.bool,device=self.device)
         # lock_wrists: the wrist pitch and yaw joints, whose applied action is always 0 (task.lock_joints).
         self.lock_wrists = ref.lock_wrists
         self.wrist_mask = constant(ref.wrist_mask,torch.bool)
@@ -152,6 +159,19 @@ class TensorG1Env:
         # set_motor_friction (tests, probes) also runs this path without the setting; then a reset puts m back to 1.
         self.motor_frictions = ref.motor_friction > 0
         self.friction_scale = torch.ones(n_envs,device=self.device)
+        # height_command: per world the pelvis height command c, drawn with self.generator at its reset and at each
+        # command change (task.height_draw, after the command's draws), an observation term and the reward's height,
+        # fall and stand pose (task.stand_target on the crouch joints); set_height (tests, probes) fixes it. BASE_HEIGHT
+        # and unused without the setting. Crouched world-steps and their pelvis above c, for rollout_metrics.
+        self.crouch = ref.height_command
+        self.height_command = torch.full((n_envs,),task.BASE_HEIGHT,device=self.device)
+        self.crouch_joints = constant(ref.crouch_joints,torch.long)
+        self.crouch_settings = {key: ref.commands[key] for key in ('crouch_share','crouch_min','crouch_speed')}
+        self._crouch_sum = torch.zeros((),device=self.device)
+        self._height_excess_sum = torch.zeros((),device=self.device)
+        self._crouch_count = 0
+        # Fixed normalization of the extra terms (the CPU task's), for TensorNormalize.
+        self.fixed_normalization = ref.fixed_normalization
         self._worlds = torch.arange(n_envs,device=self.device)
         self.returns = torch.zeros(n_envs,device=self.device)
         self.last_episode_lengths, self.last_episode_returns = self.lengths.clone(), self.returns.clone()
@@ -215,6 +235,8 @@ class TensorG1Env:
                 self.nacon = wp.to_torch(self.data.nacon)
                 self._contact_slots = torch.arange(naconmax,device=self.device)
                 self.robot_geoms = constant(ref.robot_geoms,torch.bool)
+                # arm_perturb_contact_mask: the arm links' geoms, whose contacts a perturbed world does not count.
+                self.arm_geoms = constant(ref.arm_geoms,torch.bool) if ref.arm_perturb_contact_mask else None
                 # Largest robot-robot contact force at each substep of the current step, (n_envs, frame_skip).
                 if ref.reward_weights['self_contact']:
                     self.self_contact_force = torch.zeros((n_envs,ref.frame_skip),device=self.device)
@@ -246,13 +268,18 @@ class TensorG1Env:
     def _contact_forces(self):
         """Decodes the last physics step's contact forces once: (robot-robot, foot-foot) per world, each the largest
         contact force norm (N) between two robot geoms (the GPU side of the CPU task's _self_contact_force; None
-        unless self_contact is weighted) and between a left and a right foot capsule (None without foot_collision)."""
+        unless self_contact is weighted; with arm_perturb_contact_mask a world in an arm perturbation segment leaves out
+        the contacts touching an arm link, task.self_contact_pairs) and between a left and a right foot capsule (None
+        without foot_collision)."""
         self.wp.capture_launch(self.contact_force_graph)
         geom = self.contact_geom.long()
         live = (self._contact_slots < self.nacon) & (geom >= 0).all(dim=1)
         geom = geom.clamp(min=0)
-        robot = None if self.self_contact_force is None else self._largest_contacts(
-            live & self.robot_geoms[geom].all(dim=1))
+        robot = None
+        if self.self_contact_force is not None:
+            masked = () if self.arm_geoms is None else (  # each slot's world (stale slots: any, they are not live)
+                self.arm_geoms, self.arm_contacts_masked[self.contact_world.long().clamp(0,self.n_envs-1)])
+            robot = self._largest_contacts(live & task.self_contact_pairs(geom,self.robot_geoms,*masked))
         feet = None if self.foot_contact_force is None else self._largest_contacts(
             live & (self.foot_side[geom[:,0]]*self.foot_side[geom[:,1]] < 0))
         return robot, feet
@@ -281,6 +308,9 @@ class TensorG1Env:
             rotation[:,2,:] = noise(rotation[:,2,:], NOISE['gravity'])  # projected gravity is -rotation[:,2,:]
         observed = task.deploy_observation(velocity,rotation,command,position,joint_velocity,self.home,
                                            self.previous_action,self._phase(),phase_stop=self.reference.phase_stop)
+        if self.reference.extra_terms:  # height_command [c − 0.78] (never noised, as the command), upper_body_slot zeros
+            observed = torch.cat((observed,task.command_terms(self.height_command if self.crouch else None,
+                                                              self.reference.upper_body_slot,observed)),dim=1)
         if self.history > 1:
             if history == 'fill':
                 fresh = observed[:,None].expand(-1,self.history,-1)
@@ -289,7 +319,7 @@ class TensorG1Env:
                 self.frames = torch.cat((self.frames[:,1:],observed[:,None]),dim=1)
             else:
                 self.frames[:,-1] = observed
-            observed = task.history_observation(self.frames,self.previous_action.shape[1])
+            observed = task.history_observation(self.frames,self.previous_action.shape[1],self.reference.extra_sizes)
         if self.reference.critic_extras:  # exact, never noised: only the critic reads them
             observed = torch.cat((observed, task.critic_extras(velocity, self.qpos[:,2])), dim=1)
         return observed
@@ -335,6 +365,9 @@ class TensorG1Env:
             scale = (task.motor_friction_draw(self._uniform,self.n_envs,self.reference.motor_friction)
                      if self.reference.motor_friction else torch.ones_like(self.friction_scale))
             self.friction_scale.copy_(torch.where(mask,scale,self.friction_scale))
+        if self.crouch:  # after every other draw, for the commands just drawn; nothing without height_command
+            height = task.height_draw(self._uniform,self.command,**self.crouch_settings)
+            self.height_command.copy_(torch.where(mask,height,self.height_command))
         self.returns.masked_fill_(mask,0)
         self.wp.capture_launch(self.forward_graph)
 
@@ -396,6 +429,18 @@ class TensorG1Env:
         self.friction_scale.copy_(scale)
         self.motor_frictions = True
 
+    def set_height(self, height):
+        """Fix every world's pelvis height command c (m, (n_envs,) or one number, within config.CROUCH_HEIGHTS) until
+        its next reset or, with resample_commands, its next command change (tests, probes), as the CPU task's
+        set_height; height_command only. The next observation shows it."""
+        if not self.crouch:
+            raise ValueError('a height command needs task_config height_command')
+        height = torch.as_tensor(height,dtype=torch.float32,device=self.device).expand(self.n_envs)
+        low, high = CROUCH_HEIGHTS
+        if not bool(torch.isfinite(height).all()) or bool((height < low).any()) or bool((height > high).any()):
+            raise ValueError(f'expected heights in [{low:g}, {high:g}] m')
+        self.height_command.copy_(height)
+
     @torch.no_grad()
     def step(self, actions):
         if actions.device != self.device or actions.shape != self.previous_action.shape:
@@ -410,11 +455,14 @@ class TensorG1Env:
                 # observed previous action). PPO keeps the policy's own for its log-probability.
                 if self.reference.arm_perturb:
                     steps,held = task.arm_perturb_draw(self.perturb_steps,self.perturb_action,self._uniform,
-                                                       self.reference.arm_perturb,self.dt,self.scale,limit)
+                                                       self.reference.arm_perturb,self.dt,self.scale,limit,
+                                                       self.reference.arm_perturb_radians)
                     self.perturb_steps.copy_(steps)
                     self.perturb_action.copy_(held)
                 action = task.arm_perturb_apply(action,self.perturb_steps,self.perturb_action,self.arm_mask)
                 perturbed = self.perturb_steps > 0
+                if self.reference.arm_perturb_contact_mask:  # this step's arm contacts leave self_contact
+                    self.arm_contacts_masked.copy_(perturbed)
                 self._arm_perturb_sum.add_(perturbed.sum())
                 self._arm_perturb_count += self.n_envs
                 self.perturb_steps.sub_(perturbed.long())
@@ -496,6 +544,14 @@ class TensorG1Env:
                 arm_press = task.arm_press(target,self.qpos[:,self.qadr],self.arm_joints)
                 self._arm_press_sum.add_(arm_press.sum())
                 self._arm_press_count += self.n_envs
+            height_command = stand_home = None
+            if self.crouch:  # the height command observed with the action (it changes only below, or by set_height)
+                height_command = self.height_command.clone()
+                stand_home = task.stand_target(self.home,height_command,self.crouch_joints)
+                crouched = height_command < task.BASE_HEIGHT
+                self._crouch_sum.add_(crouched.sum())
+                self._height_excess_sum.add_(((self.qpos[:,2]-height_command).clamp(min=0)*crouched).sum())
+                self._crouch_count += self.n_envs
             # Rewarded for the command observed when the action was chosen (set by the previous _obs()).
             components,terminated = reward_components(velocity,self.xmat[:,self.pelvis].reshape(-1,3,3),
                 self.qpos[:,2],self.observed_command.clone(),self.ctrl,action,self.previous_action,
@@ -509,7 +565,8 @@ class TensorG1Env:
                              if self.reference.sole_contact or self.reference.reward_weights['clearance']
                              else None),sole_contact=self.reference.sole_contact,
                 yaw_drift_error=yaw_drift,requested_command=self.command.clone(),self_contact=self_contact,
-                arm_press=arm_press,feet_flat_stance=self.reference.feet_flat_stance)
+                arm_press=arm_press,feet_flat_stance=self.reference.feet_flat_stance,height_command=height_command,
+                stand_home=stand_home)
             reward = sum(components.values())
             self.previous_action.copy_(action)
             if self.delay_depth:
@@ -526,6 +583,9 @@ class TensorG1Env:
                     here = task.heading(self.xmat[:,self.pelvis].reshape(-1,3,3)).to(self.heading_target.dtype)
                     straight = resample & task.straight_walking(fresh)
                     self.heading_target.copy_(torch.where(straight,here,self.heading_target))
+                if self.crouch:  # a new height for each new command, after the command's draws
+                    height = task.height_draw(self._uniform,fresh,**self.crouch_settings)
+                    self.height_command.copy_(torch.where(resample,height,self.height_command))
             terminal_obs = self._obs('push')
             self.returns.add_(reward)
             truncated = self.lengths >= self.max_episode_steps
@@ -542,12 +602,15 @@ class TensorG1Env:
         """Task means since the last call, for the training log (TensorPPO.collect reads them once per rollout):
         rollout/yaw_drift_abs, mean |e| of the yaw_drift term over steps on straight commands, while it is on;
         rollout/self_contact, mean share of physics substeps with a self-contact above the threshold, while that
-        term is on; rollout/foot_contact, share of world-steps with a contact between the two feet's capsules above
+        term is on (as the reward counts it: with arm_perturb_contact_mask, perturbed world-steps without their arm
+        contacts); rollout/foot_contact, share of world-steps with a contact between the two feet's capsules above
         the threshold in any substep (task.contact_step), while foot_collision is on (those contacts are in
         rollout/self_contact too); rollout/arm_press, mean Σ over the arm joints of (PD target − angle)² per
         world-step (rad², unweighted), while that term is on; rollout/arm_perturb, share of world-steps whose arms
         followed a perturbation segment, while arm_perturb is on; rollout/motor_friction, the worlds' mean motor
-        friction multiplier now, while motor_friction is on."""
+        friction multiplier now, while motor_friction is on; rollout/crouch_share, share of world-steps under a crouch
+        command (c < 0.78), and rollout/height_excess, mean max(0, h − c) (m) over those world-steps, while
+        height_command is on."""
         metrics = {}
         if self.reference.reward_weights['yaw_drift']:
             count = self._yaw_drift_count.item()
@@ -576,6 +639,13 @@ class TensorG1Env:
             self._arm_perturb_count = 0
         if self.reference.motor_friction:
             metrics['rollout/motor_friction'] = self.friction_scale.mean().item()
+        if self.crouch:
+            crouched = self._crouch_sum.item()
+            metrics['rollout/crouch_share'] = crouched / self._crouch_count if self._crouch_count else float('nan')
+            metrics['rollout/height_excess'] = self._height_excess_sum.item() / crouched if crouched else float('nan')
+            self._crouch_sum.zero_()
+            self._height_excess_sum.zero_()
+            self._crouch_count = 0
         return metrics
 
     def check_health(self):

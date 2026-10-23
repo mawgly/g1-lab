@@ -21,6 +21,12 @@ Every scenario starts the same way (Passive -> FixStand on the band -> Velocity 
   push       pushes on the pelvis forward, back, left, right (--push-order), --push-pause s apart: dv 0.5 m/s,
              then 1.0 m/s (--push-strength), or one series per --push-dv value (0.5-2.25 m/s in steps of 0.25);
              standing, or walking --walk m/s with --push-walking (needs the unitree_mujoco push patch, PUSH_KEYS)
+  crouch     the height command (iteration 28; g1_ctrl with patches/g1_ctrl-height.patch and a height export):
+             standing 0.70 m 8 s, 0.64 m 8 s, back to 0.78 m 4 s, then walking 0.5 and 1 m/s at 0.70 m, 10 s each,
+             and stand at 0.78 m (the right stick down: c = 0.78 + 0.14 min(0, ry), at least 0.70 while walking)
+--ry holds the right stick's vertical axis (-1..1, down negative: a crouch) through the commanded part of the other
+scenarios (walk: while walking); segments with the stick down are named <name>@<height> (the standing height; the
+patch keeps a walk at 0.70 m or above).
 Every action is logged with time.monotonic_ns() (CLOCK_MONOTONIC, same clock as sim2sim_probe); a
 `seg` event (value name:vx:vy:wz) starts each commanded segment, which lasts until the next event; a
 `push` event (value direction:dv) follows each push key.
@@ -44,8 +50,13 @@ AXIS_LX = 0
 AXIS_LY = 1
 AXIS_LT = 2
 AXIS_RX = 3
+AXIS_RY = 4
 AXIS_RT = 5
 AXIS_DY = 7
+# Height command of g1_ctrl-height.patch: c = NOMINAL_HEIGHT + CROUCH_DEPTH * min(0, ry), the export's height_params
+# for crouch_min 0.64 (deploy.yaml observations.height_command.params).
+NOMINAL_HEIGHT = 0.78
+CROUCH_DEPTH = 0.14
 
 PAUSE = 3.0  # s standing between the commanded segments of a scenario
 
@@ -72,6 +83,16 @@ def push_modifiers(dv):
 def push_dvs(text):
     """--push-dv: comma-separated dv of each series, m/s."""
     return [float(value) for value in text.split(',')]
+
+
+def stick_for(height):
+    """The right stick's vertical axis for a pelvis height command (m) of g1_ctrl-height.patch, -1..0."""
+    return max(-1.0, min(0.0, (height - NOMINAL_HEIGHT) / CROUCH_DEPTH))
+
+
+def height_of(ry):
+    """The height command (m) the patch makes of a right stick ry, standing."""
+    return NOMINAL_HEIGHT + CROUCH_DEPTH * min(0.0, ry)
 
 
 class Gamepad:
@@ -148,9 +169,15 @@ class Keys:
 
 
 def segments(args):
-    """Commanded part of a scenario after the band is off: (name, vx, vy, wz, seconds)."""
+    """Commanded part of a scenario after the band is off: (name, vx, vy, wz, seconds[, ry]); ry (the right stick's
+    vertical axis) is --ry where not given."""
     stand = [('stand', 0., 0., 0., args.stand_seconds)]
     v, w, s = args.walk, args.yaw, args.side
+    if args.scenario == 'crouch':
+        low, lowest = stick_for(0.70), stick_for(0.64)
+        return stand + [('crouch', 0., 0., 0., 8., low), ('crouch', 0., 0., 0., 8., lowest),
+                        ('rise', 0., 0., 0., 4., 0.), ('walk', 0.5, 0., 0., 10., low), ('walk', 1.0, 0., 0., 10., low),
+                        ('stop', 0., 0., 0., args.after_seconds, 0.)]
     if args.scenario == 'turn':
         return stand + [('turn_stand', 0., 0., w, 5.), ('stop', 0., 0., 0., PAUSE),
                         ('turn_stand', 0., 0., -w, 5.), ('stop', 0., 0., 0., PAUSE),
@@ -200,11 +227,13 @@ class Scenario:
         time.sleep(0.1)
         self.pad.axis(trigger_axis, 0)
 
-    def stick(self, vx, vy, wz):
-        """velocity_commands = (ly, -lx, -rx) in g1_ctrl; ly = -axis 1, lx = axis 0, rx = axis 3 (/ 32768)."""
+    def stick(self, vx, vy, wz, ry=0.):
+        """velocity_commands = (ly, -lx, -rx) in g1_ctrl; ly = -axis 1, lx = axis 0, rx = axis 3 (/ 32768); the
+        height command (g1_ctrl-height.patch) reads ry = -axis 4."""
         self.pad.axis(AXIS_LY, -vx * AXIS_SCALE)
         self.pad.axis(AXIS_LX, -vy * AXIS_SCALE)
         self.pad.axis(AXIS_RX, -wz * AXIS_SCALE)
+        self.pad.axis(AXIS_RY, -ry * AXIS_SCALE)
 
     def fixstand(self, name):
         # Passive -> FixStand: LT + up.on_pressed (deploy/robots/g1/config/config.yaml)
@@ -235,15 +264,20 @@ class Scenario:
             time.sleep(args.stand_seconds)
             # Forward: ly = -axis/32768, velocity_commands obs[0] = ly (no scaling, clamped to lin_vel_x)
             self.pad.axis(AXIS_LY, -args.walk * AXIS_SCALE)
+            self.pad.axis(AXIS_RY, -args.ry * AXIS_SCALE)  # --ry: walk at the height command
             self.mark('walk', f'{args.walk}')
             time.sleep(args.walk_seconds)
             self.pad.axis(AXIS_LY, 0)
+            self.pad.axis(AXIS_RY, 0)
             self.mark('stop')
             time.sleep(args.after_seconds)
             self.mark('end')
             return
-        for name, vx, vy, wz, seconds in segments(args):
-            self.stick(vx, vy, wz)
+        for name, vx, vy, wz, seconds, *rest in segments(args):
+            ry = rest[0] if rest else args.ry
+            self.stick(vx, vy, wz, ry)
+            if ry < 0:  # the height command standing (the patch keeps a walk at 0.70 m or above)
+                name = f'{name}@{height_of(ry):.2f}'
             self.mark('seg', f'{name}:{vx:g}:{vy:g}:{wz:g}')
             time.sleep(seconds)
         if args.scenario == 'passive':
@@ -294,7 +328,10 @@ def main():
     parser.add_argument('window')
     parser.add_argument('events')
     parser.add_argument('--scenario', choices=('walk', 'turn', 'side', 'sidestop', 'stopstart', 'passive', 'stand',
-                                               'push'), default='walk')
+                                               'push', 'crouch'), default='walk')
+    parser.add_argument('--ry', type=float, default=0.,
+                        help='right stick vertical axis through the commanded segments, -1..1 (down negative: the '
+                             'height command of g1_ctrl-height.patch, c = 0.78 + 0.14 min(0, ry))')
     parser.add_argument('--passive-seconds', type=float, default=2.0)
     parser.add_argument('--band-presses', type=int, default=6)
     parser.add_argument('--band-seconds', type=float, default=1.0)
@@ -319,6 +356,8 @@ def main():
     unknown = set(args.push_order.split(',')) - {d for d, _ in PUSH_KEYS}
     if unknown:
         parser.error(f'--push-order: unknown {sorted(unknown)}')
+    if not -1. <= args.ry <= 1.:
+        parser.error(f'--ry: -1..1, not {args.ry:g}')
     if args.push_dv:
         try:
             bad = [dv for dv in push_dvs(args.push_dv) if push_modifiers(dv) is None]

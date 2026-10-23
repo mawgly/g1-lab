@@ -5,9 +5,9 @@ import math
 # default to "absent" (forward, sideways, torso, orientation, height = 0) and old checkpoints keep their reward.
 G1_REWARD_WEIGHTS = dict(velocity=2., forward=0., sideways=0., heading=0., yaw=1., yaw_drift=0., alive=.5, gait=.5,
                          swing=10., tilt=1.,
-                         orientation=0., height=0., torso=0., base_motion=2., still=0., stand_pose=0., slip=0.,
-                         feet_flat=0., clearance=0., self_contact=0., arm_press=0., posture=.1, hips=0., effort=1e-5,
-                         action_change=.01, fall=5.)
+                         orientation=0., height=0., height_ceiling=0., torso=0., base_motion=2., still=0.,
+                         stand_pose=0., slip=0., feet_flat=0., clearance=0., self_contact=0., arm_press=0., posture=.1,
+                         hips=0., effort=1e-5, action_change=.01, fall=5.)
 # Values the browser form starts with for a new experiment.
 G1_RECOMMENDED = {**G1_REWARD_WEIGHTS, 'torso': 2.}
 G1_LABELS = dict(velocity='Следование скорости', forward='Скорость вперёд: чем быстрее, тем больше (до 4 м/с)',
@@ -19,6 +19,8 @@ G1_LABELS = dict(velocity='Следование скорости', forward='Ск
                  gait='Ритм шагов (контакт стоп)', swing='Штраф за высоту маха', tilt='Штраф за наклон таза (1 − cos)',
                  orientation='Штраф за наклон таза, квадратичный (как у Unitree)',
                  height='Штраф за высоту таза (цель 0,78 м)',
+                 height_ceiling=('Штраф за таз выше команды приседа (при обычной высоте 0,78 м — ноль; нужна команда '
+                                 'высоты)'),
                  torso='Штраф за наклон корпуса (цель — 6° вперёд)', base_motion='Штраф за раскачивание корпуса',
                  still='Штраф за дрейф и разворот на месте (при команде «стоять»)',
                  stand_pose='Штраф за отход ног от исходной позы стоя (при команде «стоять»)',
@@ -45,11 +47,19 @@ G1_LABELS = dict(velocity='Следование скорости', forward='Ск
 # side_speed (needs side_share): the top sideways speed of the purely sideways commands alone (the others keep
 # ±lateral_speed; iteration 25: side steps to ±1 m/s with the diagonals and forward commands unchanged); 0 or null
 # (missing) is off, the original draw bit for bit, otherwise above SIDE_MIN_SPEED.
+# crouch_share, crouch_min (pairs: standing, walking) and crouch_speed (task_config height_command, iteration 28): the
+# share of training commands that come with a crouch, the lowest pelvis height drawn for them (m, uniform up to
+# CROUCH_HEIGHTS[1]) and the top speed of a walking crouch (g1_tensor_math.height_draw, at every reset and command
+# change). A share needs height_command; [0, 0] (missing) draws no crouch.
+CROUCH_HEIGHTS = (.6, .78)  # g1_tensor_math.CROUCH_TABLE's range
+CROUCH_PAIRS = ('crouch_share', 'crouch_min')
 G1_COMMANDS = dict(min_speed=0., max_speed=1.5, stand_probability=.2, lateral_speed=0., yaw_rate=0.,
-                   straight_probability=0., side_share=0., side_stop=0., side_speed=0.)
+                   straight_probability=0., side_share=0., side_stop=0., side_speed=0., crouch_share=[0., 0.],
+                   crouch_min=[.64, .70], crouch_speed=1.)
 G1_COMMAND_LIMITS = dict(min_speed=(-1., 2.), max_speed=(0., 2.), stand_probability=(0., 1.),
                          lateral_speed=(0., 1.), yaw_rate=(0., 2.), straight_probability=(0., 1.),
-                         side_share=(0., 1.), side_stop=(0., 1.), side_speed=(0., 1.5))
+                         side_share=(0., 1.), side_stop=(0., 1.), side_speed=(0., 1.5), crouch_share=(0., 1.),
+                         crouch_min=CROUCH_HEIGHTS, crouch_speed=(0., 2.))
 G1_COMMAND_LABELS = dict(min_speed='Скорость команд от, м/с (минус — назад)', max_speed='Скорость команд до, м/с',
                          stand_probability='Доля команд «стоять» (0–1)', lateral_speed='Команды вбок до ±, м/с',
                          yaw_rate='Команды поворота до ±, рад/с',
@@ -58,7 +68,11 @@ G1_COMMAND_LABELS = dict(min_speed='Скорость команд от, м/с (�
                          side_stop=('Стоп после шага вбок: вероятность, что следующая команда (кроме «вперёд») — '
                                     '«стоять» (0–1)'),
                          side_speed=('Команды «чисто вбок» до ±, м/с (0 — как у остальных команд вбок; диагонали '
-                                     'и «вперёд» не меняются)'))
+                                     'и «вперёд» не меняются)'),
+                         crouch_share=('Доля команд с приседом: стоя и на ходу, пара чисел 0–1 (нужна команда '
+                                       'высоты)'),
+                         crouch_min='Нижняя высота таза в приседе, м: стоя и на ходу, пара чисел 0,60–0,78',
+                         crouch_speed='Присед на ходу — только до этой скорости, м/с')
 # Lowest sideways speed of a purely sideways command: g1_tensor_math.STAND_SPEED (below it the task asks to stand).
 SIDE_MIN_SPEED = .1
 # Gait clock rewarded by the `gait` term: cycle length (s) and the share of it each foot is on the ground.
@@ -97,6 +111,15 @@ ACTION_DELAY_RANGE = (0., .05)
 # set_command (evaluation, scenarios) have none. Observations and actions are unchanged, so it is not part of the
 # policy contract. 0 (missing) is the original task.
 ARM_PERTURB_RANGE = (0., .5)
+# arm_perturb_radians (iteration 30): the amplitude of a segment's random arm pose, ±rad per joint around home
+# (tasks/g1_tensor_math.arm_perturb_draw; the box and the joint ranges still clip it). ARM_PERTURB_RADIANS (missing)
+# is the original draw, bit for bit; another value needs arm_perturb. arm_perturb_contact_mask (iteration 30): while a
+# world's arms follow a segment, contacts touching an arm link do not count in the self_contact share
+# (tasks/g1_tensor_math.self_contact_pairs): the policy is not charged for a pose it did not choose; contacts of the
+# legs, feet, torso and pelvis count as before. Needs arm_perturb; false (missing) is the original term. Neither
+# changes observations or actions, so neither is part of the policy contract.
+ARM_PERTURB_RADIANS = .4
+ARM_PERTURB_RADIANS_RANGE = (.1, 1.6)
 # force_push: the largest Δv (m/s) of the training pushes as a force on the pelvis, M·Δv/T for T 0.05-0.2 s, every
 # 2-4 s per world, the direction uniform (tasks/g1_tensor_math.force_push_draw; the sim2sim push patch's force; 1.25 is
 # the working value of iteration 20). On top of the CUDA task's velocity pushes, on both backends, not scaled by
@@ -118,6 +141,12 @@ MOTOR_FRICTION_RANGE = (0., 2.)
 # the range). Same layout, different meaning of the knee actions below the floor: its own action contract
 # (action_schema …-knee<floor>). Missing or null is the original task (the knee target down to the joint range).
 KNEE_FLOOR_RANGE = (0., 1.)
+# height_command (real robot only, iteration 28): the pelvis height c the policy is told to keep, one observation term
+# [c − 0.78] after last_action, drawn at every reset and command change (commands crouch_share / crouch_min /
+# crouch_speed); the fall height, the height term, height_ceiling and the stand_pose leg pose follow it
+# (tasks/g1_tensor_math.height_draw, stand_target, fall_height). upper_body_slot (real robot only): a reserved term of
+# 18 zeros after it (a flag and 17 waist and arm targets) for a later upper-body command. Each is its own observation
+# contract (observation_schema …-hcmd, …-ubslot). False (missing) is the original layout, bit for bit.
 # foot_collision (both G1 models): the feet collide with each other through Unitree's foot capsules (unitree_rl_mjlab
 # g1.xml: 7 per foot, radius 0.01; tasks/g1_velocity.FOOT_CAPSULES, with Unitree's contact: condim 3, friction 0.6),
 # which touch nothing else, so the floor contact stays the sole spheres; a foot-foot contact above 10 N is charged by
@@ -162,6 +191,14 @@ G1_PARAMETERS = (
     dict(group=None, key='arm_perturb',
          label='Помехи на руки в обучении: доля времени, когда руки держат случайную позу (0 — без помех)',
          default=0., min=ARM_PERTURB_RANGE[0], max=ARM_PERTURB_RANGE[1]),
+    # Missing in a saved config means ARM_PERTURB_RADIANS (the original draw); another value needs arm_perturb.
+    dict(group=None, key='arm_perturb_radians',
+         label='Помехи на руки: размах случайной позы каждого сустава руки, ± рад (0,4 — прежний)',
+         default=ARM_PERTURB_RADIANS, min=ARM_PERTURB_RADIANS_RANGE[0], max=ARM_PERTURB_RADIANS_RANGE[1]),
+    # Missing in a saved config means off (every robot-robot contact counted); needs arm_perturb.
+    dict(group=None, key='arm_perturb_contact_mask', default=False, type='bool',
+         label=('Во время помехи на руки касания рук не штрафуются (касания ног, стоп, корпуса и таза — '
+                'как раньше)')),
     dict(group=None, key='force_push',
          label='Толчки силой на таз в обучении: наибольшее Δv, м/с (0 — без толчков; сила M·Δv/T раз в 2–4 с)',
          default=0., min=FORCE_PUSH_RANGE[0], max=FORCE_PUSH_RANGE[1]),
@@ -181,6 +218,14 @@ G1_PARAMETERS = (
     dict(group=None, key='foot_collision', default=False, type='bool',
          label='Стопы сталкиваются друг с другом, как в модели Unitree (7 капсул на стопу; касание стоп идёт в штраф '
                'касания тела)'),
+    # Real robot only; missing in a saved config means off. Observation terms after last_action: their own observation
+    # contract (…-hcmd, …-ubslot); a stage moves there with warm_start.insert_terms.
+    dict(group=None, key='height_command', default=False, type='bool',
+         label=('Команда высоты таза (присед): высота во входе политики, по ней падение, штраф высоты и поза стоя; '
+                'при 0,78 м всё как раньше')),
+    dict(group=None, key='upper_body_slot', default=False, type='bool',
+         label=('Место во входе под команду верха тела: 18 нулей (флаг и цели талии и рук), пока не '
+                'используется')),
     dict(group=None, key='action_limit', label='Предел команды моторов (1 — прежний, 4 — почти весь ход суставов)',
          default=1., min=ACTION_LIMIT_RANGE[0], max=ACTION_LIMIT_RANGE[1]),
     *(dict(group='commands', key=key, label=G1_COMMAND_LABELS[key], default=G1_COMMANDS[key],
@@ -220,10 +265,24 @@ def backward_share(min_speed, max_speed):
     return min(-min_speed / (max_speed - min_speed), 1.) if max_speed > min_speed else 1.
 
 
+def _pair(value, limits, key):
+    """A [standing, walking] pair of finite numbers within limits, as a list of floats."""
+    low, high = limits
+    if not isinstance(value, (list, tuple)) or len(value) != 2 or any(
+            type(v) not in (int, float) or not math.isfinite(v) or not low <= v <= high for v in value):
+        raise ValueError(f'G1 command {key} must be two numbers (standing, walking) in [{low:g},{high:g}]')
+    return [float(v) for v in value]
+
+
 def g1_commands(values=None):
     if isinstance(values, dict) and values.get('side_speed', 0.) is None:
         values = {**values, 'side_speed': 0.}  # null: off, as missing
-    result = _bounded(values, G1_COMMANDS, G1_COMMAND_LIMITS, 'command')
+    pairs = {key: list(G1_COMMANDS[key]) for key in CROUCH_PAIRS}
+    if isinstance(values, dict):  # the pairs are checked here, the numbers by _bounded
+        pairs.update({key: _pair(values[key], G1_COMMAND_LIMITS[key], key) for key in CROUCH_PAIRS if key in values})
+        values = {key: value for key, value in values.items() if key not in CROUCH_PAIRS}
+    numbers = {key: value for key, value in G1_COMMANDS.items() if key not in CROUCH_PAIRS}
+    result = {**_bounded(values, numbers, {key: G1_COMMAND_LIMITS[key] for key in numbers}, 'command'), **pairs}
     if result['min_speed'] > result['max_speed']:
         raise ValueError('G1 command min_speed exceeds max_speed')
     if result['side_share']:  # taken from the backward commands, with a real sideways step
@@ -258,15 +317,20 @@ def g1_config(values):
     feet_flat_stance missing means off (feet_flat charged both feet, every step). foot_collision missing means off (the
     feet passed through each other). side_heading_hold missing means on (heading hold steered purely sideways
     commands too). motor_friction missing or null means 0 (the motor model's friction as measured, every episode).
+    height_command and upper_body_slot missing mean off (no such observation terms). arm_perturb_radians missing means
+    ARM_PERTURB_RADIANS (the original arm poses), arm_perturb_contact_mask missing means off (arm contacts charged in a
+    perturbation segment too).
     """
     keys = {'reward_weights', 'heading_hold', 'commands', 'gait', 'action_limit', 'real_robot', 'critic_extras',
             'training_realism', 'history', 'stand_heading_hold', 'phase_stop', 'sole_contact', 'random_phase',
-            'action_delay', 'arm_perturb', 'lock_wrists', 'knee_floor', 'force_push', 'feet_flat_stance',
-            'foot_collision', 'side_heading_hold', 'motor_friction'}
+            'action_delay', 'arm_perturb', 'arm_perturb_radians', 'arm_perturb_contact_mask', 'lock_wrists',
+            'knee_floor', 'force_push', 'feet_flat_stance', 'foot_collision', 'side_heading_hold', 'motor_friction',
+            'height_command', 'upper_body_slot'}
     if not isinstance(values, dict) or set(values)-keys:
         raise ValueError('Unknown G1 task setting')
     for key in ('heading_hold', 'real_robot', 'critic_extras', 'stand_heading_hold', 'phase_stop', 'sole_contact',
-                'random_phase', 'lock_wrists', 'feet_flat_stance', 'foot_collision', 'side_heading_hold'):
+                'random_phase', 'arm_perturb_contact_mask', 'lock_wrists', 'feet_flat_stance', 'foot_collision',
+                'side_heading_hold', 'height_command', 'upper_body_slot'):
         if type(values.get(key, False)) is not bool:
             raise ValueError(f'{key} must be true or false')
     if values.get('critic_extras') and not values.get('real_robot'):
@@ -287,6 +351,14 @@ def g1_config(values):
     low, high = ARM_PERTURB_RANGE
     if type(perturb) not in (int, float) or not math.isfinite(perturb) or not low <= perturb <= high:
         raise ValueError(f'G1 arm_perturb must be in [{low:g},{high:g}]')
+    radians = values.get('arm_perturb_radians', ARM_PERTURB_RADIANS)
+    low, high = ARM_PERTURB_RADIANS_RANGE
+    if type(radians) not in (int, float) or not math.isfinite(radians) or not low <= radians <= high:
+        raise ValueError(f'G1 arm_perturb_radians must be in [{low:g},{high:g}] rad')
+    if radians != ARM_PERTURB_RADIANS and not perturb:  # the amplitude of segments that never start
+        raise ValueError('arm_perturb_radians requires arm_perturb')
+    if values.get('arm_perturb_contact_mask') and not perturb:
+        raise ValueError('arm_perturb_contact_mask requires arm_perturb')
     push = values.get('force_push', 0.)
     low, high = FORCE_PUSH_RANGE
     if type(push) not in (int, float) or not math.isfinite(push) or not low <= push <= high:
@@ -309,12 +381,18 @@ def g1_config(values):
         raise ValueError('history requires real_robot')
     if values.get('phase_stop') and not real:
         raise ValueError('phase_stop requires real_robot')
+    for key in ('height_command', 'upper_body_slot'):  # terms of the deploy observation layout
+        if values.get(key) and not real:
+            raise ValueError(f'{key} requires real_robot')
+    commands = g1_commands(values.get('commands'))
+    if any(commands['crouch_share']) and not values.get('height_command'):
+        raise ValueError('G1 command crouch_share requires height_command')
     gait = g1_gait(values.get('gait'))
     if real:  # the robot's controller computes the phase observation with a 0.6 s period
         gait['period'] = DEPLOY_PHASE_PERIOD
     return {'reward_weights': g1_reward_weights(values.get('reward_weights')),
             'heading_hold': values.get('heading_hold', False),
-            'commands': g1_commands(values.get('commands')),
+            'commands': commands,
             'gait': gait,
             'action_limit': float(limit),
             'real_robot': real,
@@ -327,13 +405,17 @@ def g1_config(values):
             'random_phase': values.get('random_phase', False),
             'action_delay': float(delay),
             'arm_perturb': float(perturb),
+            'arm_perturb_radians': float(radians),
+            'arm_perturb_contact_mask': values.get('arm_perturb_contact_mask', False),
             'lock_wrists': values.get('lock_wrists', False),
             'knee_floor': None if floor is None else float(floor),
             'force_push': float(push),
             'feet_flat_stance': values.get('feet_flat_stance', False),
             'foot_collision': values.get('foot_collision', False),
             'side_heading_hold': values.get('side_heading_hold', True),
-            'motor_friction': float(friction)}
+            'motor_friction': float(friction),
+            'height_command': values.get('height_command', False),
+            'upper_body_slot': values.get('upper_body_slot', False)}
 
 
 # Bumped when the real-robot physics or observation layout changes.
@@ -352,6 +434,8 @@ def g1_config_identity(identity, config):
         import hashlib
         schema = ('obs-unitree-deploy-v0' + (f'-h{config["history"]}' if config.get('history', 1) > 1 else '')
                   + ('-phasestop' if config.get('phase_stop') else '')
+                  + ('-hcmd' if config.get('height_command') else '')
+                  + ('-ubslot' if config.get('upper_body_slot') else '')
                   + (f'-critic{CRITIC_EXTRAS}' if config.get('critic_extras') else ''))
         identity = {**identity, 'observation_schema': f"{identity['task_id']}:{schema}",
                     'model_revision': hashlib.sha256(f"{identity['model_revision']}:{REAL_ROBOT_REVISION}".encode()).hexdigest()}

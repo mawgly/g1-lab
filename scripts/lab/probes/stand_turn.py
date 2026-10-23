@@ -15,11 +15,19 @@ probe lacks:
   * motor-model splits (extra), forced joint targets (force), left-right symmetrised policy (sym), Unitree's shipped
     v0 policy (stage 'unitree_v0': obs 98, same layout, deploy/robots/g1/config/policy/velocity/v0);
   * an export_g1 folder instead of a stage: its policy.onnx acts (humanoid_sim.export_g1.ExportedPolicy: what
-    g1_ctrl runs, stand trim included) in the environment of the stage it came from.
+    g1_ctrl runs, stand trim included) in the environment of the stage it came from;
+  * the pelvis height command (task_config height_command, iteration 28) since iteration 29 (the critic,
+    lab-critic/it29c: cwalk.py, yawc.py): a plan segment may carry a sixth element, the height c (m), set with the
+    task's set_height when the segment's command takes over (the first segment's from the Velocity entry on, as a
+    stick already held there), else the height stays. Plans crouch_walk05 (stand 5 s at 0.78, walk 0.5 m/s 10 s at
+    0.70, as g1_ctrl's height patch with the stick down walking, stop 5 s at 0.78) and crouch_stand74 / crouch_stand64
+    (30 s standing at 0.74 / 0.64), group 'crouch' (the three in the bridge copy). They need the height command: the
+    group schedules none for a stage without it (has_height), run() refuses them there.
 Case = dict(physics, stale, delay, timing, which, offset, start, plan, seed, phase, lag, extra, force, sym).
 physics: ours | nomotor | um_joint | um | ours_caps | um_caps (um_probe.apply_physics; *_caps: the feet collide as in
 Unitree's training model).  start: fixair | reset (our reset, no FixStand/band).
-Groups: smoke, stand (160 runs), bridge, motor, friction, delay, start, wrist, sym, unitree.  Prints one line per case.
+Groups: smoke, stand (160 runs), bridge, motor, friction, delay, start, wrist, sym, unitree, crouch.  Prints one line
+per case.
 Candidate 3 (exp-6986f1d9544b4d00 @ 5481431040), 22.10: see the Russian summary in the lab's answer.
 """
 import os
@@ -51,7 +59,7 @@ CAND3 = 'exp-6986f1d9544b4d00-5481431040-20261022-'
 TICK = 0.002
 STAGE3 = os.path.join(SIM, 'runs', 'humanoid_lab', 'exp-6986f1d9544b4d00', 'stage_005481431040')
 BAND_OFF_TICKS = 700  # 1.4 s after the Velocity entry (bridge runs: 1.400-1.402 s)
-PLANS = {  # (name, vx, vy, wz, seconds), after band_off
+PLANS = {  # (name, vx, vy, wz, seconds[, height]), after band_off
     'stand': [('stand', 0., 0., 0., 5.)],
     'stand30': [('stand', 0., 0., 0., 30.)],
     'walk_now': [('walk', .5, 0., 0., 10.), ('stop', 0., 0., 0., 5.)],
@@ -69,7 +77,14 @@ PLANS = {  # (name, vx, vy, wz, seconds), after band_off
     'side05': [('stand', 0., 0., 0., 5.), ('left05', 0., .5, 0., 10.), ('stop', 0., 0., 0., 3.),
                ('right05', 0., -.5, 0., 10.), ('stop', 0., 0., 0., 5.)],
     'stopstart': [('stand', 0., 0., 0., 5.)] + [('walk', .5, 0., 0., 3.), ('stop', 0., 0., 0., 3.)] * 3,
+    # The height command (task_config height_command; stage_select's step 2 since iteration 29). Walking: 'walk' with
+    # the height g1_ctrl's height patch gives with the stick down, 0.70 while the command's norm >= 0.1, else 0.78 (the
+    # critic's cwalk.py). Standing: 30 s crouched from the Velocity entry on (his cwalk.py CW_CSTAND, cstand.json).
+    'crouch_walk05': [('stand', 0., 0., 0., 5., .78), ('walk', .5, 0., 0., 10., .70), ('stop', 0., 0., 0., 5., .78)],
+    'crouch_stand74': [('stand', 0., 0., 0., 30., .74)],
+    'crouch_stand64': [('stand', 0., 0., 0., 30., .64)],
 }
+HEIGHT_PLANS = tuple(key for key, plan in PLANS.items() if any(len(segment) > 5 for segment in plan))
 _cache = {}
 
 
@@ -140,6 +155,16 @@ def stage_data(stage):
     return um._stage(stage)
 
 
+def has_height(stage):
+    """Whether the stage (an export folder: its stage) has task_config height_command, which HEIGHT_PLANS need. Reads
+    the task config only (stage_data's, without loading the policy)."""
+    if str(stage) == 'unitree_v0':
+        return False
+    from humanoid_sim.core import stage_task_config
+    from humanoid_sim.export_g1 import ExportedPolicy, is_export
+    return bool(stage_task_config(ExportedPolicy(stage).stage if is_export(stage) else stage).get('height_command'))
+
+
 def lock(raw, action):
     a = np.clip(np.asarray(action, dtype=float), -raw.action_limit, raw.action_limit)
     if raw.lock_wrists:  # = task.lock_joints (masked_fill 0), as env.step
@@ -159,6 +184,8 @@ def run(case):
     from humanoid_sim.tasks.catalog import make_task
     stage = case['stage']
     model, norm, config = stage_data(stage)
+    if case['plan'] in HEIGHT_PLANS and not config.get('height_command'):
+        raise ValueError(f"plan {case['plan']} sets the height command: the stage has no task_config height_command")
     seed = case['seed']
     torch.manual_seed(seed)
     env = make_task('g1_velocity', 'g1_29dof', {**config, 'heading_hold': False, 'max_episode_steps': 1000000,
@@ -205,13 +232,15 @@ def run(case):
         fix_target = None
     raw.previous_action[:] = 0.
     raw.set_command(np.zeros(3))
-    obs = raw._observation('fill')
-    # the schedule of policy steps in ticks
+    # the schedule of policy steps in ticks: (name, command, first tick, end tick, height or None)
     seg_ticks = []
     t0 = release
-    for name, vx, vy, wz, secs in plan:
-        seg_ticks.append((name, (vx, vy, wz), t0, t0 + int(round(secs / TICK))))
+    for name, vx, vy, wz, secs, *height in plan:
+        seg_ticks.append((name, (vx, vy, wz), t0, t0 + int(round(secs / TICK)), height[0] if height else None))
         t0 += int(round(secs / TICK))
+    if seg_ticks[0][4] is not None:  # the first segment's height from the Velocity entry on
+        raw.set_height(seg_ticks[0][4])
+    obs = raw._observation('fill')
     total = t0 + 12
     n_steps = total // 10 + 20
     if case.get('timing') == 'real':
@@ -247,6 +276,9 @@ def run(case):
             if np.abs(cmd_f - raw.command).max() > 1e-9 or i == 0:
                 raw.set_command(cmd_f)
                 obs = raw._observation('replace')
+            if seg and seg[4] is not None and seg[4] != raw.height:  # the segment's height, with its command
+                raw.set_height(seg[4])
+                obs = raw._observation('replace')
             g = -raw.data.xmat[pelvis].reshape(3, 3)[2, :]
             obs_t.append(t)
             lean.append((math.degrees(math.atan2(g[0], -g[2])), math.degrees(math.atan2(-g[1], -g[2]))))
@@ -279,13 +311,16 @@ def run(case):
     n = t
     yaw = np.unwrap(yaw[:n])
     out_segs = []
-    for name, cmd, a, b in seg_ticks:
+    for name, cmd, a, b, height in seg_ticks:
+        at = {} if height is None else dict(height=height)  # height plans only: the results of the others as before
         b = min(b, n - 1)
         settle = 1000 if (b - a) >= 4000 else 500
         if b - a - settle < 50:  # not reached, or the run fell before the measured part (yaw[s] past the end)
-            out_segs.append(dict(name=name, cmd=cmd, missing=True))
+            out_segs.append(dict(name=name, cmd=cmd, missing=True, **at))
             continue
         s = a + settle
+        if at:  # height plans: the pelvis height over the measured part
+            at['pelvis'] = float(zmin[s:b].mean())
         secs = (b - s) * TICK
         h = yaw[s:b]
         d = np.diff(xy[s:b + 1], axis=0)
@@ -304,7 +339,7 @@ def run(case):
             q=np.mean([qrec[j] for j in sel], axis=0).round(4).tolist() if sel and name == 'stand' else None,
             dq_deg=[np.degrees(qrec[min(range(len(obs_t)), key=lambda j: abs(obs_t[j] - (a + 500 * k)))][[2, 8, 12]]
                     - qrec[min(range(len(obs_t)), key=lambda j: abs(obs_t[j] - a))][[2, 8, 12]]).round(2).tolist()
-                    for k in range(1, 6)] if name == 'stand' else None))
+                    for k in range(1, 6)] if name == 'stand' else None, **at))
     return dict(case={k: v for k, v in case.items() if k != 'stage'}, fell_at=fell_at, segs=out_segs,
                 fix=None if fix is None else {k: fix[k] for k in ('fell_at', 'z', 'tilt', 'pitch', 'max_err', 'worst')},
                 pre=[round(float(yaw[min(500 * (k + 1), n - 1)] - yaw[500 * k]), 4) for k in range(int(release // 500))])
@@ -385,6 +420,8 @@ def grid(stage, which):
                     j.append(case(physics=physics, stale=stale, delay=delay, plan=plan))
             for w in range(3):
                 j.append(case(physics=physics, plan='walk', timing='real', which=w))
+    if which == 'crouch' and has_height(stage):  # the height plans in the bridge copy; none without height_command
+        j += [case(plan=plan) for plan in HEIGHT_PLANS]
     for job in j:
         job['stage'] = stage
     return j
@@ -401,10 +438,15 @@ def describe(r):
     for s in r['segs']:
         if s.get('missing'):
             continue
+        at = '' if s.get('height') is None else '@%.2f' % s['height']  # height plans: c, and the pelvis below
         if s['name'] == 'stand':
-            parts.append('stand/s ' + ' '.join('%+.3f' % x for x in s['per_s'][:5]) + ' lean %.1f' % (s['pitch'] or 0))
+            parts.append('stand%s/s ' % at + ' '.join('%+.3f' % x for x in s['per_s'][:5])
+                         + ' lean %.1f' % (s['pitch'] or 0)
+                         + ('' if not at else ' h%+.1f z%.3f' % (s['heading_deg'], s['pelvis'])))
         elif s['name'] != 'stop':
-            parts.append("%s w%+.3f v(%+.2f,%+.2f) h%+.0f" % (s['name'], s['yaw_rate'], s['fwd'], s['side'], s['heading_deg']))
+            parts.append("%s%s w%+.3f v(%+.2f,%+.2f) h%+.0f" % (s['name'], at, s['yaw_rate'], s['fwd'], s['side'],
+                                                               s['heading_deg'])
+                         + ('' if not at else ' z%.3f' % s['pelvis']))
     return head + ' | ' + ' | '.join(parts) + ('' if r['fell_at'] is None else ' FELL %.1f s' % r['fell_at'])
 
 

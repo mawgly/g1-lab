@@ -33,15 +33,29 @@ class RunningMoments:
 
 
 class TensorNormalize:
-    def __init__(self, obs_shape, n_envs, device, gamma=.99):
+    def __init__(self, obs_shape, n_envs, device, gamma=.99, fixed=None):
+        """fixed: (positions, mean, variance) of observation columns whose statistics are set, not estimated, or None:
+        the task's fixed_normalization (G1 height_command / upper_body_slot terms, which a warm-started stage's 7e9
+        counted observations would never estimate). They stay at those values through every update and import."""
         self.obs = RunningMoments(obs_shape, device)
         self.ret = RunningMoments((), device)
         self.returns = torch.zeros(n_envs, dtype=torch.float64, device=device)
         self.gamma = gamma
+        self.fixed = None if fixed is None else (
+            torch.as_tensor(fixed[0], dtype=torch.long, device=device),
+            *(torch.as_tensor(values, dtype=torch.float64, device=device) for values in fixed[1:]))
+        self._freeze()
+
+    def _freeze(self):
+        if self.fixed is not None:
+            positions, mean, variance = self.fixed
+            self.obs.mean[positions] = mean
+            self.obs.var[positions] = variance
 
     def observation(self, value, update=True):
         if update:
             self.obs.update(value)
+            self._freeze()
         return ((value - self.obs.mean) / torch.sqrt(self.obs.var + 1e-8)).clamp(-10, 10).float()
 
     def reward(self, value, done):
@@ -53,6 +67,7 @@ class TensorNormalize:
 
     def import_normalizer(self, normalizer):
         self.obs.import_rms(normalizer.obs_rms)
+        self._freeze()
         if normalizer.gamma == self.gamma:
             self.ret.import_rms(normalizer.ret_rms)
 

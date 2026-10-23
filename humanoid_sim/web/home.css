@@ -158,8 +158,16 @@ main [id] {
   padding: 16px 22px;
   max-width: 760px;
 }
+/* The same with a before/after clip (two robots, 960x360). */
+.story-card.wide.pair {
+  grid-template-columns: minmax(0, 480px) 1fr;
+}
+.story-card.wide.pair .media {
+  aspect-ratio: 960 / 360;
+}
 @media (max-width: 640px) {
-  .story-card.wide {
+  .story-card.wide,
+  .story-card.wide.pair {
     grid-template-columns: 1fr;
   }
 }

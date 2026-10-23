@@ -16,6 +16,8 @@ from humanoid_sim.tasks.identity import task_identity
 COMMANDS = dict(min_speed=-.5, max_speed=1., stand_probability=.1, lateral_speed=.5, yaw_rate=1.,
                 straight_probability=.5)
 SIDE = dict(side_share=.2, side_stop=1.)  # the working pair of the docstring
+# The height command's crouch settings (iteration 28) as g1_commands spells them out when missing: no crouch.
+CROUCH_OFF = dict(crouch_share=[0., 0.], crouch_min=[.64, .70], crouch_speed=1.)
 PROFILE = dict(real_robot=True, phase_stop=True, history=5, action_limit=10., heading_hold=True,
                stand_heading_hold=False, gait=dict(period=.6, stance_fraction=.55))
 
@@ -41,8 +43,10 @@ def _sample(n, seed, sampler=task.sample_commands, **options):
     return sampler(n, lambda k: torch.rand(k, generator=generator), **{**COMMANDS, **options})
 
 
-def _old_drop_in(n, uniform, previous=None, side_share=0., side_stop=0., side_speed=0., **commands):
-    assert not side_share and not side_stop and not side_speed
+def _old_drop_in(n, uniform, previous=None, side_share=0., side_stop=0., side_speed=0., crouch_share=None,
+                 crouch_min=None, crouch_speed=None, **commands):
+    """The crouch settings belong to height_draw, which sample_commands does not draw for."""
+    assert not side_share and not side_stop and not side_speed and not any(crouch_share or ())
     return _old_sample_commands(n, uniform, **commands)
 
 
@@ -73,7 +77,8 @@ def _iteration24_sample_commands(n, uniform, min_speed=0., max_speed=1.5, stand_
 
 
 def test_without_the_settings_the_draw_is_bit_for_bit_the_old_one():
-    assert g1_commands(COMMANDS) == {**COMMANDS, 'side_share': 0., 'side_stop': 0., 'side_speed': 0.}  # missing: off
+    assert g1_commands(COMMANDS) == {**COMMANDS, 'side_share': 0., 'side_stop': 0., 'side_speed': 0.,
+                                     **CROUCH_OFF}  # missing: off
     previous = _sample(500, 1, side_share=.2)
     for seed in range(3):
         old = _sample(500, seed, _old_sample_commands)
@@ -270,7 +275,7 @@ def test_without_side_speed_the_side_draw_is_bit_for_bit_the_iteration24_one():
             assert torch.equal(_sample(500, seed, **options), old)
             assert torch.equal(_sample(500, seed, side_speed=0., **options), old)
     for off in ({}, {'side_speed': 0}, {'side_speed': None}):  # missing, 0 and null: off
-        assert g1_commands({**COMMANDS, **SIDE, **off}) == {**COMMANDS, **SIDE, 'side_speed': 0.}
+        assert g1_commands({**COMMANDS, **SIDE, **off}) == {**COMMANDS, **SIDE, 'side_speed': 0., **CROUCH_OFF}
     assert g1_commands({**COMMANDS, **SIDE, 'side_speed': 1})['side_speed'] == 1.
 
 

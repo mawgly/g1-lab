@@ -6,8 +6,10 @@
 # Steps (default: all, in this order): apt clone mujoco sdk2 simulate g1ctrl probe pyenv config
 # Each step logs to $ROOT/logs/setup-<step>.log. Docs: docs/sim2sim.md.
 # Unitree's code is changed only by the patches in patches/ (simulate: pelvis pushes, g1ctrl: the target held
-# until the first policy step, targets published clipped, Passive after a fall), applied once by their steps
-# before the build.
+# until the first policy step, targets published clipped, Passive after a fall, the height command's observation
+# terms), applied once by their steps before the build.
+# SIM2SIM_HEIGHT=off builds g1_ctrl without the height patch (reversed if the tree has it), as robot package 8 was
+# built: wsl.exe -d Ubuntu -u root -e env SIM2SIM_HEIGHT=off bash /mnt/c/.../setup.sh g1ctrl
 set -u
 export LC_ALL=C  # compiler messages in English, plain quotes in the logs
 
@@ -89,6 +91,19 @@ apply_patch() {  # <repo> <patch file in patches/>: applies it once; a tree that
   mkdir -p "$(dirname "$kept")" && cp "$patch" "$kept"
 }
 
+remove_patch() {  # <repo> <patch file in patches/>: reverses it (this or the kept version) if the tree has it
+  local repo=$1 patch=$HERE/patches/$2 kept=$ROOT/$1/.git/sim2sim/$2
+  g() { git -c 'safe.directory=*' -C "$ROOT/$repo" "$@"; }
+  if g apply --reverse --check "$patch" 2>/dev/null; then
+    g apply --reverse "$patch" && echo "patch $2: reversed" || return 1
+  elif [ -f "$kept" ] && g apply --reverse --check "$kept" 2>/dev/null; then
+    g apply --reverse "$kept" && echo "patch $2: older version reversed" || return 1
+  else
+    echo "patch $2: not applied"
+  fi
+  rm -f "$kept"
+}
+
 step_simulate() {
   cd "$ROOT/unitree_mujoco/simulate" || return 1
   # Fix for gcc 15: jstest.cc uses uint8_t without <cstdint> (unitree_mujoco itself builds as is).
@@ -109,6 +124,14 @@ step_g1ctrl() {
   # Velocity goes to Passive once the pelvis tilts past Unitree's 1 rad: their bad_orientation check returns
   # false (docs/sim2sim.md «Гонка при входе в Velocity», «Падение: переход в Passive»).
   apply_patch unitree_rl_mjlab g1_ctrl-fall-passive.patch || return 1
+  # The observation terms of a height export (task_config height_command / upper_body_slot, iteration 28):
+  # height_command from the right stick down, upper_body_command zeros; other exports never name them.
+  # SIM2SIM_HEIGHT=off: the three patches only, as robot package 8.
+  if [ "${SIM2SIM_HEIGHT:-on}" = off ]; then
+    remove_patch unitree_rl_mjlab g1_ctrl-height.patch || return 1
+  else
+    apply_patch unitree_rl_mjlab g1_ctrl-height.patch || return 1
+  fi
   cd "$ROOT/unitree_rl_mjlab/deploy/robots/g1" && mkdir -p build && cd build &&
   cmake .. && make -j$JOBS && ls -la g1_ctrl
 }

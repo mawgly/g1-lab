@@ -21,7 +21,8 @@ own:
      outcome is not monotonic in dv (a middling push gets a hesitant half step and a fall, a strong one a decisive
      step): 5968920576 "failed" 1.1 (2 of 16) holding 1.25 (0 of 16), and candidate 4's hole forward (1.0: 6 of
      10) comes from moments 0.3-0.9 s the old ones did not reach. Also printed, with no limit: the turn over the 30 s
-     stand of the bridge copy (the 'bridge' group's stand30 run, Unitree +6 ms: the critic's stand30.py um6), and
+     stand of the bridge copy (the 'bridge' group's stand30 run, Unitree +6 ms: the critic's stand30.py um6; judged
+     since iteration 29 for stages with the height command, below), and
      since iteration 23 whether the feet pass through each other (foot_overlap.py: Unitree's foot capsules, the share
      of control steps with an overlap while both soles are below 2 cm, side steps ±0.5 / ±1 m/s in our physics and
      sideways pushes 1.0 / 1.25 m/s in the bridge copy; 20 more runs).
@@ -42,7 +43,21 @@ own:
      steps left with -0.057, 7121240064 right with +0.062 (both pass at ±0.3), candidate 7 (exp-c362df8e578148d0 @
      6368231424) -0.040. Under it 7121240064 fails step 2: stepping right +0.063 in the bridge copy (reset starts),
      the stop after stepping left 0.30-0.35 m in the four variants without +6 ms (with it 0.11-0.17).
-     1350 runs a stage (1327 before iteration 27, 699 before iteration 24);
+     Since iteration 29 (the critic, lab-critic/it29c: cwalk.py, yawc.py, screen.json, cstand.json) a stage with the
+     height command (task_config height_command) is judged in the bridge copy also on what the crouch changes and step
+     2 did not see: the walk at 0.5 m/s at the height 0.70 (stand_turn plan crouch_walk05: stand 5 s at 0.78, walk 10 s
+     at 0.70 as g1_ctrl's height patch gives with the stick down, stop 5 s at 0.78), |yaw rate| < 0.03, and the turn
+     over the 30 s stand at 0.78 (the bridge group's stand30), |.| <= 10 degrees; the turn over 30 s crouched at 0.74
+     and 0.64 (crouch_stand74 / 64, the height from the Velocity entry on) is printed only, a fall there too (3 runs
+     more). 7701331968 passed step 2 (every drift <= 0.036) yet in the Unitree bridge walks crouched with
+     -0.049...-0.052 (the copy -0.051, our physics with the delay does not show it) and turns -16...-18 degrees in the
+     30 s stand (the copy -15.8, candidate 8 -8); crouched it turns +25.5 at 0.74, 7741440000 -14.8 at 0.64. Of the
+     branch's 37 stages (7601-7962) 14 walk crouched below 0.03, 23 turn within 10 degrees standing, 10 do both. Printed
+     in a table of their own (a row each, the limit last), their reasons after the others ('команда высоты: ...'), and
+     after every stage a table across the stages with the height command (step 2 without them and with them). Stages
+     without the height command keep the rule before, the 30 s turn printed only: the rule that chose candidate 8 is
+     unchanged.
+     1350 runs a stage, 1353 with the height command (1327 before iteration 27, 699 before iteration 24);
   3. --fresh: one check of the winner on cases step 2 did not see, in the bridge copy (Unitree +6 ms): other timing
      windows (side step at offsets 5-61, walks at 13; step 2 has 0 and 0-53), delay 4 and 8 ms, stop-start, a right
      step alone (19 runs, no pushes since iteration 20: step 2 covers them). Same limits; the 4 / 8 ms runs and
@@ -50,14 +65,20 @@ own:
      stepping left -0.037 at 6 ms, -0.051 at 8 ms).
 An export_g1 folder is judged as exported (export_g1.ExportedPolicy: its policy.onnx with the stand trim, in the
 environment of its stage), as in stand_turn. Prints per stage a table by physics variant (the ±0.5 m/s side step's
-drift and stop in columns of their own), the 30 s turn, the standing pushes by direction x dv, the walking pushes and
-the verdict, then the share of stages that pass (the measure of a recipe). Every run is deterministic (seed 73000):
-the same stage gives the same numbers, run for run equal to the critic's files (the 624 pushes of each stage below:
-falls, peak speed and lowest pelvis bit for bit as in his stand8*.json / walk8*.json; the 30 s turn as his
-stand30*.json um6; the ±0.5 side steps as his side05.json). 8 workers (23.10, the trainer on the GPU, 24 logical
-cores): ~4 min a stage for step 2 (679 runs, 624 of them pushes, ~1800 s of processes), ~12 s for step 3 (4 stages
-with --fresh: 990 s). Since iteration 27 (23.10, 4 workers, the trainer on the GPU): step 2 of 7121240064 in 423 s,
-1545 s of processes for 1350 runs, the ±0.5 side steps 74 s of them (+5 %).
+drift and stop in columns of their own), the 30 s turn, the height checks (stages with the height command), the
+standing pushes by direction x dv, the walking pushes and the verdict, then the height checks across stages and the
+share of stages that pass (the measure of a recipe). Every run is deterministic (seed 73000): the same stage gives the
+same numbers, run for run equal to the critic's files (the 624 pushes of each stage below: falls, peak speed and
+lowest pelvis bit for bit as in his stand8*.json / walk8*.json; the 30 s turn as his stand30*.json um6; the ±0.5 side
+steps as his side05.json; the crouched walk and stands of 7701331968 and 7741440000, and their 30 s turn, as his
+it29c screen.json cwalk / stand30 and cstand.json cstand0.74 / 0.64 um). 8 workers (23.10, the trainer on the GPU, 24
+logical cores): ~4 min a stage for step 2 (679 runs, 624 of them pushes, ~1800 s of processes), ~12 s for step 3 (4
+stages with --fresh: 990 s). Since iteration 27 (23.10, 4 workers, the trainer on the GPU): step 2 of 7121240064 in
+423 s, 1545 s of processes for 1350 runs, the ±0.5 side steps 74 s of them (+5 %). Since iteration 29 (24.10, 2
+workers, the trainer on the GPU): step 2 of 7701331968 and 7741440000 in 1614 s, 1481 / 1484 s of processes for 1353
+runs a stage, the three height runs ~6 s of them (+0.4 %).
+Iteration 29 (exp-04f74e3838184b82), step 2: 7701331968 fails on the height checks only (crouched walk -0.051, the 30
+s turn -15.8 deg; crouched +25.5 at 0.74, +10.0 at 0.64), 7741440000 passes (-0.023, -3.5; +2.2, -14.8).
 The stages of the critic's check (iteration 20, exp-8ce0cbd70d0a4f1d, and candidate 4, exp-902b8958ee504780 @
 5631836160), step 2:
   5968920576 standing 8 of 400 (worst backwards 1.0: 3 of 10), walking 0 of 144, turn 30 s +4.5 deg: passes;
@@ -147,6 +168,20 @@ FORECAST_PHYSICS = 'um'
 PHYSICS_LABELS = {PUSH_PHYSICS: 'Unitree +6 мс + капсулы стоп', FORECAST_PHYSICS: 'Unitree +6 мс без капсул'}
 SIDE_CHECK = 'side1'  # stand_turn plan: stand, 1 m/s left 10 s, stop, 1 m/s right 10 s, stop; judged on falls
 SIDE_CHECK_SEGMENTS = (('left1', 'влево'), ('right1', 'вправо'))
+# Since iteration 29 (the critic, lab-critic/it29c: cwalk.py, yawc.py, screen.json, cstand.json) a stage with the height
+# command (task_config height_command) is judged in the bridge copy (Unitree +6 ms) also on what the crouch changes and
+# step 2 did not see: 7701331968 passed step 2 (every drift <= 0.036) yet in the Unitree bridge walks 0.5 m/s at the
+# height 0.70 with -0.049...-0.052 (the copy -0.051; 14 of the branch's 37 stages stay below 0.03) and turns -16...-18
+# deg in the 30 s stand (the copy -15.8, candidate 8 -8; 14 of 37 within +-5). Judged: the crouched walk (stand_turn
+# plan crouch_walk05), |yaw rate| < CROUCH_DRIFT_LIMIT, and the 30 s stand at 0.78 (the bridge group's stand30, printed
+# for every stage), |turn| <= STAND_TURN_LIMIT; for stages without the height command that stand stays printed only, so
+# the rule that chose candidate 8 is unchanged. Printed: the turn over 30 s crouched at 0.74 and 0.64 (crouch_stand74
+# / 64, measured nowhere before: 7701331968 +25.5 deg at 0.74, 7741440000 -14.8 at 0.64).
+CROUCH_WALK = 'crouch_walk05'  # stand 5 s at 0.78, walk 0.5 m/s 10 s at 0.70, stop 5 s at 0.78
+CROUCH_STANDS = ('crouch_stand74', 'crouch_stand64')  # 30 s standing at 0.74 / 0.64
+CROUCH_DRIFT_LIMIT = .03  # rad/s, worst |yaw rate| of the crouched walk
+STAND_TURN_LIMIT = 10.  # degrees, largest |turn| over the 30 s stand at 0.78 (stages with the height command)
+CROUCH_VARIANT = 'um_6ms'  # the bridge copy: the height checks run there only
 
 
 def push_jobs(stage):
@@ -164,10 +199,20 @@ def side_check_jobs(stage):
     return [st.case(**fields)] + [st.case(start='reset', phase=15 * k, seed=73000 + k, **fields) for k in range(3)]
 
 
-def select_jobs(stage):
+def height_jobs(stage):
+    """The height command checks of step 2 (iteration 29): the crouched walk and the two crouched stands, each one run
+    in the bridge copy (Unitree +6 ms, the bridge procedure), as the critic's cwalk.py."""
+    fields = next(fields for name, _, fields in VARIANTS if name == CROUCH_VARIANT)
+    return [st.case(plan=plan, stage=str(stage), **fields) for plan in (CROUCH_WALK,) + CROUCH_STANDS]
+
+
+def select_jobs(stage, height=None):
     """Step 2 of one stage: [(kind, job)], kind 'run' (stand_turn.run case: the 7 physics variants, the bridge group's
-    side steps again at ±0.5 m/s, then the side check), 'push' (bridge_kick.run job) or 'feet' (foot_overlap.run job,
-    printed only)."""
+    side steps again at ±0.5 m/s, then the side check and, with the height command, the height checks), 'push'
+    (bridge_kick.run job) or 'feet' (foot_overlap.run job, printed only). height: whether the stage has task_config
+    height_command (None: read it from the stage)."""
+    if height is None:
+        height = st.has_height(stage)
     bridge = st.grid(str(stage), 'bridge')
     jobs = [('run', case) for case in bridge]
     jobs += [('run', dict(case, plan=SIDE05)) for case in bridge if case['plan'] == 'side']
@@ -175,6 +220,8 @@ def select_jobs(stage):
         if name not in BRIDGE:
             jobs += [('run', st.case(plan=plan, stage=str(stage), **fields)) for plan in PLANS]
     jobs += [('run', case) for case in side_check_jobs(stage)]
+    if height:
+        jobs += [('run', case) for case in height_jobs(stage)]
     return jobs + push_jobs(stage) + [('feet', job) for job in feet.jobs(stage)]
 
 
@@ -388,21 +435,81 @@ def side_reasons(side):
     return []
 
 
-def select_summary(runs, push_results):
-    """Step 2 from the stage's stand_turn.run results (7 variants and the ±1 m/s side check) and bridge_kick.run
-    results (standing and walking, with the foot capsules and without). 'pushes' are the judged ones (since iteration
-    24: Unitree +6 ms with the capsules), 'pushes_sim2sim' the ones without them (the rule's numbers before)."""
+def variant_label(name):
+    """The label of a physics variant."""
+    return next(text for key, text, _ in VARIANTS if key == name)
+
+
+def crouch_height(plan, name):
+    """The height command (m) of segment `name` of a stand_turn height plan."""
+    return next(segment[5] for segment in st.PLANS[plan] if segment[0] == name)
+
+
+def crouch_run(runs, plan, name):
+    """Segment `name` of the plan's stand_turn.run result: runs, the fall ('fall_of' text) and the segment (None if
+    the run fell or did not reach it)."""
+    found = [r for r in runs if r['case']['plan'] == plan]
+    if not found:
+        return dict(runs=0, fell=None, seg=None)
+    seg = next((s for s in found[0]['segs'] if s['name'] == name and not s.get('missing')), None)
+    fell = None if found[0]['fell_at'] is None else fall_of(found[0])
+    return dict(runs=len(found), fell=fell, seg=None if fell else seg)
+
+
+def height_check(runs, turn):
+    """The height command checks of step 2 (iteration 29; stages with task_config height_command) from their
+    stand_turn.run results and the 30 s stand's turn (stand30()): the crouched walk's yaw rate, speed and pelvis, the
+    crouched stands' turns and pelvis, and the reasons the stage fails them ([] = passes): the crouched walk fell, was
+    not measured or has |yaw rate| >= CROUCH_DRIFT_LIMIT; the 30 s stand at 0.78 was not measured or turned |.| >
+    STAND_TURN_LIMIT degrees. The crouched stands are printed only, their falls too."""
+    where = variant_label(CROUCH_VARIANT)
+    got = crouch_run(runs, CROUCH_WALK, 'walk')
+    seg = got['seg'] or {}
+    walk = dict(height=crouch_height(CROUCH_WALK, 'walk'), runs=got['runs'], fell=got['fell'],
+                drift=seg.get('yaw_rate'), speed=seg.get('fwd'), pelvis=seg.get('pelvis'))
+    stands = []
+    for plan in CROUCH_STANDS:
+        got = crouch_run(runs, plan, 'stand')
+        seg = got['seg'] or {}
+        stands.append(dict(plan=plan, height=crouch_height(plan, 'stand'), runs=got['runs'], fell=got['fell'],
+                           heading=seg.get('heading_deg'), pelvis=seg.get('pelvis')))
+    what = 'на ходу 0.5 м/с на %.2f' % walk['height']
+    reasons = []
+    if walk['fell']:
+        reasons.append('падение %s (%s: %s)' % (what, where, walk['fell']))
+    elif walk['drift'] is None:
+        reasons.append('увод %s не измерен' % what)
+    elif abs(walk['drift']) >= CROUCH_DRIFT_LIMIT:
+        reasons.append('увод %s %+.3f, |.| >= %.2f (%s)' % (what, walk['drift'], CROUCH_DRIFT_LIMIT, where))
+    if turn['heading'] is None:
+        reasons.append('поворот стоя 30 с не измерен')
+    elif abs(turn['heading']) > STAND_TURN_LIMIT:
+        reasons.append('поворот стоя 30 с %+.1f°, |.| > %g° (%s)' % (turn['heading'], STAND_TURN_LIMIT, where))
+    return dict(walk=walk, stands=stands, reasons=reasons)
+
+
+def select_summary(runs, push_results, height=False):
+    """Step 2 from the stage's stand_turn.run results (7 variants, the ±1 m/s side check, the height checks) and
+    bridge_kick.run results (standing and walking, with the foot capsules and without). 'pushes' are the judged ones
+    (since iteration 24: Unitree +6 ms with the capsules), 'pushes_sim2sim' the ones without them (the rule's numbers
+    before). height: the stage has task_config height_command, so the height checks judge it ('height': their numbers
+    and their own reasons, which also end 'reasons'); without it 'height' is None and the rule is the one before."""
     checked = [r for r in runs if r['case']['plan'] == SIDE_CHECK]
-    runs = [r for r in runs if r['case']['plan'] != SIDE_CHECK]
+    crouched = [r for r in runs if r['case']['plan'] in st.HEIGHT_PLANS]
+    runs = [r for r in runs if r['case']['plan'] != SIDE_CHECK and r['case']['plan'] not in st.HEIGHT_PLANS]
     rows = {name: row([r for r in runs if variant_of(r['case']) == name]) for name, _, _ in VARIANTS}
     labels = {name: text for name, text, _ in VARIANTS}
     pushes = {plan: push_table(push_results, plan, mags, PUSH_PHYSICS) for plan, mags, _ in PUSHES}
     forecast = {plan: push_table(push_results, plan, mags, FORECAST_PHYSICS) for plan, mags, _ in PUSHES}
     side = side_check(checked)
+    turn = stand30(runs)
+    crouch = height_check(crouched, turn) if height else None
     reasons = (judge(rows, labels, [name for name, _, _ in VARIANTS], DRIFT + DRIFT05, STOPS)
                + push_reasons(pushes['stand'], pushes['walk']) + side_reasons(side))
+    if crouch:  # their own reasons, after the rest
+        reasons += crouch['reasons']
     return dict(passes=not reasons, reasons=reasons, rows=rows, pushes=pushes, pushes_sim2sim=forecast, side1=side,
-                stand30=stand30(runs))
+                stand30=turn, height=crouch)
 
 
 def fresh_summary(runs):
@@ -462,12 +569,15 @@ def print_push_tables(pushes, physics, note):
 
 
 def print_pushes(summary):
-    """The 30 s turn, the judged pushes of step 2 (with the foot capsules), the ±1 m/s side check and the pushes
-    without the capsules (the sim2sim forecast)."""
+    """The 30 s turn, the height checks (stages with the height command), the judged pushes of step 2 (with the foot
+    capsules), the ±1 m/s side check and the pushes without the capsules (the sim2sim forecast)."""
     turn = summary['stand30']
     print('  стояние 30 с (Unitree +6 мс): ' + (
         'поворот %+.1f°' % turn['heading'] if turn['heading'] is not None
-        else 'не измерено' if turn['fell'] is None else 'упал на %.1f с' % turn['fell']))
+        else 'не измерено' if turn['fell'] is None else 'упал на %.1f с' % turn['fell'])
+          + ('' if not summary.get('height') else ' (судится: |.| <= %g°, этап с командой высоты)' % STAND_TURN_LIMIT))
+    if summary.get('height'):
+        print_height(summary['height'], turn)
     print_push_tables(summary['pushes'], PUSH_PHYSICS, 'судится')
     side = summary['side1']
     print('  шаг вбок ±1 м/с (%s, судится по падениям): прогонов %d, падений %d%s; скорость вбок %s / %s м/с, увод '
@@ -481,8 +591,57 @@ def print_pushes(summary):
                           'прогноз sim2sim: стопы проходят друг сквозь друга, как в unitree_mujoco; не судится')
 
 
+def print_height(height, turn):
+    """The height command checks of one stage (height_check()), a row each: the crouched walk, the 30 s stand at 0.78
+    (stand30()), the crouched stands; the judged limit or 'не судится' last."""
+    print('  команда высоты (%s):' % variant_label(CROUCH_VARIANT))
+    print('    %-26s %11s %10s %7s %7s  %s' % ('', 'увод, рад/с', 'поворот, °', 'v, м/с', 'таз, м', 'правило'))
+    walk = height['walk']
+    rows = [('ходьба 0.5 м/с на %.2f' % walk['height'], walk['drift'], None, walk['speed'], walk['pelvis'],
+             '|увод| < %.2f' % CROUCH_DRIFT_LIMIT, walk['fell'], walk['runs'])]
+    rows.append(('стояние 30 с на 0.78', None, turn['heading'], None, None, '|поворот| <= %g°' % STAND_TURN_LIMIT,
+                 None if turn['fell'] is None else '%.1f с' % turn['fell'], 1))
+    rows += [('стояние 30 с на %.2f' % s['height'], None, s['heading'], None, s['pelvis'], 'не судится', s['fell'],
+              s['runs']) for s in height['stands']]
+    for text, drift, heading, speed, pelvis, rule, fell, runs in rows:
+        print('    %-26s %11s %10s %7s %7s  %s%s' % (
+            text, number(drift, '%+.3f'), number(heading, '%+.1f'), number(speed, '%+.2f'), number(pelvis, '%.3f'),
+            rule, '; упал: %s' % fell if fell else '' if runs else '; не прогнан'))
+
+
+def print_height_table(stages):
+    """After every stage: the stages with the height command, a row each with the height checks' numbers and step 2
+    without them (the rule before) and with them."""
+    rows = [s for s in stages if s['select'].get('height')]
+    if not rows:
+        return
+    walk, stands = crouch_height(CROUCH_WALK, 'walk'), [crouch_height(plan, 'stand') for plan in CROUCH_STANDS]
+    print('\nкоманда высоты (%s), этапы с height_command: увод на ходу 0.5 м/с на %.2f (|.| < %.2f), поворот стоя '
+          '30 с на 0.78 (|.| <= %g°), на %s (не судятся)' % (
+              variant_label(CROUCH_VARIANT), walk, CROUCH_DRIFT_LIMIT, STAND_TURN_LIMIT,
+              ' / '.join('%.2f' % c for c in stands)))
+    width = max(len(s['label']) for s in rows)
+    print('  %-*s %9s %9s %9s %9s %14s %12s' % (width, '', 'увод %.2f' % walk, 'стоя 0.78',
+                                                *('стоя %.2f' % c for c in stands), 'шаг 2 без них', 'шаг 2'))
+    for s in rows:
+        select, height = s['select'], s['select']['height']
+        before = len(select['reasons']) == len(height['reasons'])  # every other reason is the rule before's
+        print('  %-*s %9s %9s %9s %9s %14s %12s' % (
+            width, s['label'], 'упал' if height['walk']['fell'] else number(height['walk']['drift'], '%+.3f'),
+            number(select['stand30']['heading'], '%+.1f'),
+            *('упал' if x['fell'] else number(x['heading'], '%+.1f') for x in height['stands']),
+            'проходит' if before else 'не проходит', 'проходит' if select['passes'] else 'не проходит'))
+
+
 def verdict(summary):
-    print('  итог: ' + ('проходит' if summary['passes'] else 'не проходит: ' + '; '.join(summary['reasons'])))
+    """The verdict and the reasons; those of the height checks (the last ones) after the others, apart."""
+    if summary['passes']:
+        print('  итог: проходит')
+        return
+    height = (summary.get('height') or {}).get('reasons') or []
+    rest = summary['reasons'][:len(summary['reasons']) - len(height)]
+    print('  итог: не проходит: ' + ' | '.join((['; '.join(rest)] if rest else [])
+                                                + (['команда высоты: ' + '; '.join(height)] if height else [])))
 
 
 def report(stage):
@@ -510,7 +669,7 @@ def cost(kind, job):
     else:
         plan, physics = st.PLANS[job['plan']], job['physics']
     fix = 3500 if physics.startswith('um') else 14000  # FixStand at 2 ms / 0.5 ms
-    return sum(secs for *_, secs in plan) / st.TICK + fix + 700
+    return sum(segment[4] for segment in plan) / st.TICK + fix + 700  # (name, vx, vy, wz, seconds[, height])
 
 
 def init():
@@ -550,9 +709,10 @@ def main(argv=None):
             raise SystemExit(f'Не этап и не выгрузка export_g1: {p}')
     if not st.LOGS.is_dir():
         raise SystemExit(f'Нет логов связки (окна времени): {st.LOGS} — запущена ли WSL Ubuntu?')
+    heights = [st.has_height(p) for p in paths]  # task_config height_command: the height checks of step 2
     items = []  # (stage index, step, kind, job)
     for i, p in enumerate(paths):
-        items += [(i, 'select', kind, job) for kind, job in select_jobs(p)]
+        items += [(i, 'select', kind, job) for kind, job in select_jobs(p, heights[i])]
         if args.fresh:
             items += [(i, 'fresh', kind, job) for kind, job in fresh_jobs(p)]
     order = sorted(range(len(items)), key=lambda k: -cost(items[k][2], items[k][3]))
@@ -577,7 +737,8 @@ def main(argv=None):
         def spent(step):
             return sum(seconds[k] for k, item in enumerate(items) if item[:2] == (i, step))
 
-        stage = dict(label=label(p), path=str(p), select=select_summary(of('select', 'run'), of('select', 'push')),
+        stage = dict(label=label(p), path=str(p), height_command=heights[i],
+                     select=select_summary(of('select', 'run'), of('select', 'push'), heights[i]),
                      feet=feet.summary(of('select', 'feet')),
                      runs={'select': sum(item[:2] == (i, 'select') for item in items)},
                      seconds={'select': spent('select')})
@@ -589,6 +750,7 @@ def main(argv=None):
         stage['results'] = {step: {kind: of(step, kind) for kind in ('run', 'push', 'feet')}
                             for step in (('select', 'fresh') if args.fresh else ('select',))}
         stages.append(stage)
+    print_height_table(stages)
     passed = [s for s in stages if s['select']['passes']]
     print('\nшаг 2 проходят %d из %d этапов: %s' % (len(passed), len(stages), ', '.join(s['label'] for s in passed)
                                                     or '-'))
@@ -600,6 +762,8 @@ def main(argv=None):
     if args.out:
         rule = dict(drift=DRIFT_LIMIT, stop=STOP_LIMIT, variants=[name for name, _, _ in VARIANTS], side05=SIDE05,
                     push_physics=PUSH_PHYSICS, forecast_physics=FORECAST_PHYSICS, side_check=SIDE_CHECK,
+                    height=dict(walk=CROUCH_WALK, stands=CROUCH_STANDS, variant=CROUCH_VARIANT,
+                                drift=CROUCH_DRIFT_LIMIT, stand_turn=STAND_TURN_LIMIT),
                     pushes=dict(dirs=DIRS8, stand_mags=STAND_MAGS, stand_offsets=STAND_OFFSETS, walk_mags=WALK_MAGS,
                                 walk_offsets=WALK_OFFSETS, judged_mag=JUDGED_MAG, stand_falls=STAND_FALLS,
                                 cell_falls=CELL_FALLS, half=HALF, walk_falls=WALK_FALLS))

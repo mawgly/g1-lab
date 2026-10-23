@@ -7,7 +7,9 @@ policy.onnx takes `obs` [1, A] (A = the actor's inputs: the deploy terms with th
 returns `actions` [1, 29], float32, static shapes, opset 17. Inside: the stage's VecNormalize ((x - mean) /
 sqrt(var + epsilon), clipped to ±clip_obs), the SB3 actor (mlp_extractor.policy_net + action_net; its first layer
 keeps only the columns of the actor's inputs, which is what ActorInputs' zeroing of the rest amounts to), the mean
-action (no σ) and the clip to ±action_limit the environment applies before the PD target; with task_config
+action (no σ) and the clip to ±action_limit the environment applies before the PD target (task_config
+height_command / upper_body_slot add the terms height_command and upper_body_command after last_action: A 585 at
+history 5, for g1_ctrl with scripts/sim2sim/patches/g1_ctrl-height.patch); with task_config
 lock_wrists, then zeros on the wrist pitch and yaw outputs (g1_tensor_math.lock_joints, as the environment), so
 g1_ctrl holds those joints at default_joint_pos. g1_ctrl feeds that output back as last_action, exactly as the
 environment's previous_action, and every observation term in deploy.yaml has scale 1 and clip null.
@@ -119,10 +121,11 @@ def applied_action(action, config, raw):
     return task.lock_joints(torch.from_numpy(np.asarray(action))[None], raw.wrist_mask)[0].numpy()
 
 
-def command_inputs(joints, history):
-    """[start, end) of the newest frame's velocity_commands in the actor's input (history_observation layout)."""
-    start, end = task.deploy_terms(joints)[TERMS.index('velocity_commands')]
-    positions = task.history_index(joints, history)[history - 1][start:end]
+def command_inputs(joints, history, extra=()):
+    """[start, end) of the newest frame's velocity_commands in the actor's input (history_observation layout; extra:
+    the sizes of the terms after last_action)."""
+    start, end = task.deploy_terms(joints, extra)[TERMS.index('velocity_commands')]
+    positions = task.history_index(joints, history, extra)[history - 1][start:end]
     if positions != list(range(positions[0], positions[0] + end - start)):
         raise ValueError('Команда во входе актёра лежит не подряд')
     return positions[0], positions[0] + end - start
@@ -271,9 +274,12 @@ def deploy_config(raw, config, narrowed=None):
     ranges = np.stack((raw.target_low, raw.target_high), axis=1)
     if not (raw.model.jnt_limited[raw.joints].all() and (ranges[:, 0] < ranges[:, 1]).all()):
         raise ValueError('У суставов модели нет пределов для clip')
-    sizes = [end - start for start, end in task.deploy_terms(nu)]
+    sizes = [end - start for start, end in task.deploy_terms(nu, raw.extra_sizes)]
+    names = (*TERMS, *(name for name, _ in raw.extra_terms))
     params = {'velocity_commands': {'command_name': 'base_velocity'},
               'gait_phase': {'period': float(config['gait']['period'])}}
+    if config.get('height_command'):  # g1_ctrl-height.patch: c from the right stick (height_params)
+        params[task.HEIGHT_TERM] = height_params(config)
     return {
         'joint_ids_map': list(range(nu)),  # the model's actuators are in the SDK order, as controller.json
         'step_dt': float(raw.dt),
@@ -289,8 +295,18 @@ def deploy_config(raw, config, narrowed=None):
             'joint_ids': None}},
         'observations': {name: {'params': params.get(name, {}), 'clip': None, 'scale': [1.] * size,
                                 'history_length': int(config['history'])}
-                         for name, size in zip(TERMS, sizes)},
+                         for name, size in zip(names, sizes)},
     }
+
+
+def height_params(config):
+    """deploy.yaml params of the height_command term for scripts/sim2sim/patches/g1_ctrl-height.patch: c = nominal +
+    (nominal − lowest)·min(0, ry) from the right stick's vertical axis (smoothed as the left stick, 0.03), at least
+    walking_lowest while the command's norm is at least walking_norm (phase_stop's threshold); the term reads
+    c − nominal. The stage's crouch_min: 0.78 + 0.14·min(0, ry), c ≥ 0.70 walking, with the working values."""
+    lowest, walking = config['commands']['crouch_min']
+    return {'nominal': float(task.BASE_HEIGHT), 'lowest': float(lowest), 'walking_lowest': float(walking),
+            'walking_norm': float(task.PHASE_STOP_NORM)}
 
 
 def write_yaml(value, path, header):
@@ -352,7 +368,7 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
         raw = env.unwrapped
         actor_inputs, actions = raw.actor_inputs, raw.model.nu
         if raw.frame_size * config['history'] != actor_inputs or raw.frame_size != sum(
-                end - start for start, end in task.deploy_terms(raw.model.nu)):
+                end - start for start, end in task.deploy_terms(raw.model.nu, raw.extra_sizes)):
             raise ValueError('Раскладка входа актёра не совпадает с термами deploy.yaml')
         if abs(raw.dt - identity['control_dt']) > 1e-12:
             raise ValueError('Шаг управления этапа не совпадает с controller.json')
@@ -361,7 +377,7 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
             trim = np.asarray(trim, dtype=float)
             if trim.shape != (actions,) or not np.isfinite(trim).all():
                 raise ValueError('Подстройка стоя: нужно по одному конечному числу на сустав')
-            command = command_inputs(actions, config['history'])
+            command = command_inputs(actions, config['history'], raw.extra_sizes)
         mirror = None
         if symmetric:  # the actor's inputs mirror among themselves (history frames), never into the critic extras
             obs_index, obs_sign, action_index, action_sign = mirror_maps(env)
@@ -381,6 +397,8 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
             properties['symmetric'] = 'true'
         if config.get('foot_collision'):  # training physics only: the graph and deploy.yaml are the same
             properties.update(foot_collision='true', model_revision=identity['model_revision'])
+        for name, _ in raw.extra_terms:  # observation terms g1_ctrl knows only with g1_ctrl-height.patch
+            properties[name] = 'true'
         write_onnx(module, onnx_path, actor_inputs, actions, properties)
         header = f'humanoid_sim.export_g1: {stage.resolve()} ({metadata.get("steps")} steps)'
         if trim is not None:
@@ -390,6 +408,10 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
         if config.get('foot_collision'):
             header += ('\nfoot_collision: trained with the feet colliding with each other (Unitree\'s foot capsules); '
                        'nothing to set in g1_ctrl')
+        if raw.extra_terms:
+            header += ('\n' + ', '.join(name for name, _ in raw.extra_terms) + ': observation terms of '
+                       'scripts/sim2sim/patches/g1_ctrl-height.patch (stock g1_ctrl refuses them); height_command '
+                       '= c - 0.78 from the right stick down, upper_body_command = zeros')
         if narrowed is not None:
             training = command_ranges(config)
             header += '\ncommand ranges narrowed (--command-ranges) from the training ones:' + ''.join(
@@ -411,6 +433,9 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
     if not config.get('phase_stop'):
         notes.append('В task_config этапа нет phase_stop: true — на роботе g1_ctrl обнуляет фазу шага при норме '
                         'команды < 0,1, а политика училась с фазой, которая тикает всегда.')
+    if raw.extra_terms:
+        notes.append('Во входе термы ' + ', '.join(name for name, _ in raw.extra_terms) + ': штатный g1_ctrl их не '
+                     'знает, нужен патч scripts/sim2sim/patches/g1_ctrl-height.patch (высота — правый стик вниз).')
     return {'stage': stage, 'onnx': onnx_path, 'deploy': yaml_path, 'actor_inputs': actor_inputs,
             'actions': actions, 'history': config['history'], 'warnings': notes,
             'trim': None if trim is None else trim_path, 'symmetric': symmetric,
@@ -437,7 +462,9 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
     trim or the symmetrisation the graph's properties declare (reference_action), on `samples` observations of the
     stage's CPU environment (every `stride`-th step of episodes under CHECK_COMMANDS, driven by the expected
     actions). On the same samples, g1_ctrl's motor target for the ONNX action (deploy_target, the deploy.yaml next to
-    policy.onnx) against the environment's PD target for the action it applies (_target: joint ranges, knee_floor)."""
+    policy.onnx) against the environment's PD target for the action it applies (_target: joint ranges, knee_floor).
+    With task_config height_command the second half of each command's samples comes under a crouch command (the
+    stage's crouch_min, standing or walking, set mid-episode as the stick would)."""
     import onnxruntime
     import yaml
     from .tasks.catalog import make_task
@@ -454,7 +481,7 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
     per_command = math.ceil(samples / len(CHECK_COMMANDS))
     session = onnxruntime.InferenceSession(str(onnx_path), providers=['CPUExecutionProvider'])
     model, norm = load_stage(stage)
-    worst, worst_target, count, resets = 0., 0., 0, 0
+    worst, worst_target, count, resets, crouched = 0., 0., 0, 0, 0
     try:
         for number, command_now in enumerate(CHECK_COMMANDS):
             env = make_task(identity['task_id'], identity['robot_id'],
@@ -462,9 +489,16 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
             raw = env.unwrapped
             actor_inputs = raw.actor_inputs
             mirror = mirror_maps(env) if properties.get('symmetric') == 'true' else None
+            moving = bool(task.command_moving(torch.tensor([command_now]))[0])
+            crouch = config['commands']['crouch_min'][int(moving)] if config.get('height_command') else None
+            options = {'command': list(command_now)}
             try:
-                obs, _ = env.reset(seed=seed_start + number, options={'command': list(command_now)})
+                obs, _ = env.reset(seed=seed_start + number, options=options)
                 for step in range(per_command * stride):
+                    if crouch is not None and step == (per_command // 2) * stride:  # the stick goes down
+                        options['height'] = crouch
+                        raw.set_height(crouch)
+                        obs = raw._observation()
                     expected = reference_action(model, norm, obs, config, raw, trim, command, mirror)
                     if step % stride == 0 and count < samples:
                         got = session.run(['actions'], {'obs': obs[None, :actor_inputs].astype(np.float32)})[0][0]
@@ -472,17 +506,18 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
                         target = raw._target(raw.applied_action(expected))  # what env.step's PD follows
                         worst_target = max(worst_target, float(np.abs(deploy_target(got, deploy) - target).max()))
                         count += 1
+                        crouched += raw.height_command and raw.height < task.BASE_HEIGHT
                     obs, _, terminated, truncated, _ = env.step(expected)
-                    if terminated or truncated:  # a fall: go on under the same command
+                    if terminated or truncated:  # a fall: go on under the same command (and height)
                         resets += 1
-                        obs, _ = env.reset(seed=seed_start + 1000 * resets + number,
-                                           options={'command': list(command_now)})
+                        obs, _ = env.reset(seed=seed_start + 1000 * resets + number, options=options)
             finally:
                 env.close()
     finally:
         norm.close()
     return {'samples': count, 'max_abs_diff': worst, 'max_target_diff': worst_target, 'tolerance': TOLERANCE,
-            'resets': resets, 'ok': count == samples and worst < TOLERANCE and worst_target < TOLERANCE}
+            'resets': resets, 'crouched': int(crouched),
+            'ok': count == samples and worst < TOLERANCE and worst_target < TOLERANCE}
 
 
 def is_export(path):
@@ -583,7 +618,8 @@ def main(argv=None):
     if args.samples > 0:
         verdict = check(stage, result['onnx'], samples=args.samples)
         same = ' (с той же подстройкой стоя)' if trim is not None else ' (симметризованным)' if args.symmetric else ''
-        print(f'Сверка с policy.predict{same}: {verdict["samples"]} наблюдений, max |разница| = '
+        crouched = f' (в приседе {verdict["crouched"]})' if verdict['crouched'] else ''
+        print(f'Сверка с policy.predict{same}: {verdict["samples"]} наблюдений{crouched}, max |разница| = '
               f'{verdict["max_abs_diff"]:.2e}, цели моторов по deploy.yaml {verdict["max_target_diff"]:.2e} '
               f'(порог {verdict["tolerance"]:g}) — {"совпадает" if verdict["ok"] else "НЕ СОВПАДАЕТ"}')
         if not verdict['ok']:

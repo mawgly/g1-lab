@@ -4,9 +4,10 @@
 # Run as root from Windows (PowerShell), after setup.sh:
 #   wsl.exe -d Ubuntu -u root -e bash /mnt/c/Users/Admin/Documents/Codex/Sim/scripts/sim2sim/run.sh [export dir] [gamepad.py options]
 # export dir: output of `python -m humanoid_sim.export_g1` (policy.onnx + deploy.yaml), as a WSL path.
-# gamepad.py options: --scenario walk|turn|side|sidestop|stopstart|passive|stand|push (default walk), --walk,
+# gamepad.py options: --scenario walk|turn|side|sidestop|stopstart|passive|stand|push|crouch (default walk), --walk,
 #   --yaw, --side, --stand-seconds, --push-walking, --push-strength weak|strong|both, --push-dv 1.25,1.5,
-#   --push-order, ... (push needs setup.sh's unitree_mujoco push patch)
+#   --push-order, --ry, ... (push needs setup.sh's unitree_mujoco push patch; crouch and --ry a height export,
+#   task_config height_command, and setup.sh's g1_ctrl-height.patch: the right stick down is the height command)
 # run.sh options:
 #   --fixstand-wrist left|right[=rad]  FixStand ends with that wrist pitch (SDK 20 left, 27 right) at this target
 #                                      instead of Unitree's 0 (default 0.699999988: candidate 2's own target for
@@ -82,6 +83,11 @@ GL=(LIBGL_ALWAYS_SOFTWARE=1)
 for f in policy.onnx deploy.yaml; do
   [ -f "$EXPORT/$f" ] || { echo "no $EXPORT/$f"; exit 1; }
 done
+# A height export needs g1_ctrl with the height patch (setup.sh g1ctrl without SIM2SIM_HEIGHT=off): its term
+# registrar puts the name into the binary.
+if grep -q '^  height_command:' "$EXPORT/deploy.yaml" && ! grep -q height_command "$G1/build/g1_ctrl"; then
+  echo "g1_ctrl is built without patches/g1_ctrl-height.patch, $EXPORT needs it: run setup.sh g1ctrl"; exit 1
+fi
 mkdir -p "$OUT" "$POLICY/exported" "$POLICY/params"
 cp "$EXPORT/policy.onnx" "$POLICY/exported/policy.onnx"
 cp "$EXPORT/deploy.yaml" "$POLICY/params/deploy.yaml"
@@ -103,7 +109,8 @@ if [ -n "$WRIST_SIDE" ]; then
     { echo "fixstand.py failed"; exit 1; }
 fi
 cp "$CFG" "$OUT/g1_ctrl_config.yaml"
-chown mawgly:mawgly "$OUT/g1_ctrl_config.yaml"
+md5sum "$G1/build/g1_ctrl" > "$OUT/g1_ctrl.md5"  # which build ran (with the height patch or without)
+chown mawgly:mawgly "$OUT/g1_ctrl_config.yaml" "$OUT/g1_ctrl.md5"
 
 echo "sim2sim: $NAME"
 cd "$ROOT/unitree_mujoco/simulate/build" || exit 1

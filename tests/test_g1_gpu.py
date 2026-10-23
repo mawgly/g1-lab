@@ -1296,6 +1296,155 @@ def test_g1_gpu_foot_contact_is_logged_without_the_self_contact_weight(monkeypat
 
 
 @pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_self_contact_with_arm_contact_mask(monkeypatch):
+    """arm_perturb_contact_mask on both backends, three worlds each against the CPU task with the same segment (set by
+    hand; arm_perturb 0, so nothing else is drawn): world 0 a 6-step segment holds the upper arms pressed on the torso
+    (test_g1_self_contact.arms_pressed, the policy's arms at home), world 1 the policy presses them itself (no
+    segment), world 2 drives its feet into each other in the air (foot_collision's capsules) while a segment holds the
+    arms at home. Worlds 0 and 1 move alike (the same applied action), but in the segment world 0's arm contacts leave
+    the share (0 on both backends) while world 1's count (0, 0.5, then 1, as without the mask); the foot contacts of
+    world 2 count in its segment, as on the CPU task (Warp may start them a substep or two apart). The segment over,
+    world 0 pressing by itself is charged again. rollout/self_contact is the masked share."""
+    import mujoco
+    import warp as wp
+    import humanoid_sim.g1_tensor_env as tensor_env
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
+    from test_g1_foot_collision import crossed
+    from test_g1_self_contact import _record, arms_pressed
+    seen_gpu, original = [], tensor_env.reward_components
+
+    def spy(*args, **kwargs):
+        components, fell = original(*args, **kwargs)
+        seen_gpu.append((kwargs, components))
+        return components, fell
+
+    monkeypatch.setattr(tensor_env, 'reward_components', spy)
+    profile = dict(real_robot=True, action_limit=10., gait={'period': .6, 'stance_fraction': .55}, foot_collision=True,
+                   reward_weights={'self_contact': 4.}, arm_perturb_contact_mask=True)
+    cpus = [G1VelocityEnv(**profile) for _ in range(3)]
+    seen_cpu = [_record(cpu) for cpu in cpus]
+    gpu = TensorG1Env(3, seed=4, resample_commands=False, push_velocity=0, observation_noise=False, randomize=False,
+                      **profile)
+    try:
+        assert gpu.arm_geoms is not None and torch.equal(gpu.arm_geoms.cpu(), torch.from_numpy(cpus[0].arm_geoms))
+        for cpu in cpus:
+            cpu.reset(seed=4, options={'command': [0., 0., 0.]})
+        cpus[2].data.qpos[cpus[2].qadr] = cpus[2].home + crossed(cpus[2], .12)
+        cpus[2].data.qpos[2] = .9  # in the air
+        mujoco.mj_forward(cpus[2].model, cpus[2].data)
+        held = np.stack([arms_pressed(), np.zeros(29), np.zeros(29)])
+        cpus[0].set_arm_perturb(6, held[0])
+        cpus[2].set_arm_perturb(6, held[2])
+        gpu.reset()
+        gpu.set_arm_perturb(torch.tensor([6, 0, 6]), torch.tensor(held, dtype=torch.float32))
+        gpu.qpos.copy_(torch.tensor(np.stack([cpu.data.qpos for cpu in cpus]), device=gpu.device, dtype=torch.float32))
+        gpu.qvel.zero_()
+        gpu.command.zero_()
+        with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(gpu.device))):
+            wp.capture_launch(gpu.forward_graph)
+        gpu._obs()  # refreshes the observed (rewarded) command
+        gpu.rollout_metrics()  # from here on
+        cross = crossed(cpus[2], .25) / cpus[2].scale
+        shares = {'cpu': [], 'gpu': []}
+        for step in range(8):
+            actions = np.stack([np.zeros(29) if step < 6 else arms_pressed(), arms_pressed(), cross])
+            results = [cpu.step(action) for cpu, action in zip(cpus, actions)]
+            _, reward, _, _, _ = gpu.step(torch.tensor(actions, device=gpu.device, dtype=torch.float32))
+            gpu.check_health()
+            in_segment = step < 6
+            assert gpu.arm_contacts_masked.tolist() == [in_segment, False, in_segment]
+            assert [cpu.arm_contacts_masked for cpu in cpus] == [in_segment, False, in_segment]
+            kwargs, components = seen_gpu[-1]
+            force = gpu.self_contact_force.cpu().numpy()
+            torch.testing.assert_close(kwargs['self_contact'], task.self_contact_share(gpu.self_contact_force))
+            for world in range(3 if in_segment else 2):
+                expected_reward, info = results[world][1], results[world][-1]
+                cpu_force = np.array(seen_cpu[world][-10:])
+                cpu_share = -info['reward_components']['self_contact'] / 4
+                assert cpu_share == float(np.mean(cpu_force > task.SELF_CONTACT_FORCE))
+                if world < 2:  # no substep near the threshold here: the same share on both
+                    assert float(kwargs['self_contact'][world]) == cpu_share
+                    np.testing.assert_allclose(reward.cpu()[world], expected_reward, atol=.03, rtol=.02)
+                else:  # the onset substep of the foot contact may differ: the rest of the reward apart
+                    shares['cpu'].append(cpu_share)
+                    shares['gpu'].append(float(kwargs['self_contact'][2]))
+                    rest = float(reward.cpu()[2]) - float(components['self_contact'][2])
+                    assert rest == pytest.approx(expected_reward - info['reward_components']['self_contact'],
+                                                 abs=.05, rel=.03)
+            if in_segment:  # world 0 presses as world 1 does, its arm contacts left out: nothing else touches
+                assert float(force[0].max()) == 0 and max(seen_cpu[0][-10:]) == 0
+                np.testing.assert_allclose(gpu.qpos[0].cpu().numpy(), gpu.qpos[1].cpu().numpy(), atol=1e-4, rtol=0)
+            else:  # over: world 0 pressing by itself is charged
+                assert float(kwargs['self_contact'][0]) == 1.
+        world_1 = [float(kwargs['self_contact'][1]) for kwargs, _ in seen_gpu[-8:]]
+        assert world_1[0] == 0 and 0 < world_1[1] < 1 and world_1[2:] == [1.] * 6  # as without the mask (0.5 there)
+        assert [float(kwargs['self_contact'][0]) for kwargs, _ in seen_gpu[-8:]] == [0.] * 6 + [1.] * 2
+        # World 2: CPU [0, 0, 0, 1, 1, 1]; Warp may start a substep or two apart.
+        assert shares['cpu'][0] == shares['gpu'][0] == 0 and min(shares['cpu'][-2:] + shares['gpu'][-2:]) >= .8
+        assert abs(sum(shares['gpu']) - sum(shares['cpu'])) <= .3
+        metrics = gpu.rollout_metrics()
+        everything = [float(kwargs['self_contact'].sum()) for kwargs, _ in seen_gpu[-8:]]
+        assert metrics['rollout/self_contact'] == pytest.approx(np.sum(everything) / 24, rel=1e-6)
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+    plain = TensorG1Env(2, seed=4, real_robot=True, action_limit=10., reward_weights={'self_contact': 4.})
+    try:  # without the setting: no arm geoms, nothing masked (the original rule)
+        assert plain.arm_geoms is None
+        plain.reset()
+        plain.set_arm_perturb(torch.tensor([3, 3]), torch.tensor(np.stack([arms_pressed()] * 2), dtype=torch.float32))
+        plain.step(torch.zeros((2, 29), device=plain.device))
+        assert not bool(plain.arm_contacts_masked.any())
+    finally:
+        plain.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_arm_perturb_radians_scales_the_held_poses(monkeypatch):
+    """1024 worlds at arm_perturb 0.5, amplitude 0.4 and 1.0, one seed, falls switched off (so no reset changes a
+    segment): the same segments start at the same steps in the same worlds (the draws do not depend on the amplitude),
+    each holding the same pose scaled by 2.5 within the action box (the wrist pitch and yaw joints, scale 0.07, clip at
+    ±10); the poses of the wide one reach ±1.0 rad per arm joint, never beyond."""
+    from humanoid_sim.tasks import g1_tensor_math as task
+    monkeypatch.setattr(task, 'FALL_HEIGHT', -1e9)
+    monkeypatch.setattr(task, 'FALL_UPRIGHT', -2.)
+    n = 1024
+    envs = [TensorG1Env(n, seed=3, max_episode_steps=1000, resample_commands=False, push_velocity=0, real_robot=True,
+                        action_limit=10., observation_noise=False, randomize=False, arm_perturb=.5,
+                        arm_perturb_radians=radians) for radians in (.4, 1.)]
+    try:
+        narrow, wide = envs
+        arms = wide.arm_mask
+        for env in envs:
+            env.reset()
+        policy = torch.full((n, 29), .05, device=wide.device)
+        largest, segments = torch.zeros(int(arms.sum()), device=wide.device), 0
+        for _ in range(300):
+            for env in envs:
+                env.step(policy)
+            assert torch.equal(wide.perturb_steps, narrow.perturb_steps)
+            torch.testing.assert_close(wide.perturb_action[:, arms], (2.5 * narrow.perturb_action[:, arms]).clamp(-10, 10),
+                                       rtol=1e-5, atol=1e-6)
+            on = (wide.previous_action[:, arms] != .05).any(dim=1)
+            assert torch.equal(on, (narrow.previous_action[:, arms] != .05).any(dim=1))
+            radians = (wide.perturb_action[on][:, arms] * wide.scale[arms]).abs()
+            if len(radians):
+                largest = torch.maximum(largest, radians.amax(dim=0))
+            segments += int(on.sum())
+            assert not bool(wide.arm_contacts_masked.any())  # the mask is off
+        wrists = wide.scale[arms] < .1
+        assert int(wrists.sum()) == 4 and segments > 1000
+        assert bool((largest[~wrists] <= 1. + 1e-5).all()) and bool((largest[~wrists] > .95).all())
+        torch.testing.assert_close(largest[wrists], 10 * wide.scale[arms][wrists])  # clipped at the box edge
+        assert wide.rollout_metrics()['rollout/arm_perturb'] == narrow.rollout_metrics()['rollout/arm_perturb']
+    finally:
+        for env in envs:
+            env.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
 def test_g1_cpu_gpu_arm_press(monkeypatch):
     """World 0 presses the upper arms on the torso (no delay), world 1 sets the left shoulder pitch target 0.5 rad
     from home with the motors 15 substeps late, so its whole first step follows the zero action: each against the
@@ -1738,3 +1887,142 @@ def test_g1_gpu_motor_friction_draws_per_world_redraws_at_reset_and_is_logged():
             simulation.set_motor_friction(.5)
     finally:
         simulation.close()
+
+
+# height_command / upper_body_slot (iteration 28): candidate 8's layout with the two terms, the crouch draws' recipe.
+HEIGHT_PROFILE = dict(real_robot=True, critic_extras=True, history=5, phase_stop=True, action_limit=10.,
+                      gait={'period': .6, 'stance_fraction': .55}, height_command=True, upper_body_slot=True,
+                      reward_weights={'height': 10., 'height_ceiling': 2., 'stand_pose': 1., 'still': 3.})
+CROUCH_COMMANDS = {'crouch_share': [.5, .33], 'crouch_min': [.64, .70], 'crouch_speed': 1.}
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_height_command(monkeypatch):
+    """Two standing worlds told 0.70 and 0.78 (set_height), each against the CPU task reset with the same height: the
+    observation (the height term c − 0.78 and the slot's zeros in every history frame) matches, and over three steps
+    the CUDA task hands the shared reward the world's c and stand_target(home, c) on the crouch joints, so the
+    height, height_ceiling and stand_pose terms match the CPU ones; at 0.78 the ceiling is 0 and the stand pose home."""
+    import warp as wp
+    import humanoid_sim.g1_tensor_env as tensor_env
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
+    seen, original = [], tensor_env.reward_components
+
+    def spy(*args, **kwargs):
+        components, fell = original(*args, **kwargs)
+        seen.append((kwargs, components))
+        return components, fell
+
+    monkeypatch.setattr(tensor_env, 'reward_components', spy)
+    heights = (.70, .78)
+    cpus = [G1VelocityEnv(**HEIGHT_PROFILE) for _ in heights]
+    gpu = TensorG1Env(2, seed=4, resample_commands=False, push_velocity=0, observation_noise=False, randomize=False,
+                      **HEIGHT_PROFILE)
+    try:
+        assert gpu.observation_space.shape == (589,) and gpu.crouch and gpu.fixed_normalization is not None
+        for cpu, height in zip(cpus, heights):
+            cpu.reset(seed=4, options={'command': [0., 0., 0.], 'height': height})
+        gpu.reset()
+        gpu.qpos.copy_(torch.tensor(np.stack([cpu.data.qpos for cpu in cpus]), device=gpu.device, dtype=torch.float32))
+        gpu.qvel.zero_()
+        gpu.command.zero_()
+        gpu.set_height(torch.tensor(heights))
+        with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(gpu.device))):
+            wp.capture_launch(gpu.forward_graph)
+        start = gpu._obs('fill').cpu()
+        for world, cpu in enumerate(cpus):
+            np.testing.assert_allclose(start[world], cpu._observation(), atol=2e-5, rtol=2e-5)
+            np.testing.assert_allclose(start[world, 490:495], heights[world] - .78, atol=1e-6, rtol=0)
+            assert not start[world, 495:585].any()
+        for step in range(3):
+            results = [cpu.step(np.zeros(29)) for cpu in cpus]
+            _, reward, terminated, _, terminal = gpu.step(torch.zeros((2, 29), device=gpu.device))
+            gpu.check_health()
+            kwargs, components = seen[-1]
+            torch.testing.assert_close(kwargs['height_command'].cpu(), torch.tensor(heights))
+            torch.testing.assert_close(kwargs['stand_home'],
+                                       task.stand_target(gpu.home, gpu.height_command, gpu.crouch_joints))
+            assert torch.equal(kwargs['stand_home'][1], gpu.home)  # 0.78: home
+            for world, result in enumerate(results):
+                np.testing.assert_allclose(terminal.cpu()[world], result[0], atol=.03, rtol=.02)
+                np.testing.assert_allclose(reward.cpu()[world], result[1], atol=.03, rtol=.02)
+                parts = result[4]['reward_components']
+                for name in ('height', 'height_ceiling', 'stand_pose'):
+                    np.testing.assert_allclose(float(components[name][world]), parts[name], atol=2e-3, rtol=1e-2)
+            assert float(components['height_ceiling'][0]) < -.3 and float(components['height_ceiling'][1]) == 0
+            assert not terminated.any()
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_height_draws_per_world_redraws_at_command_changes_freezes_its_columns_and_logs(monkeypatch):
+    """4096 worlds with the crouch recipe: at the reset standing worlds crouch about half the time to [0.64, 0.78),
+    walking ones up to 1 m/s a third of the time to [0.70, 0.78), faster ones never; a resample at every step draws c
+    for each new command; rollout/crouch_share and rollout/height_excess are logged; TensorNormalize keeps the fixed
+    columns; without the settings nothing is drawn, the observation is the old 494 and no crouch log appears."""
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tensor_ppo import TensorNormalize
+    commands = {'min_speed': -1., 'max_speed': 2., 'stand_probability': .3, 'lateral_speed': .5, 'yaw_rate': 1.,
+                'straight_probability': .5, **CROUCH_COMMANDS}
+    profile = dict(push_velocity=0, observation_noise=False, randomize=False)
+    n = 4096
+    env = TensorG1Env(n, seed=5, commands=commands, **profile, **HEIGHT_PROFILE)
+
+    def kinds(command):
+        moving = task.command_moving(command)
+        fast = command[:, :2].norm(dim=1) > 1
+        return ~moving, moving & ~fast, moving & fast
+
+    try:
+        obs = env.reset()
+        assert obs.shape == (n, 589)
+        torch.testing.assert_close(obs[:, 494], env.height_command - .78, atol=1e-6, rtol=0)
+        stand, walk, fast = kinds(env.command)
+        c = env.height_command
+        for mask, share, lowest in ((stand, .5, .64), (walk, .33, .70), (fast, 0., None)):
+            crouched = c[mask] < task.BASE_HEIGHT
+            assert float(crouched.float().mean()) == pytest.approx(share, abs=.06)
+            assert bool((c[mask][~crouched] == np.float32(task.BASE_HEIGHT)).all())
+            if lowest is not None:
+                assert float(c[mask][crouched].min()) >= lowest - 1e-6 and float(c[mask].max()) <= .78 + 1e-6
+        norm = TensorNormalize(env.observation_space.shape, n, env.device, fixed=env.fixed_normalization)
+        norm.observation(obs)
+        positions = torch.as_tensor(env.fixed_normalization[0], device=env.device)
+        assert not norm.obs.mean[positions].any() and float(norm.obs.var[490]) == .0025
+        monkeypatch.setattr(task, 'COMMAND_RESAMPLE_SECONDS', .001)  # every world changes its command every step
+        action = torch.zeros((n, 29), device=env.device)
+        for _ in range(3):
+            obs, _, _, _, _ = env.step(action)
+            env.check_health()
+            stand, walk, fast = kinds(env.command)
+            c = env.height_command
+            assert bool((c[fast] == np.float32(.78)).all()) and float(c[walk].min()) >= .70 - 1e-6
+            assert float(c[stand].min()) >= .64 - 1e-6 and float((c[stand] < .78).float().mean()) > .35
+            torch.testing.assert_close(obs[:, 494], c - .78, atol=1e-6, rtol=0)
+            norm.observation(obs)
+            assert not norm.obs.mean[positions].any()
+        metrics = env.rollout_metrics()
+        assert .1 < metrics['rollout/crouch_share'] < .4 and metrics['rollout/height_excess'] > 0
+    finally:
+        env.close()
+    plain_profile = {key: value for key, value in HEIGHT_PROFILE.items() if key not in ('height_command',
+                                                                                       'upper_body_slot')}
+    plain_commands = {key: value for key, value in commands.items() if key not in CROUCH_COMMANDS}
+    plain = TensorG1Env(8, seed=5, commands=plain_commands, **profile, **plain_profile)
+    off = TensorG1Env(8, seed=5, commands=plain_commands, height_command=False, upper_body_slot=False, **profile,
+                      **plain_profile)
+    try:
+        assert plain.observation_space.shape == off.observation_space.shape == (494,)
+        for other in (plain, off):
+            other.reset()
+            other.step(torch.full((8, 29), .3, device=other.device))
+        assert torch.equal(off.generator.get_state(), plain.generator.get_state())
+        torch.testing.assert_close(off.qpos, plain.qpos, rtol=0, atol=0)
+        assert 'rollout/crouch_share' not in off.rollout_metrics() and off.fixed_normalization is None
+        with pytest.raises(ValueError):
+            off.set_height(.7)
+    finally:
+        plain.close(), off.close()

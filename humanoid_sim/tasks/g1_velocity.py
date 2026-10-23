@@ -12,7 +12,8 @@ from gymnasium import spaces
 import mujoco
 import numpy as np
 import torch
-from .config import CRITIC_EXTRAS, FORCE_PUSH_RANGE, MOTOR_FRICTION_RANGE, g1_commands, g1_gait, g1_reward_weights
+from .config import (ARM_PERTURB_RADIANS, ARM_PERTURB_RADIANS_RANGE, CRITIC_EXTRAS, CROUCH_HEIGHTS, FORCE_PUSH_RANGE,
+                     MOTOR_FRICTION_RANGE, g1_commands, g1_gait, g1_reward_weights)
 from . import g1_tensor_math as task
 
 ASSETS = Path(__file__).resolve().parents[2] / 'assets' / 'robots' / 'g1'
@@ -145,8 +146,20 @@ class G1VelocityEnv(gym.Env):
                  training_realism=1., history=1, stand_heading_hold=True, phase_stop=False, sole_contact=False,
                  random_phase=False, action_delay=0., arm_perturb=0., lock_wrists=False, knee_floor=None,
                  force_push=0., feet_flat_stance=False, foot_collision=False, side_heading_hold=True,
-                 motor_friction=0.):
+                 motor_friction=0., height_command=False, upper_body_slot=False,
+                 arm_perturb_radians=ARM_PERTURB_RADIANS, arm_perturb_contact_mask=False):
         self.real_robot = bool(real_robot)
+        # height_command: the pelvis height command c (self.height), an observation term after last_action; drawn at
+        # training resets and command changes (task.height_draw), BASE_HEIGHT at a reset with a command, set by
+        # set_height or options['height'] (set_command keeps it); the reward's height, fall and stand pose follow it.
+        # upper_body_slot: a reserved term of zeros after it. Both are terms of the deploy layout (real robot only).
+        self.height_command = bool(height_command)
+        self.upper_body_slot = bool(upper_body_slot)
+        if (self.height_command or self.upper_body_slot) and not self.real_robot:
+            raise ValueError('height_command and upper_body_slot require real_robot')
+        self.extra_terms = task.extra_terms(self.height_command, self.upper_body_slot)
+        self.extra_sizes = tuple(size for _, size in self.extra_terms)
+        self.height = task.BASE_HEIGHT
         # Largest multiplier of the motor model's joint friction; a reset without a set command draws the episode's
         # m ~ U(0, motor_friction) (task.motor_friction_draw), as the CUDA task does per world. 0: the original task.
         self.motor_friction = float(motor_friction)
@@ -174,6 +187,14 @@ class G1VelocityEnv(gym.Env):
         self.arm_perturb = float(arm_perturb)
         if not 0. <= self.arm_perturb <= .5:
             raise ValueError('arm_perturb must be in [0, 0.5]')
+        # Amplitude (±rad per arm joint) of a segment's random pose (task.arm_perturb_draw); ARM_PERTURB_RADIANS: the
+        # original draw. And whether contacts touching an arm link leave the self_contact share while a segment runs
+        # (task.self_contact_pairs; also a set_arm_perturb segment), as the CUDA task does. False: the original term.
+        self.arm_perturb_radians = float(arm_perturb_radians)
+        low, high = ARM_PERTURB_RADIANS_RANGE
+        if not low <= self.arm_perturb_radians <= high:
+            raise ValueError(f'arm_perturb_radians must be in [{low:g}, {high:g}] rad')
+        self.arm_perturb_contact_mask = bool(arm_perturb_contact_mask)
         # Largest delay (s) from policy output to motor target; a reset without a set command draws the episode's
         # delay in physics substeps (task.action_lags), as the CUDA task does. 0: the original task.
         self.action_delay = float(action_delay)
@@ -262,6 +283,9 @@ class G1VelocityEnv(gym.Env):
             raise ValueError('knee_floor must lie within the knee joint range')
         self.target_low = task.target_low(torch.from_numpy(low), self.knee_mask, self.knee_floor).numpy()
         self.target_high = high
+        # height_command: per leg its hip pitch, knee and ankle pitch, the joints stand_target bends (both G1 models).
+        self.crouch_joints = tuple(tuple(names.index(f'{side}_{part}_joint') for part in task.CROUCH_JOINT_PARTS)
+                                   for side in ('left', 'right'))
         self.pelvis = self.model.body('pelvis').id
         self.torso = self.model.body(task.TORSO_BODY).id
         self.feet = [self.model.body(name).id for name in task.FEET]
@@ -280,6 +304,15 @@ class G1VelocityEnv(gym.Env):
         # foot_collision's capsules are on the ankle_roll links, so a foot-foot contact counts.
         self.robot_geoms = self.model.body_rootid[self.model.geom_bodyid] == self.model.body_rootid[self.pelvis]
         self._contact_force = np.zeros(6)
+        # arm_perturb_contact_mask: per geom, whether it is on an arm link, the bodies in the subtrees of the bodies the
+        # arm joints move (shoulders, elbows, wrists, hands; none on the legs-only G1, whose arm links are welded to the
+        # torso), and whether this control step's contacts with them are left out of self_contact (set by step).
+        roots = {int(self.model.jnt_bodyid[self.joints[i]]) for i in self.arm_joints}
+        arm_bodies = np.zeros(self.model.nbody, dtype=bool)
+        for body in range(1, self.model.nbody):  # a parent always comes before its children
+            arm_bodies[body] = body in roots or arm_bodies[self.model.body_parentid[body]]
+        self.arm_geoms = arm_bodies[self.model.geom_bodyid]
+        self.arm_contacts_masked = False
         # force_push: the pushed body, the robot's total mass (35.112 kg on both G1 models), whether this episode
         # pushes by itself (training resets only), the control steps to its next push, the substeps of the running
         # push still to come (0: none) and its world force (task.force_push_draw / force_push_substeps).
@@ -302,8 +335,9 @@ class G1VelocityEnv(gym.Env):
         self._friction_scale = None
         self.action_space = spaces.Box(-self.action_limit, self.action_limit, (self.model.nu,), dtype=np.float32)
         # Simulation profile: body angular+linear velocity, gravity, command, joint offsets/velocities,
-        # previous action, gait clock. Real robot: the controller's layout without linear velocity.
-        self.frame_size = (11 if self.real_robot else 14) + 3*self.model.nu
+        # previous action, gait clock. Real robot: the controller's layout without linear velocity, then the extra
+        # terms (height_command, upper_body_slot).
+        self.frame_size = (11 if self.real_robot else 14) + 3*self.model.nu + sum(self.extra_sizes)
         size = self.frame_size * self.history
         self.actor_inputs = size  # what the robot measures; critic extras follow
         self.frames = None  # (1, history, frame size) torch buffer, oldest first; filled at reset
@@ -335,6 +369,39 @@ class G1VelocityEnv(gym.Env):
         self.yaw_drift_error = torch.zeros(1, dtype=torch.float64)
         self.perturb_live, self.perturb_steps = False, 0  # evaluation and scenarios: the policy drives the arms
         self.push_live, self.push_left = False, 0  # and nothing pushes the pelvis
+
+    def set_height(self, height):
+        """Pelvis height command c (m, within the crouch table's range, CROUCH_HEIGHTS) from the next observation on
+        (tests, probes, scenarios; re-read the observation as after set_command), until the next reset or, in a
+        training episode, the next command change; as the CUDA task's set_height. set_command keeps it."""
+        if not self.height_command:
+            raise ValueError('a height command needs task_config height_command')
+        low, high = CROUCH_HEIGHTS
+        if isinstance(height, bool) or not isinstance(height, (int, float, np.floating, np.integer)) \
+                or not np.isfinite(height) or not low <= height <= high:
+            raise ValueError(f'height must be a number in [{low:g}, {high:g}] m')
+        self.height = float(height)
+
+    def _draw_height(self):
+        """A training draw of the height command for the current command (task.height_draw: two draws, always)."""
+        uniform = lambda n: torch.from_numpy(self.np_random.random(n))
+        crouch = {key: self.commands[key] for key in ('crouch_share', 'crouch_min', 'crouch_speed')}
+        self.height = float(task.height_draw(uniform, _batch(self.command.copy()), **crouch)[0])
+
+    @property
+    def fixed_normalization(self):
+        """(positions, mean, variance) of the observation columns whose normalization is set, not estimated: every
+        frame's entries of the extra terms (task.TERM_NORMALIZATION); None without them. warm_start.insert_terms writes
+        these into a stage's statistics, TensorNormalize keeps them frozen."""
+        if not self.extra_terms:
+            return None
+        positions, mean, variance = [], [], []
+        for name, _ in self.extra_terms:
+            columns = task.term_positions(self.model.nu, self.history, self.extra_terms, name)
+            positions += columns
+            mean += [task.TERM_NORMALIZATION[name][0]] * len(columns)
+            variance += [task.TERM_NORMALIZATION[name][1]] * len(columns)
+        return np.array(positions, dtype=np.int64), np.array(mean), np.array(variance)
 
     def set_force_push(self, velocity, seconds=.1):
         """Push the pelvis from the next control step on (tests, probes), as the sim2sim push patch does: the
@@ -402,10 +469,13 @@ class G1VelocityEnv(gym.Env):
 
     def _self_contact_force(self):
         """Largest contact force (N, norm of the contact-frame force) between two robot geoms at this physics step,
-        0 without such a contact; for task.self_contact_share."""
+        0 without such a contact; for task.self_contact_share. With arm_perturb_contact_mask, in a step whose arms follow
+        a perturbation segment (arm_contacts_masked), contacts touching an arm link are left out
+        (task.self_contact_pairs)."""
         largest = 0.
         if self.data.ncon:
-            for k in np.flatnonzero(self.robot_geoms[self.data.contact.geom].all(axis=1)):
+            masked = (self.arm_geoms, True) if self.arm_contacts_masked else ()
+            for k in np.flatnonzero(task.self_contact_pairs(self.data.contact.geom, self.robot_geoms, *masked)):
                 mujoco.mj_contactForce(self.model, self.data, int(k), self._contact_force)
                 largest = max(largest, float(np.linalg.norm(self._contact_force[:3])))
         return largest
@@ -424,6 +494,9 @@ class G1VelocityEnv(gym.Env):
                  _batch(self.home), _batch(self.previous_action), self._phase())
         observed = (task.deploy_observation(*parts, phase_stop=self.phase_stop) if self.real_robot
                     else task.observation(*parts))
+        if self.extra_terms:  # height_command [c − 0.78], upper_body_slot zeros
+            height = torch.tensor([self.height], dtype=torch.float64) if self.height_command else None
+            observed = torch.cat((observed, task.command_terms(height, self.upper_body_slot, observed)), dim=1)
         if self.history > 1:
             if history == 'fill' or self.frames is None:
                 self.frames = observed[:, None].repeat(1, self.history, 1)
@@ -431,7 +504,7 @@ class G1VelocityEnv(gym.Env):
                 self.frames = torch.cat((self.frames[:, 1:], observed[:, None]), dim=1)
             else:
                 self.frames[:, -1] = observed
-            observed = task.history_observation(self.frames, self.model.nu)
+            observed = task.history_observation(self.frames, self.model.nu, self.extra_sizes)
         if self.critic_extras:
             observed = torch.cat((observed, task.critic_extras(velocity, _batch(self.data.qpos[2]))), dim=1)
         return observed[0].numpy().astype(np.float32)
@@ -504,6 +577,14 @@ class G1VelocityEnv(gym.Env):
             scale = 1.
         if 'motor_friction_scale' in options or self.motors is not None:
             self.set_motor_friction(scale)
+        # height_command: training resets (no command given) draw c for the drawn command, after every other draw, so
+        # those stay the old ones, and not at all without the setting; a reset with a command starts at BASE_HEIGHT.
+        # options['height'] sets c (probes, scenarios).
+        self.height = task.BASE_HEIGHT
+        if 'height' in options:
+            self.set_height(options['height'])
+        elif self.height_command and options.get('command') is None:
+            self._draw_height()
         return self._observation('fill'), {'x_position': float(self.data.qpos[0])}
 
     def _target(self, action):
@@ -538,10 +619,12 @@ class G1VelocityEnv(gym.Env):
             steps, held = task.arm_perturb_draw(
                 torch.tensor([self.perturb_steps]), _batch(self.perturb_action),
                 lambda n: torch.from_numpy(self.np_random.random(n)), self.arm_perturb, self.dt,
-                torch.from_numpy(self.scale), self.action_limit)
+                torch.from_numpy(self.scale), self.action_limit, self.arm_perturb_radians)
             self.perturb_steps, self.perturb_action = int(steps[0]), held[0].numpy()
         # The applied action (box clip, arm_perturb segment, lock_wrists) replaces the policy's in all below.
         action = self.applied_action(action)
+        # arm_perturb_contact_mask: this step's arm contacts leave self_contact while its arms follow a segment.
+        self.arm_contacts_masked = self.arm_perturb_contact_mask and self.perturb_steps > 0
         if self.perturb_steps:
             self.perturb_steps -= 1
         target = self._target(action)
@@ -596,6 +679,12 @@ class G1VelocityEnv(gym.Env):
         arm_press = None
         if self.reward_weights['arm_press']:
             arm_press = task.arm_press(_batch(target), _batch(self.data.qpos[self.qadr]), self.arm_joints)
+        # height_command: the height, fall and stand pose of the height command the policy observed (c changes only
+        # at a command change, below, or by set_height between steps).
+        height_command = stand_home = None
+        if self.height_command:
+            height_command = torch.tensor([self.height], dtype=torch.float64)
+            stand_home = task.stand_target(_batch(self.home), height_command, self.crouch_joints)
         # Rewarded for the command the policy observed when it chose this action.
         components, fell = task.reward_components(
             _batch(velocity), _batch(self.data.xmat[self.pelvis].reshape(3, 3)), _batch(self.data.qpos[2]),
@@ -610,17 +699,22 @@ class G1VelocityEnv(gym.Env):
                          else None), sole_contact=self.sole_contact,
             yaw_drift_error=yaw_drift, requested_command=_batch(self.command.copy()),
             self_contact=None if self_force is None else task.self_contact_share(_batch(self_force)),
-            arm_press=arm_press, feet_flat_stance=self.feet_flat_stance)
+            arm_press=arm_press, feet_flat_stance=self.feet_flat_stance, height_command=height_command,
+            stand_home=stand_home)
         components = {key: float(value[0]) for key, value in components.items()}
         fell = bool(fell[0])
         info = dict(x_position=float(self.data.qpos[0]), fell=fell,
                     command=self.observed_command.copy(), velocity=velocity[3:5].copy(), reward_components=components)
+        if self.height_command:
+            info['height_command'] = self.height
         self.previous_action[:] = action
         if self.delay_actions:
             self.delay_actions = [action, *self.delay_actions[:-1]]
         # The reward above belongs to the command the action was taken under.
         if not self.fixed_command and self.np_random.random() < self.dt / task.COMMAND_RESAMPLE_SECONDS:
             self._sample_command(resample=True)
+            if self.height_command:  # a new height for the new command, after the command's draws
+                self._draw_height()
         return self._observation('push'), sum(components.values()), fell, self.steps >= self.max_episode_steps, info
 
     def render(self):

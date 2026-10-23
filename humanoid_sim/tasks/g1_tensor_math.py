@@ -7,7 +7,7 @@ rotation maps pelvis local coordinates to world coordinates.
 """
 import math
 import torch
-from .config import G1_REWARD_WEIGHTS, backward_share
+from .config import ARM_PERTURB_RADIANS, G1_COMMANDS, G1_REWARD_WEIGHTS, backward_share
 
 # Gait clock: each leg is in stance for the first 55% of its 0.8 s cycle, legs half a cycle apart.
 # Defaults of the task's `gait` setting; a stance share below 0.5 adds flight phases (running).
@@ -45,6 +45,58 @@ STAND_PROBABILITY = .2
 COMMAND_RESAMPLE_SECONDS = 5.
 # Pelvis height while standing in the default pose (unitree_rl_gym G1 base_height_target).
 BASE_HEIGHT = .78
+# task_config height_command (iteration 28): the pelvis height c the policy is told to keep, an observation term
+# [c − BASE_HEIGHT] after last_action (deploy.yaml term HEIGHT_TERM; command_terms). Training draws c at every reset and
+# every command change (height_draw); from c follow the fall height (fall_height), the height term −w·(h − c)², the
+# height_ceiling term and the leg pose of the stand_pose term (stand_target: home plus CROUCH_TABLE's offsets). At
+# c = BASE_HEIGHT all four are exactly the old ones. A separate state, not a fourth command axis: phase_stop, heading
+# hold and set_command never see it.
+HEIGHT_TERM = 'height_command'
+# Crouch pose (scripts/lab/crouch_table.py; the critic's lab-critic/it28/crouch_geom.py): symmetric sagittal inverse
+# kinematics of the legs, pelvis upright at height c with the soles on the floor, feet flat, the robot's centre of mass
+# over the middle of the soles; per c, IK(c) − IK(BASE_HEIGHT) of hip pitch, knee and ankle pitch (CROUCH_JOINT_PARTS,
+# the same on both legs; IK(0.78) = −0.13573, 0.37810, −0.24236). stand_target adds them to home, whose own pelvis
+# height is 0.784 (IK(c) itself puts it at c; home + offsets 0.712 at c = 0.70, 0.656 at 0.64). The ankle pitch stop is
+# −0.873: IK's ankle −0.585 at 0.70, −0.744 at 0.64, −0.835 at 0.60. Rows (c m, hip pitch, knee, ankle pitch rad).
+CROUCH_JOINT_PARTS = ('hip_pitch', 'knee', 'ankle_pitch')
+CROUCH_TABLE = (
+    (0.60, -0.62711, 1.21946, -0.59235),
+    (0.61, -0.60467, 1.17502, -0.57035),
+    (0.62, -0.58167, 1.12954, -0.54788),
+    (0.63, -0.55805, 1.08293, -0.52489),
+    (0.64, -0.53375, 1.03507, -0.50132),
+    (0.65, -0.50871, 0.98582, -0.47711),
+    (0.66, -0.48283, 0.93501, -0.45218),
+    (0.67, -0.45601, 0.88245, -0.42644),
+    (0.68, -0.42815, 0.82792, -0.39977),
+    (0.69, -0.39907, 0.77111, -0.37204),
+    (0.70, -0.36859, 0.71166, -0.34307),
+    (0.71, -0.33646, 0.64910, -0.31264),
+    (0.72, -0.30237, 0.58282, -0.28045),
+    (0.73, -0.26585, 0.51196, -0.24611),
+    (0.74, -0.22627, 0.43531, -0.20904),
+    (0.75, -0.18264, 0.35098, -0.16834),
+    (0.76, -0.13332, 0.25587, -0.12256),
+    (0.77, -0.07511, 0.14395, -0.06883),
+    (0.78, 0.00000, 0.00000, 0.00000),
+)
+# height_ceiling reward weight (the critic, iteration 28): −w·g(c)·(1 − exp(−CEILING_SHARPNESS·max(0, h − c))) with
+# g(c) = clamp((BASE_HEIGHT − c)/CEILING_RAMP, 0, 1), a penalty on the pelvis only above a crouch command. At c = 0.78 it
+# is exactly 0, so the pelvis keeps its own height at speed (candidate 8: 0.789 standing, 0.764 at 1 m/s, 0.727 at 2 m/s),
+# which a tracking term exp(−4|h − c|) would pull to 0.78 at every speed.
+CEILING_SHARPNESS = 4.
+CEILING_RAMP = .02
+# task_config upper_body_slot (iteration 28): a reserved term of UPPER_BODY_SIZE entries after the height term
+# (deploy.yaml term UPPER_BODY_TERM): a flag, then the PD targets of joints UPPER_BODY_FIRST.. (waist and arms, 12-28 of
+# the 29-DoF G1, relative to home) of a later upper-body command. Always 0 in this contract: the layout is reserved, the
+# training does not use it.
+UPPER_BODY_TERM = 'upper_body_command'
+UPPER_BODY_FIRST = 12
+UPPER_BODY_SIZE = 18
+# Fixed normalization (mean, variance) of these terms: a warm-started stage's running statistics count ~7e9
+# observations, so new columns would keep any estimate for good; set by hand (std 0.05 m: c − 0.78 in [−0.14, 0] reads
+# −2.8…0) and frozen in TensorNormalize.
+TERM_NORMALIZATION = {HEIGHT_TERM: (0., .0025), UPPER_BODY_TERM: (0., 1.)}
 # "Faster is better" (Humanoid-v5 style): reward grows with ground speed along the episode's target
 # heading (world +x unless the start was turned), not along the pelvis axis, so running in circles
 # earns nothing. Clipped so a lunge cannot dominate the return; moving backwards is penalised up to 1 m/s.
@@ -185,7 +237,8 @@ def action_lags(delay_steps, frame_skip):
 
 def sample_commands(n, uniform, min_speed=MIN_FORWARD_SPEED, max_speed=MAX_FORWARD_SPEED,
                     stand_probability=STAND_PROBABILITY, lateral_speed=0., yaw_rate=0., straight_probability=0.,
-                    side_share=0., side_stop=0., side_speed=0., previous=None):
+                    side_share=0., side_stop=0., side_speed=0., previous=None, crouch_share=None, crouch_min=None,
+                    crouch_speed=None):
     """uniform(n) -> values in [0, 1); returns (n, 3) commands (vx, vy, yaw_rate).
 
     Sideways and turning commands are drawn only when their ranges are non-zero, so forward-only
@@ -216,7 +269,10 @@ def sample_commands(n, uniform, min_speed=MIN_FORWARD_SPEED, max_speed=MAX_FORWA
     [STAND_SPEED, side_speed] instead of [STAND_SPEED, lateral_speed]. The same uniform number is rescaled, with no
     new draw, so every other walking command keeps vy within ±lateral_speed and, off, the stream is bit for bit the
     old one. Why: side steps to ±1 m/s without raising lateral_speed, which would halve the forward commands with
-    |vy| ≤ 0.1 and add diagonals such as (2, ±1)."""
+    |vy| ≤ 0.1 and add diagonals such as (2, ±1).
+
+    crouch_share, crouch_min, crouch_speed: height_draw's (the pelvis height command), accepted here so that a whole
+    commands setting passes; nothing of them is drawn here."""
     speed, stand = uniform(n), uniform(n)
     command = torch.zeros((n, 3), dtype=speed.dtype, device=speed.device)
     standing = stand < stand_probability
@@ -276,6 +332,20 @@ def yaw_drift_update(error, velocity, command, dt, seconds=YAW_DRIFT_SECONDS):
 SELF_CONTACT_FORCE = 10.
 
 
+def self_contact_pairs(geom, robot_geoms, arm_geoms=None, masked=False):
+    """Which contacts the self_contact term counts: (k,) bool for k contacts with geom ids `geom` (k, 2), numpy arrays
+    (the CPU task's data.contact, one world) or torch tensors (the CUDA task's contact slots) alike. A contact counts
+    when both geoms are on the robot (robot_geoms, (ngeom,) bool: bodies in the pelvis subtree, never the floor). With
+    task_config arm_perturb_contact_mask (arm_geoms: (ngeom,) bool, the geoms of the arm links) a contact touching an arm
+    link does not count where `masked` holds (a bool, or (k,) bool per contact: its world's arms follow an arm_perturb
+    segment this control step), so the policy is not charged for an arm pose it did not choose; contacts of the legs,
+    feet (foot_collision's capsules), torso and pelvis count as before. Without arm_geoms: the original rule."""
+    counted = robot_geoms[geom].all(-1)
+    if arm_geoms is None:
+        return counted
+    return counted & ~(arm_geoms[geom].any(-1) & masked)
+
+
 def self_contact_share(force):
     """(n, substeps) largest robot-robot contact force (N) at each physics substep of a control step (0 without
     such a contact) -> (n,) share of those substeps above SELF_CONTACT_FORCE, for the self_contact term."""
@@ -309,10 +379,12 @@ def arm_press(target, position, arm_joints):
 # bent to the box edge (+40°), the left one 0.5 s after every training reset; moved in by 4-8°, the bend jumps to the
 # other wrist; both at home, it falls standing or turns 30-70°, and in sim2sim the side came up at random out of
 # FixStand (right in 2 of 9 runs, exactly the two drifting the other way). A segment holds the home pose (action 0)
-# with probability ARM_PERTURB_HOME, otherwise an action uniform within ±ARM_PERTURB_RADIANS/scale per joint.
+# with probability ARM_PERTURB_HOME, otherwise an action uniform within ±radians/scale per joint: task_config
+# arm_perturb_radians, ARM_PERTURB_RADIANS 0.4 (config.py, the original draw) when missing. Iteration 30: candidates
+# carry arm poses of ±1.0-1.2 rad without falling, but standing 7841 turns up to −31° and creeps up to 1.04 m at 1.0 rad
+# and candidate 8 at 1 m/s slows to 0.02-0.47 m/s (critic, scripts/lab/probes/arm_probe.py); 0.4 is too gentle.
 ARM_PERTURB_SECONDS = (.5, 2.)
 ARM_PERTURB_HOME = .5
-ARM_PERTURB_RADIANS = .4
 
 
 def arm_perturb_lengths(dt):
@@ -333,21 +405,22 @@ def arm_perturb_onset(share, dt):
     return share / (share + (1 - share) * mean) if share else 0.
 
 
-def arm_perturb_draw(steps, held, uniform, share, dt, scale, limit=1.):
+def arm_perturb_draw(steps, held, uniform, share, dt, scale, limit=1., radians=ARM_PERTURB_RADIANS):
     """One control step of the arm perturbation process, before the action is applied. steps: (n,) long, control
     steps left in each world's segment, this one included (0: none); held: (n, joints) the segment's action;
-    uniform(k) -> k values in [0, 1) (CPU np_random, CUDA generator); scale: (joints,) action scale. Returns the new
-    (steps, held): a world outside a segment starts one with probability arm_perturb_onset(share, dt), lasting a
-    uniform whole number of steps in arm_perturb_lengths(dt) and holding the home pose (action 0) with probability
-    ARM_PERTURB_HOME, else U(±ARM_PERTURB_RADIANS/scale) per joint clipped to the action box ±limit (pd_target then
-    clips the target to the joint range: ±0.4 rad stays inside every G1 arm range). A world is perturbed this step
-    while steps > 0 (arm_perturb_apply); the environment counts the step off afterwards."""
+    uniform(k) -> k values in [0, 1) (CPU np_random, CUDA generator); scale: (joints,) action scale; radians: the
+    amplitude (task_config arm_perturb_radians). Returns the new (steps, held): a world outside a segment starts one
+    with probability arm_perturb_onset(share, dt), lasting a uniform whole number of steps in arm_perturb_lengths(dt)
+    and holding the home pose (action 0) with probability ARM_PERTURB_HOME, else U(±radians/scale) per joint clipped to
+    the action box ±limit (pd_target then clips the target to the joint range: ±0.4 rad stays inside every G1 arm
+    range, ±1.0 does not). The draws do not depend on radians, which only scales the pose. A world is perturbed this
+    step while steps > 0 (arm_perturb_apply); the environment counts the step off afterwards."""
     n, joints = held.shape
     shortest, longest = arm_perturb_lengths(dt)
     start = (steps == 0) & (uniform(n) < arm_perturb_onset(share, dt))
     length = shortest + (uniform(n) * (longest - shortest + 1)).long().clamp(max=longest - shortest)
     home = uniform(n) < ARM_PERTURB_HOME
-    bound = ARM_PERTURB_RADIANS / scale.to(held.dtype)
+    bound = radians / scale.to(held.dtype)
     random = ((2 * uniform(n * joints).reshape(n, joints).to(held.dtype) - 1) * bound).clamp(-limit, limit)
     action = torch.where(home[:, None], torch.zeros_like(random), random)
     return torch.where(start, length, steps), torch.where(start[:, None], action, held)
@@ -509,28 +582,54 @@ def deploy_observation(velocity, rotation, command, position, joint_velocity, ho
                       position-home, joint_velocity, previous_action), dim=1)
 
 
-def deploy_terms(joints):
-    """(start, end) of each term in a deploy_observation frame, in deploy.yaml order."""
-    sizes = (3, 3, 3, 2, joints, joints, joints)
+def deploy_terms(joints, extra=()):
+    """(start, end) of each term in a deploy_observation frame, in deploy.yaml order; extra: the sizes of the terms
+    after last_action (task_config height_command, upper_body_slot: extra_terms)."""
+    sizes = (3, 3, 3, 2, joints, joints, joints, *extra)
     starts = [sum(sizes[:k]) for k in range(len(sizes))]
     return tuple((start, start + size) for start, size in zip(starts, sizes))
 
 
-def history_observation(frames, joints):
+def extra_terms(height_command=False, upper_body_slot=False):
+    """(name, size) of the observation terms after last_action, in deploy.yaml order: task_config height_command's
+    HEIGHT_TERM (1), upper_body_slot's UPPER_BODY_TERM (UPPER_BODY_SIZE); none without either."""
+    return (((HEIGHT_TERM, 1),) if height_command else ()) + (
+        ((UPPER_BODY_TERM, UPPER_BODY_SIZE),) if upper_body_slot else ())
+
+
+def command_terms(height, upper_body_slot, like):
+    """The extra terms' frame entries, (n, k) in like's dtype and device: [c − BASE_HEIGHT] for height commands height
+    (n,) (None: no height term), then UPPER_BODY_SIZE zeros with upper_body_slot (always 0 in this contract)."""
+    parts = [] if height is None else [(height.to(like.dtype) - BASE_HEIGHT)[:, None]]
+    if upper_body_slot:
+        parts.append(torch.zeros((len(like), UPPER_BODY_SIZE), dtype=like.dtype, device=like.device))
+    return torch.cat(parts, dim=1) if parts else like[:, :0]
+
+
+def history_observation(frames, joints, extra=()):
     """Observation with history, as Unitree's controller builds it with history_length H per term
     (deploy/include/isaaclab/manager: each term keeps its own buffer, oldest frame first, newest last;
-    terms are concatenated in deploy.yaml order). frames: (n, H, frame size), oldest first."""
-    return torch.cat([frames[:, :, start:end].reshape(len(frames), -1) for start, end in deploy_terms(joints)],
+    terms are concatenated in deploy.yaml order). frames: (n, H, frame size), oldest first; extra as deploy_terms."""
+    return torch.cat([frames[:, :, start:end].reshape(len(frames), -1) for start, end in deploy_terms(joints, extra)],
                      dim=1)
 
 
-def history_index(joints, history):
-    """index[h, i]: position of frame h's (0 = oldest) entry i in history_observation's output."""
+def history_index(joints, history, extra=()):
+    """index[h, i]: position of frame h's (0 = oldest) entry i in history_observation's output (extra as
+    deploy_terms; with history 1, the frame itself)."""
     index = []
     for h in range(history):
         index.append([history * start + h * (end - start) + i - start
-                      for start, end in deploy_terms(joints) for i in range(start, end)])
+                      for start, end in deploy_terms(joints, extra) for i in range(start, end)])
     return index
+
+
+def term_positions(joints, history, terms, name):
+    """Positions in the history observation of term `name`'s entries, every frame (oldest first); terms: the extra
+    terms ((name, size), extra_terms) of the layout. For fixed normalization (TERM_NORMALIZATION) and warm starts."""
+    sizes = tuple(size for _, size in terms)
+    start, end = deploy_terms(joints, sizes)[7 + [term for term, _ in terms].index(name)]
+    return [position for frame in history_index(joints, history, sizes) for position in frame[start:end]]
 
 
 def sole_height(sphere_height, radius):
@@ -539,19 +638,89 @@ def sole_height(sphere_height, radius):
     return (sphere_height - radius.to(sphere_height.dtype)).amin(dim=-1)
 
 
+def command_moving(command):
+    """Whether each command (n, 3) asks for motion, (n,): speed or turn above STAND_SPEED; otherwise the reward's
+    standing terms apply."""
+    return (command[:, :2].norm(dim=1) > STAND_SPEED) | (command[:, 2].abs() > STAND_SPEED)
+
+
 def gait_targets(phase, command, stance_fraction=STANCE_FRACTION):
     """Expected stance per foot (n, 2) and whether the command asks for motion (n,)."""
     offsets = torch.as_tensor(FOOT_OFFSETS, dtype=phase.dtype, device=phase.device)
     stance = torch.remainder(phase[:, None] + offsets, 1.) < stance_fraction
-    moving = (command[:, :2].norm(dim=1) > STAND_SPEED) | (command[:, 2].abs() > STAND_SPEED)
+    moving = command_moving(command)
     return stance | ~moving[:, None], moving
+
+
+_CROUCH_TABLES = {}  # CROUCH_TABLE as a tensor per (dtype, device): no host copy at every CUDA step
+
+
+def crouch_offsets(height):
+    """(n, 3) hip pitch, knee and ankle pitch offsets from home for pelvis height commands height (n,): CROUCH_TABLE
+    interpolated linearly, clamped to its range; exactly 0 at BASE_HEIGHT and above."""
+    key = (height.dtype, height.device)
+    if key not in _CROUCH_TABLES:
+        _CROUCH_TABLES[key] = torch.as_tensor(CROUCH_TABLE, dtype=height.dtype, device=height.device)
+    table = _CROUCH_TABLES[key]
+    lowest, step = CROUCH_TABLE[0][0], CROUCH_TABLE[1][0] - CROUCH_TABLE[0][0]
+    position = (height.clamp(lowest, BASE_HEIGHT) - lowest) / step
+    below = position.floor().long().clamp(0, len(CROUCH_TABLE) - 2)
+    weight = (position - below.to(height.dtype)).clamp(0., 1.)[:, None]
+    offsets = table[below, 1:] * (1 - weight) + table[below + 1, 1:] * weight
+    return torch.where((height >= BASE_HEIGHT)[:, None], torch.zeros_like(offsets), offsets)
+
+
+def stand_target(home, height, joints):
+    """Joint angles the stand_pose term pulls the legs to under pelvis height commands height (n,), (n, joints): home
+    plus crouch_offsets on `joints` ((2, 3): per leg its CROUCH_JOINT_PARTS, hip pitch, knee, ankle pitch). Exactly
+    home at BASE_HEIGHT."""
+    offsets = crouch_offsets(height).to(home.dtype)
+    delta = torch.zeros((len(height), home.shape[-1]), dtype=home.dtype, device=home.device)
+    for leg in joints:
+        delta[:, torch.as_tensor(leg, device=home.device)] = offsets
+    return home + delta
+
+
+def fall_height(height):
+    """Pelvis height (m) below which the episode ends under height commands height (n,): FALL_HEIGHT moved with the
+    command, exactly FALL_HEIGHT at BASE_HEIGHT."""
+    return FALL_HEIGHT + (height - BASE_HEIGHT)
+
+
+def height_ceiling(height, command):
+    """(n,) the height_ceiling term before its weight, in [0, 1): g(c)·(1 − exp(−CEILING_SHARPNESS·max(0, h − c))),
+    g(c) = clamp((BASE_HEIGHT − c)/CEILING_RAMP, 0, 1); pelvis heights height, commands command (n,). 0 at c = 0.78."""
+    ramp = ((BASE_HEIGHT - command) / CEILING_RAMP).clamp(0., 1.)
+    return ramp * (1 - torch.exp(-CEILING_SHARPNESS * (height - command).clamp(min=0.)))
+
+
+# commands.crouch_share / crouch_min / crouch_speed defaults (config.G1_COMMANDS: share 0, off): the share of commands
+# that crouch and the lowest height drawn, standing and walking; walking crouches only up to crouch_speed (m/s).
+CROUCH_SHARE, CROUCH_MIN, CROUCH_SPEED = (G1_COMMANDS[key] for key in ('crouch_share', 'crouch_min', 'crouch_speed'))
+
+
+def height_draw(uniform, command, crouch_share=CROUCH_SHARE, crouch_min=CROUCH_MIN, crouch_speed=CROUCH_SPEED):
+    """Pelvis height commands (n,) for the training commands command (n, 3) (the requested ones, before heading hold):
+    two uniform(n) draws, always, whatever the shares. A stand command (command_moving false) crouches with probability
+    crouch_share[0] to c ~ U(crouch_min[0], BASE_HEIGHT); a walking one with ‖v_xy‖ ≤ crouch_speed with probability
+    crouch_share[1] to U(crouch_min[1], BASE_HEIGHT); every other command keeps c = BASE_HEIGHT exactly. Why the two
+    ranges (critic, iteration 28): walking at 1 m/s candidate 8's ankle pitch is already at −0.74 in swing (stop
+    −0.873), and a crouch to 0.70 adds 0.26-0.34 rad; standing, IK reaches 0.64 at −0.744."""
+    n = len(command)
+    pick, value = uniform(n), uniform(n)
+    moving = command_moving(command)
+    walking = moving & (command[:, :2].norm(dim=1) <= crouch_speed)
+    share = torch.where(moving, walking.to(pick.dtype) * crouch_share[1], torch.full_like(pick, crouch_share[0]))
+    bottom = torch.where(moving, torch.full_like(pick, crouch_min[1]), torch.full_like(pick, crouch_min[0]))
+    return torch.where(pick < share, bottom + value * (BASE_HEIGHT - bottom), torch.full_like(pick, BASE_HEIGHT))
 
 
 def reward_components(velocity, rotation, height, command, torque, action, previous_action,
                       foot_height, phase, position, home, torso_rotation, weights=None, posture_joints=POSTURE_JOINTS,
                       heading_target=None, stance_fraction=STANCE_FRACTION, hip_joints=HIP_JOINTS, foot_speed=None,
                       foot_rotation=None, sole_height=None, sole_contact=None, yaw_drift_error=None,
-                      requested_command=None, self_contact=None, arm_press=None, feet_flat_stance=False):
+                      requested_command=None, self_contact=None, arm_press=None, feet_flat_stance=False,
+                      height_command=None, stand_home=None):
     """foot_speed: (n, 2) horizontal speed of each foot over the control step (m/s), for the slip and clearance
     terms. foot_rotation: (n, 2, 3, 3) world <- body rotations of the FEET bodies, for the feet_flat term.
     sole_height: (n, 2) lowest sole point of each foot (m, see sole_height()), for the clearance term and for
@@ -566,7 +735,11 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
     self_contact: (n,) share of this control step's physics substeps with a robot-robot contact above
     SELF_CONTACT_FORCE (self_contact_share), for the self_contact term; None: the term is zero.
     arm_press: (n,) Σ over the arm joints of (PD target − joint angle)² (arm_press()), for the arm_press term; None:
-    the term is zero."""
+    the term is zero.
+    height_command (task_config height_command): (n,) pelvis height commands c; the height term then measures h − c,
+    the episode ends below fall_height(c) and the height_ceiling term charges a pelvis above a crouch command. None:
+    BASE_HEIGHT, FALL_HEIGHT and no ceiling, the old expressions. stand_home: (n, joints) the leg pose of the
+    stand_pose term (stand_target of c); None: home."""
     weights = G1_REWARD_WEIGHTS if weights is None else weights
     dtype = velocity.dtype
     if yaw_drift_error is not None and requested_command is None:
@@ -576,7 +749,14 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
     if sole_contact is None:
         sole_contact = sole_height is not None
     upright = rotation[:, 2, 2]
-    fell = (height < FALL_HEIGHT) | (upright < FALL_UPRIGHT)
+    if height_command is None:
+        fell = (height < FALL_HEIGHT) | (upright < FALL_UPRIGHT)
+        height_error, ceiling = height - BASE_HEIGHT, torch.zeros_like(height)
+    else:
+        crouch = height_command.to(height.dtype)
+        fell = (height < fall_height(crouch)) | (upright < FALL_UPRIGHT)
+        height_error, ceiling = height - crouch, height_ceiling(height, crouch)
+    stand_home = home if stand_home is None else stand_home
     contact = sole_height < SOLE_CONTACT_HEIGHT if sole_contact else foot_height < CONTACT_HEIGHT
     stance, moving = gait_targets(phase, command, stance_fraction)
     swinging = ~contact & moving[:, None]
@@ -615,7 +795,9 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
         'tilt': -weights['tilt']*(1-upright),
         # legged_gym "orientation": squared projected gravity in the pelvis plane, sin^2 of the tilt.
         'orientation': -weights['orientation']*rotation[:, 2, :2].square().sum(dim=1),
-        'height': -weights['height']*(height-BASE_HEIGHT).square(),
+        'height': -weights['height']*height_error.square(),
+        # Pelvis above a crouch command (height_command): zero at c = 0.78 (see height_ceiling).
+        'height_ceiling': -weights['height_ceiling']*ceiling,
         'torso': -weights['torso']*((lean_forward-lean_target).square() + lean_side.square()),
         'base_motion': -weights['base_motion']*(velocity[:, 5].square() + .05*velocity[:, :2].square().sum(dim=1)),
         # Creeping while told to stand: linear in the speed and yaw-rate error, because the exp tracking terms
@@ -624,7 +806,8 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
                                                          + (velocity[:, 2]-command[:, 2]).abs()),
         # Legs at the default pose while standing (mjlab's variable_posture with a tight standing std): a robot
         # standing 0.14 rad off it with jittering ankles slid its feet 0.4 m in 10 s without lifting them.
-        'stand_pose': -weights['stand_pose']*(~moving).to(dtype)*(position-home)[:, :LEGS].square().sum(dim=1),
+        # With height_command the pose is the crouch's (stand_target), home at c = 0.78.
+        'stand_pose': -weights['stand_pose']*(~moving).to(dtype)*(position-stand_home)[:, :LEGS].square().sum(dim=1),
         # Feet sliding on the ground (unitree_rl_lab G1 feet_slide, -0.2): standing still the robot shuffled
         # its feet 0.4 m in 10 s without lifting them. Linear, so slow sliding still costs.
         'slip': -weights['slip']*(torch.zeros_like(height) if foot_speed is None

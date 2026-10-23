@@ -36,7 +36,8 @@ real-time factor, policy step intervals in simulator time and how old the state 
 
 Latency is measured without touching g1_ctrl. For every new lowcmd target (a policy step) the
 observation is rebuilt as g1_ctrl builds it (deploy.yaml terms, 5-frame history, gait phase counted
-from the Velocity reset, command from the remote) from each lowstate received in the 15 ms before,
+from the Velocity reset, command from the remote; a height export's height_command from the right stick as
+patches/g1_ctrl-height.patch builds it) from each lowstate received in the 15 ms before,
 policy.onnx is replayed, and the lowstate that reproduces the target is the one the policy saw.
   obs -> cmd: lowcmd arrival minus the first arrival of that lowstate (wall clock);
   sim delay: simulator ticks from that state to the first physics step whose motor torque
@@ -77,7 +78,7 @@ HOLD_LINE = re.compile(r'kept the previous target for (\d+) FSM ticks')  # g1_ct
 LS_T, LS_TICK = 0, 1
 LS_Q, LS_DQ, LS_TAU = slice(2, 31), slice(31, 60), slice(60, 89)
 LS_QUAT, LS_GYRO = slice(89, 93), slice(93, 96)
-LS_LX, LS_RX, LS_LY = 97, 98, 101
+LS_LX, LS_RX, LS_RY, LS_LY = 97, 98, 99, 101
 # lowcmd.csv columns
 LC_T, LC_Q, LC_KP0 = 0, slice(1, 30), 30
 
@@ -179,7 +180,7 @@ def motion(sport, ls, t_from, t_to):
     return dict(seconds=seconds, forward_speed=forward / seconds, sideways_speed=sideways / seconds,
                 yaw_rate=turn / seconds, heading_deg=math.degrees(turn),
                 distance_m=float(np.linalg.norm(p[-1] - p[0])), path_m=float(np.linalg.norm(d, axis=1).sum()),
-                pelvis_z_min=float(sport[inside, 3].min()))
+                pelvis_z_min=float(sport[inside, 3].min()), pelvis_z_mean=float(sport[inside, 3].mean()))
 
 
 def scenario_segments(timeline):
@@ -484,23 +485,42 @@ class Replay:
         for name in self.order:
             if terms[name].get('clip') is not None or any(s != 1 for s in terms[name]['scale']):
                 raise SystemExit(f'analyze.py: observation {name} has clip/scale, not replayed')
+        # Terms of patches/g1_ctrl-height.patch (a height export): the height command from the right stick, the
+        # upper-body slot's zeros.
+        self.height = terms['height_command'].get('params') if 'height_command' in terms else None
+        self.slot = len(terms['upper_body_command']['scale']) if 'upper_body_command' in terms else None
 
     def command(self, lx, ly, rx):
         """velocity_commands: (ly, -lx, -rx) clamped to the deploy ranges."""
         raw = [ly, -lx, -rx]
         return np.float32([min(max(v, lo), hi) for v, (lo, hi) in zip(raw, self.ranges)])
 
-    def frame(self, row, command, phase, last_action):
+    def height_term(self, command, ry):
+        """height_command as the patch builds it: c = nominal + (nominal - lowest) min(0, ry), at least
+        walking_lowest while the command's norm is at least walking_norm, within [lowest, nominal]; c - nominal."""
+        p = {key: np.float32(value) for key, value in self.height.items()}
+        height = np.float32(p['nominal'] + (p['nominal'] - p['lowest']) * np.float32(min(0.0, float(ry))))
+        if float(np.sqrt(np.sum(command.astype(np.float32) ** 2))) >= float(p['walking_norm']):
+            height = max(height, p['walking_lowest'])
+        height = min(max(height, p['lowest']), p['nominal'])
+        return np.float32([height - p['nominal']])
+
+    def frame(self, row, command, phase, last_action, ry=0.):
         quat = np.float32(row[LS_QUAT])
         gait = np.float32([math.sin(float(np.float32(phase * 2)) * math.pi),
                            math.cos(float(np.float32(phase * 2)) * math.pi)])
         if float(np.sqrt(np.sum(command.astype(np.float32) ** 2))) < 0.1:
             gait = np.zeros(2, np.float32)
-        return dict(base_ang_vel=np.float32(row[LS_GYRO]),
-                    projected_gravity=np.float32(gravity_of(quat[None])[0]),
-                    velocity_commands=command, gait_phase=gait,
-                    joint_pos_rel=np.float32(row[LS_Q]) - self.default, joint_vel_rel=np.float32(row[LS_DQ]),
-                    last_action=np.float32(last_action))
+        terms = dict(base_ang_vel=np.float32(row[LS_GYRO]),
+                     projected_gravity=np.float32(gravity_of(quat[None])[0]),
+                     velocity_commands=command, gait_phase=gait,
+                     joint_pos_rel=np.float32(row[LS_Q]) - self.default, joint_vel_rel=np.float32(row[LS_DQ]),
+                     last_action=np.float32(last_action))
+        if self.height is not None:
+            terms['height_command'] = self.height_term(command, ry)
+        if self.slot is not None:
+            terms['upper_body_command'] = np.zeros(self.slot, np.float32)
+        return terms
 
     def act(self, frames):
         """frames: oldest to newest; each term's own history buffer, terms in deploy.yaml order."""
@@ -516,13 +536,14 @@ class Replay:
         return raw, target
 
 
-def smooth_remote(ls):
-    """g1_ctrl's joystick axes: unitree_joystick.hpp Axis smoothing applied again to the sim's values."""
-    out = np.zeros((len(ls), 3), np.float32)
-    state = [np.float32(0)] * 3
+def smooth_remote(ls, columns=(LS_LX, LS_LY, LS_RX)):
+    """g1_ctrl's joystick axes (lx, ly, rx; columns=(LS_RY,): the right stick's vertical, the height command of
+    g1_ctrl-height.patch): unitree_joystick.hpp Axis smoothing applied again to the sim's values."""
+    out = np.zeros((len(ls), len(columns)), np.float32)
+    state = [np.float32(0)] * len(columns)
     smooth = np.float32(0.03)
     for i, row in enumerate(ls):
-        for k, col in enumerate((LS_LX, LS_LY, LS_RX)):
+        for k, col in enumerate(columns):
             v = np.float32(row[col])
             dz = 0.0 if abs(v) < np.float32(0.01) else float(v)
             state[k] = np.float32(float(state[k]) * (1.0 - float(smooth)) + dz * float(smooth))
@@ -561,6 +582,7 @@ def latency(run, ls, lc, deploy, t_enter, t_leave, segments):
     """segments: (label, start ns, end ns) to tag each policy step with."""
     replay = Replay(run, deploy)
     remote = smooth_remote(ls)
+    ry = smooth_remote(ls, (LS_RY,)) if replay.height is not None else None
     t_ls, ticks = ls[:, LS_T], ls[:, LS_TICK]
     # first arrival of each simulator state (the bridge publishes at 1 kHz, physics steps at 500 Hz)
     first = np.ones(len(ls), bool)
@@ -577,6 +599,9 @@ def latency(run, ls, lc, deploy, t_enter, t_leave, segments):
     def cmd(r):
         lx, ly, rx = remote[r]
         return replay.command(float(lx), float(ly), float(rx))
+
+    def frame_at(r, phase, last):  # g1_ctrl's frame from lowstate r (the height command from its right stick)
+        return replay.frame(ls[r], cmd(r), phase, last, 0. if ry is None else float(ry[r, 0]))
 
     # Step number on the policy thread's fixed grid (sleep_until += step_dt; a late step is followed by
     # quick catch-up steps, a step that ends within one FSM tick of the next is never published). The
@@ -613,8 +638,8 @@ def latency(run, ls, lc, deploy, t_enter, t_leave, segments):
                 for b in cands[-4:]:
                     if b < a:
                         continue
-                    f0 = replay.frame(ls[a], cmd(a), phases[0], raws[0])
-                    hist = [f0] * 4 + [replay.frame(ls[b], cmd(b), phases[1], raws[0])]
+                    f0 = frame_at(a, phases[0], raws[0])
+                    hist = [f0] * 4 + [frame_at(b, phases[1], raws[0])]
                     raw, pred = replay.act(hist)
                     err = float(np.max(np.abs(pred - target)))
                     if best is None or err < best[0]:
@@ -628,7 +653,7 @@ def latency(run, ls, lc, deploy, t_enter, t_leave, segments):
                 history = [nearest(frames, max(n, 0)) for n in range(j - 4, j)]
                 last = nearest(raws, j - 1)
                 for r in cands:
-                    f = replay.frame(ls[r], cmd(r), phases[j], last)
+                    f = frame_at(r, phases[j], last)
                     raw, pred = replay.act(history + [f])
                     err = float(np.max(np.abs(pred - target)))
                     if best is None or err < best[0] - 1e-9:
@@ -928,11 +953,13 @@ def print_report(r):
         vx, vy, wz = s['command']
         st, wh = s['settled'], s['whole']
         fell = '' if s['fell_s'] is None else f", ПАДЕНИЕ на {s['fell_s']:.1f} с"
+        # name@height: the right stick down (gamepad.py crouch / --ry, g1_ctrl-height.patch)
+        crouch = f", таз после {s['settle_s']:g} с в среднем {st['pelvis_z_mean']:.3f} м" if '@' in s['name'] else ''
         print(f"{s['start_s']:5.1f} с {s['name']:<11} ({vx:+.2f}, {vy:+.2f}, {wz:+.2f}) {s['seconds']:.1f} с; "
               f"после {s['settle_s']:g} с: вперёд {st['forward_speed']:+.2f} м/с, "
               f"вбок {st['sideways_speed']:+.2f} м/с, рысканье {st['yaw_rate']:+.3f} рад/с, "
               f"смещение {st['distance_m']:.2f} м; весь отрезок: смещение {wh['distance_m']:.2f} м, "
-              f"курс {wh['heading_deg']:+.1f}°, таз ≥ {wh['pelvis_z_min']:.3f} м{fell}")
+              f"курс {wh['heading_deg']:+.1f}°, таз ≥ {wh['pelvis_z_min']:.3f} м{crouch}{fell}")
     p = r.get('passive')
     if p:
         print(f"Passive: LT + B на {p['command_s']:.1f} с, g1_ctrl в Passive на "
