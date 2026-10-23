@@ -158,6 +158,70 @@ def test_g1_gpu_straight_command_holds_the_heading_it_starts_at(monkeypatch):
 
 
 @pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_side_command_turn_stays_zero_without_side_heading_hold(monkeypatch):
+    """side_heading_hold through the shared effective_command: four worlds turned 0.5 rad off the held heading, told
+    to step left, right, forward and diagonally. Missing and true: heading hold steers all four (−0.25), as before;
+    false: the side steps' turn is exactly zero in the observed and in the rewarded command, the other two as before.
+    The same command as effective_command on CPU tensors and as the CPU task with the same setting."""
+    import mujoco
+    import warp as wp
+    import humanoid_sim.g1_tensor_env as tensor_env
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
+    seen, original = [], tensor_env.reward_components
+
+    def spy(*args, **kwargs):  # the command the CUDA env rewards
+        seen.append(args[3].clone())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tensor_env, 'reward_components', spy)
+    commands = torch.tensor([[0., 1., 0.], [0., -1., 0.], [1., 0., 0.], [.5, .5, 0.]])
+    side = task.pure_sideways(commands)
+    assert side.tolist() == [True, True, False, False]
+    profile = dict(real_robot=True, action_limit=10., heading_hold=True, stand_heading_hold=False)
+    steered = {}
+    for setting in (None, True, False):
+        options = {} if setting is None else {'side_heading_hold': setting}
+        hold = setting is not False
+        env = TensorG1Env(4, seed=2, resample_commands=False, push_velocity=0, observation_noise=False,
+                          randomize=False, **profile, **options)
+        cpu = G1VelocityEnv(**profile, **options)
+        try:
+            assert env.reference.side_heading_hold is hold
+            env.reset()
+            env.command.copy_(commands.to(env.device))
+            env.qpos[:, 3:7] = torch.tensor([math.cos(.25), 0, 0, math.sin(.25)], device=env.device)
+            with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(env.device))):
+                wp.capture_launch(env.forward_graph)
+            env._obs()
+            observed = env.observed_command.cpu()
+            yaw = observed[:, 2]
+            assert bool((yaw[~side] < -.2).all())  # forward and diagonal: steered back in every case
+            assert bool((yaw[side] < -.2).all()) if hold else bool((yaw[side] == 0).all())
+            torch.testing.assert_close(observed[:, :2], commands[:, :2])
+            rotation = env.xmat[:, env.pelvis].reshape(-1, 3, 3).cpu().double()
+            shared = task.effective_command(commands.double(), rotation, env.heading_target.cpu().double(), False, hold)
+            torch.testing.assert_close(observed.double(), shared, atol=1e-6, rtol=0)
+            for k, command in enumerate(commands.tolist()):  # the CPU task with the same setting
+                cpu.reset(seed=1, options={'command': command})
+                cpu.data.qpos[3:7] = [math.cos(.25), 0, 0, math.sin(.25)]
+                mujoco.mj_forward(cpu.model, cpu.data)
+                cpu._observation()
+                np.testing.assert_allclose(cpu.observed_command, observed[k].numpy(), atol=1e-5, rtol=0)
+                if not hold and side[k]:
+                    assert cpu.observed_command[2] == 0.
+            env.step(torch.zeros((4, 29), device=env.device))
+            env.check_health()
+            assert torch.equal(seen[-1].cpu(), observed)  # rewarded for the command it observed
+            steered[setting] = observed
+        finally:
+            env.close()
+            cpu.close()
+    assert torch.equal(steered[None], steered[True])
+    assert torch.equal(steered[False][~side], steered[True][~side])
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
 def test_g1_gpu_side_commands_stop_after_a_sideways_step_and_keep_the_old_draw_without_them(monkeypatch):
     """side_share / side_stop through the shared sample_commands, a resample at every step: (1) every walking command
     sideways and side_stop 1: each world goes sideways, stand, sideways, …, a sideways step holding the heading it
@@ -234,6 +298,44 @@ def test_g1_gpu_side_commands_stop_after_a_sideways_step_and_keep_the_old_draw_w
         finally:
             env.close()
     assert torch.equal(drawn[0], drawn[1])
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_side_speed_widens_only_the_purely_sideways_commands(monkeypatch):
+    """side_speed through the shared sample_commands on the CUDA stream, a resample at every step (zero actions, so
+    the physics and the stream do not depend on the commands): with the same seed every world draws what it draws
+    without side_speed, except the purely sideways commands, whose |vy| is the same uniform number on [0.1, 1]
+    instead of [0.1, 0.5] (no new draw, so the later resamples match too); the other walking commands stay within
+    ±lateral_speed 0.5."""
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from test_g1_side_stop import COMMANDS
+    monkeypatch.setattr(task, 'COMMAND_RESAMPLE_SECONDS', .001)  # resample every step
+    profile = dict(real_robot=True, action_limit=10., heading_hold=True, stand_heading_hold=False, phase_stop=True,
+                   push_velocity=0, observation_noise=False, randomize=False)
+    n, drawn = 4096, []
+    for side_speed in (0., 1.):
+        commands = {**COMMANDS, 'side_share': .2, 'side_stop': 1., 'side_speed': side_speed}
+        env = TensorG1Env(n, seed=5, commands=commands, **profile)
+        try:
+            env.reset()
+            frames = [env.command.clone()]
+            for _ in range(3):
+                env.step(torch.zeros((n, 29), device=env.device))
+                env.check_health()
+                frames.append(env.command.clone())
+            drawn.append(torch.stack(frames).reshape(-1, 3))
+        finally:
+            env.close()
+    plain, wide = drawn
+    side = task.pure_sideways(wide)
+    assert torch.equal(side, task.pure_sideways(plain)) and int(side.sum()) > 1000
+    assert torch.equal(wide[~side], plain[~side])
+    assert torch.equal(torch.sign(wide[side, 1]), torch.sign(plain[side, 1]))
+    speed = wide[side, 1].abs()
+    assert float(speed.min()) >= .1 - 1e-6 and float(speed.max()) <= 1. + 1e-6 and float(speed.max()) > .9
+    torch.testing.assert_close((speed - .1) / .9, (plain[side, 1].abs() - .1) / .4)  # the same uniform number
+    walking = wide.abs().sum(dim=1) > 0
+    assert float(wide[walking & ~side, 1].abs().max()) <= .5 + 1e-6
 
 
 @pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
@@ -1505,3 +1607,134 @@ def test_g1_gpu_force_push_runs_per_world_on_top_of_the_velocity_pushes_and_ends
         torch.testing.assert_close(zero.qpos, plain.qpos, rtol=0, atol=0)
     finally:
         plain.close(), zero.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_motor_friction_scales_the_motor_torque_per_world(monkeypatch):
+    """Three worlds with the motor friction set by hand to 0, 0.5 and 1.25 (set_motor_friction, no setting), each
+    against the CPU task reset with the same motor_friction_scale, from one pose with the joints moving at
+    0.5·sin(j + 1) rad/s, so the friction acts from the first substep (up to 3.1 N·m between m 0 and 1.25 on CPU).
+    The first substep's torque is the CPU task's in every world; every substep's torque is the shared motor model
+    with the world's m on its own Warp state (m = 0: no friction at all). Trajectories are compared at m = 0 only:
+    with the friction's tanh(v/0.01) a float32-rounded start drifts from the float64 one on CPU alone by 0.04-0.18 in
+    the observation within 1-3 steps at m 0.5-1.25 (by 4e-5 at m = 0), beyond any CPU-GPU tolerance."""
+    import mujoco
+    import warp as wp
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
+    scales = (0., .5, 1.25)
+    profile = dict(real_robot=True, action_limit=10., gait={'period': .6, 'stance_fraction': .55})
+    cpus = [G1VelocityEnv(**profile) for _ in scales]
+    gpu = TensorG1Env(3, seed=4, resample_commands=False, push_velocity=0, observation_noise=False, randomize=False,
+                      **profile)
+    cpu_ctrl, gpu_seen = [[] for _ in scales], []
+    original_step, original_launch = mujoco.mj_step, wp.capture_launch
+
+    def cpu_step(model, data):  # what each CPU substep gets
+        for world, cpu in enumerate(cpus):
+            if data is cpu.data:
+                cpu_ctrl[world].append(data.ctrl.copy())
+        original_step(model, data)
+
+    def launch(graph, *args, **kwargs):  # the Warp state and torque each substep starts from
+        if graph is gpu.step_graph:
+            gpu_seen.append((gpu.qpos[:, gpu.qadr].clone(), gpu.qvel[:, gpu.vadr].clone(), gpu.ctrl.clone()))
+        return original_launch(graph, *args, **kwargs)
+
+    monkeypatch.setattr(mujoco, 'mj_step', cpu_step)
+    monkeypatch.setattr(wp, 'capture_launch', launch)
+    try:
+        assert not gpu.motor_frictions and gpu.reference.motor_friction == 0
+        for cpu, m in zip(cpus, scales):
+            cpu.reset(seed=4, options={'command': [.6, 0., 0.], 'motor_friction_scale': m})
+            assert cpu.friction_scale == m
+            cpu.data.qvel[cpu.vadr] = .5 * np.sin(np.arange(cpu.model.nu) + 1.)
+            mujoco.mj_forward(cpu.model, cpu.data)
+        gpu.reset()
+        assert torch.equal(gpu.friction_scale.cpu(), torch.ones(3))
+        gpu.set_motor_friction(torch.tensor(scales))
+        assert gpu.motor_frictions
+        gpu.qpos.copy_(torch.tensor(np.stack([cpu.data.qpos for cpu in cpus]), device=gpu.device, dtype=torch.float32))
+        gpu.qvel.copy_(torch.tensor(np.stack([cpu.data.qvel for cpu in cpus]), device=gpu.device, dtype=torch.float32))
+        gpu.command.copy_(torch.tensor([[.6, 0., 0.]], device=gpu.device).expand(3, -1))
+        with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(gpu.device))):
+            wp.capture_launch(gpu.forward_graph)
+        start = gpu._obs().cpu()  # also refreshes the observed (rewarded) command
+        for world in range(3):
+            np.testing.assert_allclose(start[world], cpus[world]._observation(), atol=2e-5, rtol=2e-5)
+        joints = cpus[0].action_space.shape[0]
+        for step in range(3):
+            results = [cpu.step(np.zeros(joints)) for cpu in cpus]
+            _, reward, _, _, terminal = gpu.step(torch.zeros((3, joints), device=gpu.device))
+            gpu.check_health()
+            np.testing.assert_allclose(terminal.cpu()[0], results[0][0], atol=.03, rtol=.02)
+            np.testing.assert_allclose(reward.cpu()[0], results[0][1], atol=.03, rtol=.02)
+        assert len(gpu_seen) == 30 and all(len(ctrl) == 30 for ctrl in cpu_ctrl)
+        # The first substep starts from the same state on both backends: the same torque in every world.
+        first, expected = gpu_seen[0][2].cpu().numpy(), np.array([ctrl[0] for ctrl in cpu_ctrl])
+        np.testing.assert_allclose(first, expected, rtol=1e-4, atol=2e-3)
+        assert np.abs(expected[2] - expected[0]).max() > 2  # the friction acted
+        # Every substep: the shared motor model with each world's m on the Warp state it starts from.
+        for position, velocity, ctrl in gpu_seen:
+            pd = task.pd_torque(torch.zeros_like(ctrl), position, velocity, gpu.home, gpu.scale, gpu.kp, gpu.kd,
+                                gpu.joint_low, gpu.joint_high, -gpu.unclamped, gpu.unclamped, 10.)
+            torque = task.motor_torque(pd, velocity, *gpu.motors, friction_scale=gpu.friction_scale)
+            torch.testing.assert_close(ctrl, torque.clamp(min=gpu.torque_low, max=gpu.torque_high), rtol=1e-6,
+                                       atol=1e-5)
+            x1, x2, y1, y2, static, viscous = gpu.motors
+            frictionless = task.motor_torque(pd, velocity, x1, x2, y1, y2, 0 * static, 0 * viscous)
+            torch.testing.assert_close(ctrl[0], frictionless[0].clamp(min=gpu.torque_low, max=gpu.torque_high),
+                                       rtol=1e-6, atol=1e-5)
+        assert 'rollout/motor_friction' not in gpu.rollout_metrics()  # logged only with the setting
+        gpu.reset()  # without the setting a reset puts m back to 1
+        assert torch.equal(gpu.friction_scale.cpu(), torch.ones(3))
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_motor_friction_draws_per_world_redraws_at_reset_and_is_logged():
+    """256 worlds at the working 1.25: each world's m is drawn at its reset in [0, 1.25] (mean 0.625), fixed within
+    the episode, redrawn at the next reset and logged as rollout/motor_friction; off, nothing is drawn or scaled."""
+    env = TensorG1Env(256, seed=3, max_episode_steps=2, resample_commands=False, push_velocity=0, real_robot=True,
+                      action_limit=10., observation_noise=False, randomize=False, motor_friction=1.25)
+    try:
+        assert env.motor_frictions and env.reference.motor_friction == 1.25
+        env.reset()
+        first = env.friction_scale.clone()
+        assert float(first.min()) >= 0 and float(first.max()) < 1.25 and len(first.unique()) > 250
+        assert float(first.mean()) == pytest.approx(.625, abs=.1)
+        action = torch.zeros((256, 29), device=env.device)
+        env.step(action)
+        assert torch.equal(env.friction_scale, first)  # fixed within an episode
+        assert env.rollout_metrics()['rollout/motor_friction'] == pytest.approx(float(first.mean()), rel=1e-5)
+        _, _, _, truncated, _ = env.step(action)
+        env.check_health()
+        assert truncated.all()
+        again = env.friction_scale
+        assert float(again.min()) >= 0 and float(again.max()) < 1.25 and float((again != first).float().mean()) > .99
+    finally:
+        env.close()
+    plain = TensorG1Env(2, seed=3, real_robot=True, action_limit=10.)
+    zero = TensorG1Env(2, seed=3, real_robot=True, action_limit=10., motor_friction=0.)
+    try:
+        for other in (plain, zero):
+            other.reset()
+            other.step(torch.full((2, 29), .3, device=other.device))
+        assert not zero.motor_frictions and torch.equal(zero.friction_scale.cpu(), torch.ones(2))
+        assert torch.equal(zero.generator.get_state(), plain.generator.get_state())
+        torch.testing.assert_close(zero.qpos, plain.qpos, rtol=0, atol=0)
+        assert 'rollout/motor_friction' not in zero.rollout_metrics()
+        for bad in (-.1, float('nan'), [1., float('inf')]):
+            with pytest.raises(ValueError):
+                zero.set_motor_friction(bad)
+    finally:
+        plain.close(), zero.close()
+    simulation = TensorG1Env(2, seed=3)  # no motor model, nothing to scale
+    try:
+        with pytest.raises(ValueError):
+            simulation.set_motor_friction(.5)
+    finally:
+        simulation.close()

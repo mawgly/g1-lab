@@ -54,7 +54,7 @@ function header(active) {
 function footer() {
   const bar = document.createElement('footer');
   bar.className = 'site-footer';
-  bar.innerHTML = `<div class="wrap"><span>G1 Lab · MuJoCo, MuJoCo Warp, PyTorch · unitree_mujoco, g1_ctrl (unitree_rl_mjlab)</span><span>${t('Все числа на сайте — из записей лаборатории')}</span></div>`;
+  bar.innerHTML = `<div class="wrap"><span>G1 Lab · <a href="https://github.com/mawgly/g1-lab">GitHub</a> · MuJoCo, MuJoCo Warp, PyTorch · unitree_mujoco, g1_ctrl (unitree_rl_mjlab)</span><span>${t('Все числа на сайте — из записей лаборатории')}</span></div>`;
   return bar;
 }
 

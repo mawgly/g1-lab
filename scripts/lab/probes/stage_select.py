@@ -33,20 +33,31 @@ own:
      before, comparable with earlier outputs: summary 'pushes_sim2sim') are printed as the sim2sim forecast
      (unitree_mujoco's feet pass through each other), not judged. Also judged there: side steps at ±1 m/s (stand 5
      s, left 10 s, stop 3 s, right 10 s, stop; the bridge procedure and three reset starts), 0 falls; their sideways
-     speed, drift and stop move are printed. 1327 runs a stage (was 699), about 8 min on 8 workers;
+     speed, drift and stop move are printed.
+     Since iteration 27 (the critic, lab-critic/it27/side05.py, side_grid.py) every side step of the 7 variants (left
+     then right at ±0.3 m/s) runs again at ±0.5 m/s, plan 'side05' with the same segments, start and timing (the
+     bridge group's 18 and one for each of the other five: 23 runs), judged as at ±0.3 (worst |yaw rate| < 0.05, the
+     stop right after it < 0.3 m) and printed in columns of its own: the floor works at ±0.5, the stick's limit in the
+     export's deploy.yaml, while step 2 judged drift and stop at ±0.3 only, and at ±0.5 in the bridge copy 7141294080
+     steps left with -0.057, 7121240064 right with +0.062 (both pass at ±0.3), candidate 7 (exp-c362df8e578148d0 @
+     6368231424) -0.040. Under it 7121240064 fails step 2: stepping right +0.063 in the bridge copy (reset starts),
+     the stop after stepping left 0.30-0.35 m in the four variants without +6 ms (with it 0.11-0.17).
+     1350 runs a stage (1327 before iteration 27, 699 before iteration 24);
   3. --fresh: one check of the winner on cases step 2 did not see, in the bridge copy (Unitree +6 ms): other timing
      windows (side step at offsets 5-61, walks at 13; step 2 has 0 and 0-53), delay 4 and 8 ms, stop-start, a right
      step alone (19 runs, no pushes since iteration 20: step 2 covers them). Same limits; the 4 / 8 ms runs and
      stop-start are judged on falls and the stop only, their drift is printed (the delay itself moves it: 5631836160
      stepping left -0.037 at 6 ms, -0.051 at 8 ms).
 An export_g1 folder is judged as exported (export_g1.ExportedPolicy: its policy.onnx with the stand trim, in the
-environment of its stage), as in stand_turn. Prints per stage a table by physics variant, the 30 s turn, the standing
-pushes by direction x dv, the walking pushes and the verdict, then the share of stages that pass (the measure of a
-recipe). Every run is deterministic (seed 73000): the same stage gives the same numbers, run for run equal to the
-critic's files (the 624 pushes of each stage below: falls, peak speed and lowest pelvis bit for bit as in his
-stand8*.json / walk8*.json; the 30 s turn as his stand30*.json um6). 8 workers (23.10, the trainer on the GPU, 24
-logical cores): ~4 min a stage for step 2 (679 runs, 624 of them pushes, ~1800 s of processes), ~12 s for step 3
-(4 stages with --fresh: 990 s).
+environment of its stage), as in stand_turn. Prints per stage a table by physics variant (the ±0.5 m/s side step's
+drift and stop in columns of their own), the 30 s turn, the standing pushes by direction x dv, the walking pushes and
+the verdict, then the share of stages that pass (the measure of a recipe). Every run is deterministic (seed 73000):
+the same stage gives the same numbers, run for run equal to the critic's files (the 624 pushes of each stage below:
+falls, peak speed and lowest pelvis bit for bit as in his stand8*.json / walk8*.json; the 30 s turn as his
+stand30*.json um6; the ±0.5 side steps as his side05.json). 8 workers (23.10, the trainer on the GPU, 24 logical
+cores): ~4 min a stage for step 2 (679 runs, 624 of them pushes, ~1800 s of processes), ~12 s for step 3 (4 stages
+with --fresh: 990 s). Since iteration 27 (23.10, 4 workers, the trainer on the GPU): step 2 of 7121240064 in 423 s,
+1545 s of processes for 1350 runs, the ±0.5 side steps 74 s of them (+5 %).
 The stages of the critic's check (iteration 20, exp-8ce0cbd70d0a4f1d, and candidate 4, exp-902b8958ee504780 @
 5631836160), step 2:
   5968920576 standing 8 of 400 (worst backwards 1.0: 3 of 10), walking 0 of 144, turn 30 s +4.5 deg: passes;
@@ -108,7 +119,11 @@ VARIANTS = (  # name, label, stand_turn case fields
     ('um_6ms', 'Unitree +6 мс (связка)', dict(physics='um', **SIX_MS)),
 )
 BRIDGE = ('ours_6ms', 'um_6ms')  # stand_turn's 'bridge' group runs these two
-PLANS = ('side', 'walk', 'walk1')  # the other five: side step left then right, walk 0.5, walk 1.0
+# Since iteration 27 every side step of step 2 runs again at ±0.5 m/s, the stick's limit in the export's deploy.yaml
+# where the floor works (the critic, lab-critic/it27/side05.py, side_grid.py): judged at ±0.3 only, the rule let through
+# drifts of -0.057 (7141294080 stepping left) and +0.062 (7121240064 right) in the bridge copy at ±0.5.
+SIDE05 = 'side05'  # stand_turn plan: 'side' at ±0.5 m/s, segments 'left05' / 'right05'
+PLANS = ('side', SIDE05, 'walk', 'walk1')  # the other five: side step ±0.3 and ±0.5, walk 0.5, walk 1.0
 FRESH = (  # group, label, judged on drift
     ('windows', 'другие окна времени', True),
     ('right', 'шаг вправо', True),
@@ -117,6 +132,10 @@ FRESH = (  # group, label, judged on drift
     ('delay8', 'задержка 8 мс', False),
 )
 DRIFT = (('w05', '0.5 м/с'), ('w1', '1 м/с'), ('L', 'влево'), ('R', 'вправо'))
+DRIFT05 = (('L05', 'влево 0.5 м/с'), ('R05', 'вправо 0.5 м/с'))  # the ±0.5 m/s side step, step 2 only
+STOPS = (('stop', ''), ('stop05', ' 0.5 м/с:'))  # row key, label: the stop right after a ±0.3 / ±0.5 m/s side step
+# a side step segment of stand_turn's plans -> its drift key and the key of the stop right after it
+SIDE_SEGMENTS = dict(left=('L', 'stop'), right=('R', 'stop'), left05=('L05', 'stop05'), right05=('R05', 'stop05'))
 # Since iteration 24 the pushes and the ±1 m/s side check are judged in the Unitree bridge copy with the feet colliding
 # as in Unitree's training model (um_probe 'um_caps': task_config foot_collision's capsules, condim 3, friction 0.6):
 # on the robot a foot grazing the other is a trip, and without the capsules the feet pass through each other (the
@@ -146,9 +165,12 @@ def side_check_jobs(stage):
 
 
 def select_jobs(stage):
-    """Step 2 of one stage: [(kind, job)], kind 'run' (stand_turn.run case: the 7 physics variants, then the side
-    check), 'push' (bridge_kick.run job) or 'feet' (foot_overlap.run job, printed only)."""
-    jobs = [('run', case) for case in st.grid(str(stage), 'bridge')]
+    """Step 2 of one stage: [(kind, job)], kind 'run' (stand_turn.run case: the 7 physics variants, the bridge group's
+    side steps again at ±0.5 m/s, then the side check), 'push' (bridge_kick.run job) or 'feet' (foot_overlap.run job,
+    printed only)."""
+    bridge = st.grid(str(stage), 'bridge')
+    jobs = [('run', case) for case in bridge]
+    jobs += [('run', dict(case, plan=SIDE05)) for case in bridge if case['plan'] == 'side']
     for name, _, fields in VARIANTS:
         if name not in BRIDGE:
             jobs += [('run', st.case(plan=plan, stage=str(stage), **fields)) for plan in PLANS]
@@ -186,10 +208,10 @@ def fresh_group(case):
 
 
 def measures(result):
-    """One stand_turn.run result: yaw rates walking ('w05', 'w1') and stepping ('L', 'R'), speeds ('v05', 'v1'),
-    the move in a stop right after a side step ('stop') and in the stops of stop-start ('brake'). A run that fell
-    gives none (its fall is counted)."""
-    out = {key: [] for key in ('w05', 'w1', 'L', 'R', 'v05', 'v1', 'stop', 'brake')}
+    """One stand_turn.run result: yaw rates walking ('w05', 'w1') and stepping at ±0.3 ('L', 'R') and ±0.5 m/s ('L05',
+    'R05'), speeds ('v05', 'v1'), the move in a stop right after a side step ('stop'; after ±0.5 'stop05') and in the
+    stops of stop-start ('brake'). A run that fell gives none (its fall is counted)."""
+    out = {key: [] for key in ('w05', 'w1', 'L', 'R', 'L05', 'R05', 'v05', 'v1', 'stop', 'stop05', 'brake')}
     if result['fell_at'] is not None:
         return out
     plan, prev = result['case']['plan'], None
@@ -203,10 +225,10 @@ def measures(result):
                 key = 'w1' if seg['cmd'][0] > .75 else 'w05'
                 out[key].append(seg['yaw_rate'])
                 out['v' + key[1:]].append(seg['fwd'])
-            elif name in ('left', 'right'):
-                out[name[0].upper()].append(seg['yaw_rate'])
-            elif name == 'stop' and prev in ('left', 'right'):
-                out['stop'].append(seg['disp'])
+            elif name in SIDE_SEGMENTS:
+                out[SIDE_SEGMENTS[name][0]].append(seg['yaw_rate'])
+            elif name == 'stop' and prev in SIDE_SEGMENTS:
+                out[SIDE_SEGMENTS[prev][1]].append(seg['disp'])
         prev = name
     return out
 
@@ -225,19 +247,21 @@ def row(results):
     for r in results:
         for key, values in measures(r).items():
             got.setdefault(key, []).extend(values)
-    worst = {key: (max(got.get(key, []), key=abs) if got.get(key) else None) for key, _ in DRIFT}
+    worst = {key: (max(got.get(key, []), key=abs) if got.get(key) else None) for key, _ in DRIFT + DRIFT05}
     return dict(runs=len(results), falls=[fall_of(r) for r in results if r['fell_at'] is not None], drift=worst,
-                stop=max(got.get('stop', []), default=None), brake=max(got.get('brake', []), default=None),
+                stop=max(got.get('stop', []), default=None), stop05=max(got.get('stop05', []), default=None),
+                brake=max(got.get('brake', []), default=None),
                 speed={key: (float(np.mean(got[key])) if got.get(key) else None) for key in ('v05', 'v1')})
 
 
-def judge(rows, labels, drift_rows):
-    """Reasons a stage does not pass ([] = passes). rows: name -> row; drift_rows: the names judged on drift."""
+def judge(rows, labels, drift_rows, drift=DRIFT, stops=STOPS[:1]):
+    """Reasons a stage does not pass ([] = passes). rows: name -> row; drift_rows: the names judged on drift; drift,
+    stops: the (key, label) of the yaw rates and side-step stops judged (step 2 adds the ±0.5 m/s side step's)."""
     reasons = []
     falls = ['%s: %s' % (labels[name], f) for name, r in rows.items() for f in r['falls']]
     if falls:
         reasons.append('падений %d (%s)' % (len(falls), '; '.join(falls)))
-    for key, what in DRIFT:
+    for key, what in drift:
         values = [(abs(rows[name]['drift'][key]), rows[name]['drift'][key], name) for name in drift_rows
                   if rows[name]['drift'][key] is not None]
         if not values:
@@ -246,12 +270,13 @@ def judge(rows, labels, drift_rows):
         size, value, name = max(values)
         if size >= DRIFT_LIMIT:
             reasons.append('увод %s %+.3f, |.| >= %.2f (%s)' % (what, value, DRIFT_LIMIT, labels[name]))
-    stops = [(r['stop'], name) for name, r in rows.items() if r['stop'] is not None]
-    if not stops:
-        reasons.append('сдвиг после стопа за шагом вбок не измерен')
-    elif max(stops)[0] >= STOP_LIMIT:
-        reasons.append('сдвиг после стопа за шагом вбок %.2f м >= %.1f (%s)' % (
-            max(stops)[0], STOP_LIMIT, labels[max(stops)[1]]))
+    for key, what in stops:
+        moves = [(r[key], name) for name, r in rows.items() if r[key] is not None]
+        if not moves:
+            reasons.append('сдвиг после стопа за шагом вбок%s не измерен' % what)
+        elif max(moves)[0] >= STOP_LIMIT:
+            reasons.append('сдвиг после стопа за шагом вбок%s %.2f м >= %.1f (%s)' % (
+                what, max(moves)[0], STOP_LIMIT, labels[max(moves)[1]]))
     return reasons
 
 
@@ -374,8 +399,8 @@ def select_summary(runs, push_results):
     pushes = {plan: push_table(push_results, plan, mags, PUSH_PHYSICS) for plan, mags, _ in PUSHES}
     forecast = {plan: push_table(push_results, plan, mags, FORECAST_PHYSICS) for plan, mags, _ in PUSHES}
     side = side_check(checked)
-    reasons = (judge(rows, labels, [name for name, _, _ in VARIANTS]) + push_reasons(pushes['stand'], pushes['walk'])
-               + side_reasons(side))
+    reasons = (judge(rows, labels, [name for name, _, _ in VARIANTS], DRIFT + DRIFT05, STOPS)
+               + push_reasons(pushes['stand'], pushes['walk']) + side_reasons(side))
     return dict(passes=not reasons, reasons=reasons, rows=rows, pushes=pushes, pushes_sim2sim=forecast, side1=side,
                 stand30=stand30(runs))
 
@@ -399,16 +424,21 @@ def number(value, fmt):
     return '-' if value is None else fmt % value
 
 
-def print_rows(title, summary, labels):
+def print_rows(title, summary, labels, side05=False):
+    """A table of rows by name; side05 (step 2): the ±0.5 m/s side step's yaw rates and stop in columns of their own."""
     print(title)
-    print('  %-24s %8s %8s %8s %8s %8s %8s %7s %12s' % (
-        '', 'прогонов', 'падений', '0.5 м/с', '1 м/с', 'влево', 'вправо', 'стоп, м', 'v 0.5 / 1'))
+    extra = ' %9s %10s %8s' % ('влево 0.5', 'вправо 0.5', 'стоп 0.5') if side05 else ''
+    print('  %-24s %8s %8s %8s %8s %8s %8s %7s%s %12s' % (
+        '', 'прогонов', 'падений', '0.5 м/с', '1 м/с', 'влево', 'вправо', 'стоп, м', extra, 'v 0.5 / 1'))
     for name, text in labels:
         r = summary['rows'][name]
         speed = '%s / %s' % (number(r['speed']['v05'], '%.2f'), number(r['speed']['v1'], '%.2f'))
-        print('  %-24s %8d %8d %8s %8s %8s %8s %7s %12s' % (
+        extra = ' %9s %10s %8s' % (*(number(r['drift'][key], '%+.3f') for key, _ in DRIFT05),
+                                   number(r['stop05'], '%.2f')) if side05 else ''
+        print('  %-24s %8d %8d %8s %8s %8s %8s %7s%s %12s' % (
             text, r['runs'], len(r['falls']), *(number(r['drift'][key], '%+.3f') for key, _ in DRIFT),
-            number(r['stop'], '%.2f'), speed) + ('' if r['brake'] is None else '  стоп-старт %.2f м' % r['brake']))
+            number(r['stop'], '%.2f'), extra, speed)
+              + ('' if r['brake'] is None else '  стоп-старт %.2f м' % r['brake']))
 
 
 def print_push_tables(pushes, physics, note):
@@ -457,7 +487,7 @@ def verdict(summary):
 
 def report(stage):
     print('\n== %s' % stage['label'])
-    print_rows('шаг 2 — 7 вариантов физики и толчки', stage['select'], [(n, t) for n, t, _ in VARIANTS])
+    print_rows('шаг 2 — 7 вариантов физики и толчки', stage['select'], [(n, t) for n, t, _ in VARIANTS], side05=True)
     print_pushes(stage['select'])
     if stage.get('feet'):
         print('  ' + feet.line(stage['feet']))
@@ -568,7 +598,7 @@ def main(argv=None):
                                                        or '-'))
     print('%.0f с на %d процессах (%.0f с на этап)' % (wall, args.workers, wall / len(stages)))
     if args.out:
-        rule = dict(drift=DRIFT_LIMIT, stop=STOP_LIMIT, variants=[name for name, _, _ in VARIANTS],
+        rule = dict(drift=DRIFT_LIMIT, stop=STOP_LIMIT, variants=[name for name, _, _ in VARIANTS], side05=SIDE05,
                     push_physics=PUSH_PHYSICS, forecast_physics=FORECAST_PHYSICS, side_check=SIDE_CHECK,
                     pushes=dict(dirs=DIRS8, stand_mags=STAND_MAGS, stand_offsets=STAND_OFFSETS, walk_mags=WALK_MAGS,
                                 walk_offsets=WALK_OFFSETS, judged_mag=JUDGED_MAG, stand_falls=STAND_FALLS,

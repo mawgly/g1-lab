@@ -7,11 +7,13 @@ writes Linux joystick events (struct js_event) into it, with the Xbox layout of
 unitree_mujoco/simulate/src/physics_joystick.h. The elastic band is driven with key presses sent to
 the simulator window (keys from unitree_mujoco's user_key_cb: 9 on/off, 8 lower, 7 raise), see Keys.
 
-Usage: python gamepad.py <fifo> <window id> <events.csv> [--scenario walk|turn|side|stopstart|passive|push] [...]
+Usage: python gamepad.py <fifo> <window id> <events.csv> [--scenario <name>] [...]
 Every scenario starts the same way (Passive -> FixStand on the band -> Velocity -> band off -> stand).
   walk       forward --walk m/s for --walk-seconds, then stand (the first sim2sim check)
   turn       turn stick +-yaw standing (5 s each) and while walking --walk m/s (10 s each)
   side       sideways +-side m/s, 10 s each
+  sidestop   sideways --side m/s (negative: right) for 10 s, then stand --after-seconds s (the stop after a
+             side step alone; in `side` the step the other way starts 3 s into it)
   stopstart  (walk --walk m/s 3 s, stop 3 s) x 3
   passive    LT + B from Velocity (standing, or walking with --passive-walking), then back on the band,
              FixStand and Velocity again
@@ -157,6 +159,8 @@ def segments(args):
     if args.scenario == 'side':
         return stand + [('side', 0., s, 0., 10.), ('stop', 0., 0., 0., PAUSE),
                         ('side', 0., -s, 0., 10.), ('stop', 0., 0., 0., args.after_seconds)]
+    if args.scenario == 'sidestop':
+        return stand + [('side', 0., s, 0., 10.), ('stop', 0., 0., 0., args.after_seconds)]
     if args.scenario == 'stopstart':
         return stand + [('walk', v, 0., 0., 3.), ('stop', 0., 0., 0., 3.)] * 3
     if args.scenario == 'passive':
@@ -289,8 +293,8 @@ def main():
     parser.add_argument('fifo')
     parser.add_argument('window')
     parser.add_argument('events')
-    parser.add_argument('--scenario', choices=('walk', 'turn', 'side', 'stopstart', 'passive', 'stand', 'push'),
-                        default='walk')
+    parser.add_argument('--scenario', choices=('walk', 'turn', 'side', 'sidestop', 'stopstart', 'passive', 'stand',
+                                               'push'), default='walk')
     parser.add_argument('--passive-seconds', type=float, default=2.0)
     parser.add_argument('--band-presses', type=int, default=6)
     parser.add_argument('--band-seconds', type=float, default=1.0)
@@ -299,7 +303,8 @@ def main():
     parser.add_argument('--walk-seconds', type=float, default=10.0)
     parser.add_argument('--after-seconds', type=float, default=5.0)
     parser.add_argument('--yaw', type=float, default=0.5, help='turn: stick yaw rate, rad/s')
-    parser.add_argument('--side', type=float, default=0.3, help='side: sideways speed, m/s')
+    parser.add_argument('--side', type=float, default=0.3,
+                        help='side, sidestop: sideways speed, m/s (sidestop: negative steps right)')
     parser.add_argument('--passive-walking', action='store_true', help='passive: press LT + B while walking')
     parser.add_argument('--passive-hold', type=float, default=4.0, help='passive: seconds in Passive')
     parser.add_argument('--push-walking', action='store_true', help='push: push while walking --walk m/s')

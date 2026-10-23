@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 
 import mujoco
@@ -40,13 +41,39 @@ def _sample(n, seed, sampler=task.sample_commands, **options):
     return sampler(n, lambda k: torch.rand(k, generator=generator), **{**COMMANDS, **options})
 
 
-def _old_drop_in(n, uniform, previous=None, side_share=0., side_stop=0., **commands):
-    assert not side_share and not side_stop
+def _old_drop_in(n, uniform, previous=None, side_share=0., side_stop=0., side_speed=0., **commands):
+    assert not side_share and not side_stop and not side_speed
     return _old_sample_commands(n, uniform, **commands)
 
 
+def _iteration24_sample_commands(n, uniform, min_speed=0., max_speed=1.5, stand_probability=.2, lateral_speed=0.,
+                                 yaw_rate=0., straight_probability=0., side_share=0., side_stop=0., previous=None):
+    """sample_commands as it was before side_speed (iteration 24), kept verbatim."""
+    speed, stand = uniform(n), uniform(n)
+    command = torch.zeros((n, 3), dtype=speed.dtype, device=speed.device)
+    standing = stand < stand_probability
+    command[:, 0] = torch.where(standing, 0., min_speed + speed * (max_speed - min_speed))
+    if lateral_speed:
+        command[:, 1] = torch.where(standing, 0., (2 * uniform(n) - 1) * lateral_speed)
+    if yaw_rate:
+        command[:, 2] = torch.where(standing, 0., (2 * uniform(n) - 1) * yaw_rate)
+        if straight_probability:
+            command[:, 2] = torch.where(uniform(n) < straight_probability, 0., command[:, 2])
+    if side_share:
+        side = (command[:, 0] < 0) & (uniform(n) < side_share / task.backward_share(min_speed, max_speed))
+        lateral = command[:, 1]
+        step = torch.copysign(task.STAND_SPEED + lateral.abs() * (1 - task.STAND_SPEED / lateral_speed), lateral)
+        command[:, 0] = torch.where(side, 0., command[:, 0])
+        command[:, 1] = torch.where(side, step, lateral)
+        command[:, 2] = torch.where(side, 0., command[:, 2])
+    if side_stop and previous is not None:
+        stop = task.pure_sideways(previous) & (command[:, 0] <= 0) & (uniform(n) < side_stop)
+        command = torch.where(stop[:, None], 0., command)
+    return command
+
+
 def test_without_the_settings_the_draw_is_bit_for_bit_the_old_one():
-    assert g1_commands(COMMANDS) == {**COMMANDS, 'side_share': 0., 'side_stop': 0.}  # missing keys: off
+    assert g1_commands(COMMANDS) == {**COMMANDS, 'side_share': 0., 'side_stop': 0., 'side_speed': 0.}  # missing: off
     previous = _sample(500, 1, side_share=.2)
     for seed in range(3):
         old = _sample(500, seed, _old_sample_commands)
@@ -205,6 +232,89 @@ def test_settings_are_bounded_and_outside_the_checkpoint_identity():
     validate_resume(saved, task_identity('g1_29dof', 'g1_velocity', with_side))
 
 
+SIDE_SPEED = dict(side_share=.2, side_speed=1.)  # iteration 25: side steps to ±1, the rest within ±lateral_speed .5
+
+
+def test_side_speed_rescales_only_the_purely_sideways_commands_with_no_new_draw():
+    def draw(**options):  # the commands and what the stream gives next
+        generator = torch.Generator().manual_seed(3)
+        command = task.sample_commands(20000, lambda k: torch.rand(k, generator=generator), **{**COMMANDS, **options})
+        return command, torch.rand(4, generator=generator)
+
+    (plain, plain_next), (wide, wide_next) = draw(side_share=.2), draw(**SIDE_SPEED)
+    assert torch.equal(plain_next, wide_next)  # the same number of draws
+    side = task.pure_sideways(wide)
+    assert torch.equal(side, task.pure_sideways(plain))
+    assert torch.equal(wide[~side], plain[~side])  # forward, backward, diagonals and stand: the old commands
+    assert torch.equal(torch.sign(wide[side, 1]), torch.sign(plain[side, 1]))
+    speed = wide[side, 1].abs()
+    assert float(speed.min()) >= SIDE_MIN_SPEED - 1e-6 and float(speed.max()) <= 1. + 1e-6
+    assert float(speed.max()) > .9 and abs(float(speed.mean()) - .55) < .02  # uniform over [0.1, 1]
+    torch.testing.assert_close((speed - .1) / .9, (plain[side, 1].abs() - .1) / .4)  # the same uniform number
+    walking = wide.abs().sum(dim=1) > 0
+    assert float(wide[walking & ~side, 1].abs().max()) <= .5  # every other walking command within ±lateral_speed
+    straight_forward = lambda command: float(((command[:, 0] > 0) & (command[:, 1].abs() <= .1)).float().mean())
+    assert straight_forward(wide) == straight_forward(plain) == straight_forward(_sample(20000, 3))
+    assert abs(straight_forward(wide) - .6 * .2) < .01  # forward 0.6 of the commands, |vy| ≤ 0.1 a fifth of it
+    previous = torch.tensor([[0., .8, 0.]]).expand(5000, -1)  # side_stop still reads a wide sideways step
+    stopped = _sample(5000, 7, side_share=.2, side_stop=1., side_speed=1., previous=previous)
+    forward = stopped[:, 0] > 0
+    assert float(stopped[~forward].abs().max()) == 0 and bool(forward.any())
+
+
+def test_without_side_speed_the_side_draw_is_bit_for_bit_the_iteration24_one():
+    previous = _sample(500, 1, side_share=.2)
+    for seed in range(3):
+        for options in ({'side_share': .2}, {'side_share': .2, 'side_stop': 1., 'previous': previous}):
+            old = _sample(500, seed, _iteration24_sample_commands, **options)
+            assert torch.equal(_sample(500, seed, **options), old)
+            assert torch.equal(_sample(500, seed, side_speed=0., **options), old)
+    for off in ({}, {'side_speed': 0}, {'side_speed': None}):  # missing, 0 and null: off
+        assert g1_commands({**COMMANDS, **SIDE, **off}) == {**COMMANDS, **SIDE, 'side_speed': 0.}
+    assert g1_commands({**COMMANDS, **SIDE, 'side_speed': 1})['side_speed'] == 1.
+
+
+def test_cpu_task_draws_side_speed_as_the_tensor_function():
+    """The CPU task's draws (its np_random as uniform numbers, float64) are the shared function's, side_speed
+    included: the same commands from the same generator state, and sideways steps above lateral_speed."""
+    commands = {**COMMANDS, **SIDE_SPEED, 'side_stop': 1.}
+    env = G1VelocityEnv(commands=commands, **PROFILE)
+    try:
+        env.reset(seed=6)
+        drawn = []
+        for _ in range(600):
+            previous = torch.from_numpy(env.command.copy())[None]
+            replay = copy.deepcopy(env.np_random)  # the generator state the task draws from
+            env._sample_command(resample=True)
+            expected = task.sample_commands(1, lambda k: torch.from_numpy(replay.random(k)), previous=previous,
+                                            **g1_commands(commands))
+            np.testing.assert_array_equal(env.command, expected[0].numpy())
+            drawn.append(env.command.copy())
+        drawn = torch.from_numpy(np.array(drawn))
+        side = task.pure_sideways(drawn)
+        walking = drawn.abs().sum(dim=1) > 0
+        assert float(drawn[side, 1].abs().max()) > .8 and float(drawn[side, 1].abs().max()) <= 1.
+        assert float(drawn[walking & ~side, 1].abs().max()) <= .5
+    finally:
+        env.close()
+
+
+def test_side_speed_is_bounded_and_outside_the_checkpoint_identity():
+    for commands in ({**COMMANDS, 'side_speed': 1.},  # no purely sideways commands to widen
+                     {**COMMANDS, 'side_share': .2, 'side_speed': .1},  # no sideways step above STAND_SPEED
+                     {**COMMANDS, 'side_share': .2, 'side_speed': .05},
+                     {**COMMANDS, 'side_share': .2, 'side_speed': 1.6},
+                     {**COMMANDS, 'side_share': .2, 'side_speed': -1.},
+                     {**COMMANDS, 'side_share': .2, 'side_speed': float('nan')}):
+        with pytest.raises(ValueError):
+            g1_commands(commands)
+    config = {**PROFILE, 'commands': {**COMMANDS, **SIDE}}
+    saved = task_identity('g1_29dof', 'g1_velocity', config)
+    wide = {**config, 'commands': {**COMMANDS, **SIDE, 'side_speed': 1.}}
+    assert task_identity('g1_29dof', 'g1_velocity', wide) == saved
+    validate_resume(saved, task_identity('g1_29dof', 'g1_velocity', wide))
+
+
 def test_last_iteration18_stage_resumes_with_side_commands():
     from humanoid_sim.checkpoint_schema import checkpoint_identity
     from humanoid_sim.core import list_stages, read_json
@@ -214,4 +324,18 @@ def test_last_iteration18_stage_resumes_with_side_commands():
     metadata = read_json(list_stages(run)[-1] / 'metadata.json')
     config = metadata['task_config']
     requested = task_identity('g1_29dof', 'g1_velocity', {**config, 'commands': {**config['commands'], **SIDE}})
+    validate_resume(checkpoint_identity(metadata), requested)
+
+
+def test_last_iteration24_stage_resumes_with_side_speed():
+    from humanoid_sim.checkpoint_schema import checkpoint_identity
+    from humanoid_sim.core import list_stages, read_json
+    run = Path(__file__).resolve().parents[1] / 'runs' / 'humanoid_lab' / 'exp-c362df8e578148d0'
+    if not run.exists() or not list_stages(run):
+        pytest.skip('iteration 24 run is not on this machine')
+    metadata = read_json(list_stages(run)[-1] / 'metadata.json')
+    config = metadata['task_config']
+    assert config['commands']['side_share'] == .2 and config['commands']['lateral_speed'] == .5
+    commands = g1_commands({**config['commands'], 'side_speed': 1.})
+    requested = task_identity('g1_29dof', 'g1_velocity', {**config, 'commands': commands})
     validate_resume(checkpoint_identity(metadata), requested)

@@ -30,7 +30,8 @@ class TensorG1Env:
                  legs_only=False, gait=None, action_limit=1., real_robot=False, observation_noise=None,
                  randomize=None, critic_extras=False, training_realism=1., history=1, stand_heading_hold=True,
                  phase_stop=False, sole_contact=False, random_phase=False, action_delay=0., arm_perturb=0.,
-                 lock_wrists=False, knee_floor=None, force_push=0., feet_flat_stance=False, foot_collision=False):
+                 lock_wrists=False, knee_floor=None, force_push=0., feet_flat_stance=False, foot_collision=False,
+                 side_heading_hold=True, motor_friction=0.):
         if type(n_envs) is not int or n_envs < 1 or type(max_episode_steps) is not int or max_episode_steps < 1:
             raise ValueError('n_envs and max_episode_steps must be positive integers')
         if not torch.cuda.is_available():
@@ -50,7 +51,8 @@ class TensorG1Env:
                                              random_phase=random_phase, action_delay=action_delay,
                                              arm_perturb=arm_perturb, lock_wrists=lock_wrists, knee_floor=knee_floor,
                                              force_push=force_push, feet_flat_stance=feet_flat_stance,
-                                             foot_collision=foot_collision)
+                                             foot_collision=foot_collision, side_heading_hold=side_heading_hold,
+                                             motor_friction=motor_friction)
         # Warp gets the reference's model (put_model below), so foot_collision's capsules, their contact filter and
         # the sole spheres are the CPU task's; a foot-foot contact is a robot-robot one for self_contact.
         # Curriculum: 0 = no noise, randomisation or pushes; 1 = Unitree's full training setup.
@@ -145,6 +147,11 @@ class TensorG1Env:
         self.push_timer = torch.zeros(n_envs,dtype=torch.long,device=self.device)
         self.push_left = torch.zeros(n_envs,dtype=torch.long,device=self.device)
         self.push_force = torch.zeros((n_envs,3),device=self.device)
+        # motor_friction: per world, the multiplier m of the motor model's joint friction (1: as measured), drawn with
+        # self.generator at its reset (task.motor_friction_draw) and handed to task.motor_torque every substep.
+        # set_motor_friction (tests, probes) also runs this path without the setting; then a reset puts m back to 1.
+        self.motor_frictions = ref.motor_friction > 0
+        self.friction_scale = torch.ones(n_envs,device=self.device)
         self._worlds = torch.arange(n_envs,device=self.device)
         self.returns = torch.zeros(n_envs,device=self.device)
         self.last_episode_lengths, self.last_episode_returns = self.lengths.clone(), self.returns.clone()
@@ -254,7 +261,8 @@ class TensorG1Env:
         """history: 'push' adds this frame (after a step), 'fill' fills the buffer of the masked worlds (reset),
         'replace' rewrites the newest frame. Without history (1 frame) the three are the same."""
         rotation = self.xmat[:,self.pelvis].reshape(-1,3,3)
-        command = (task.effective_command(self.command,rotation,self.heading_target,self.reference.stand_heading_hold)
+        command = (task.effective_command(self.command,rotation,self.heading_target,self.reference.stand_heading_hold,
+                                          self.reference.side_heading_hold)
                    if self.heading_hold else self.command)
         self.observed_command.copy_(command)
         if not self.real_robot:
@@ -323,6 +331,10 @@ class TensorG1Env:
             if self.reference.force_push:
                 timer = task.force_push_interval(self._uniform,self.n_envs,self.dt)
                 self.push_timer.copy_(torch.where(mask,timer,self.push_timer))
+        if self.motor_frictions:  # drawn last, so the draws above stay the old ones; nothing without motor_friction
+            scale = (task.motor_friction_draw(self._uniform,self.n_envs,self.reference.motor_friction)
+                     if self.reference.motor_friction else torch.ones_like(self.friction_scale))
+            self.friction_scale.copy_(torch.where(mask,scale,self.friction_scale))
         self.returns.masked_fill_(mask,0)
         self.wp.capture_launch(self.forward_graph)
 
@@ -372,6 +384,17 @@ class TensorG1Env:
         self.push_force.copy_(task.force_push_force(velocity,heading,self.reference.mass,steps,
                                                     self.reference.model.opt.timestep))
         self.force_pushes = True
+
+    def set_motor_friction(self, scale):
+        """Scale every world's motor joint friction (static and viscous) by scale[w] ((n_envs,) or one number) until
+        its next reset (tests, probes), as the CPU task's set_motor_friction; real robot only."""
+        if self.motors is None:
+            raise ValueError('motor friction needs the real-robot motor model')
+        scale = torch.as_tensor(scale,dtype=torch.float32,device=self.device).expand(self.n_envs)
+        if not bool(torch.isfinite(scale).all()) or bool((scale < 0).any()):
+            raise ValueError('expected finite non-negative motor friction scales')
+        self.friction_scale.copy_(scale)
+        self.motor_frictions = True
 
     @torch.no_grad()
     def step(self, actions):
@@ -434,8 +457,9 @@ class TensorG1Env:
                     joint_velocity = self.qvel[:,self.vadr]
                     torque = pd_torque(applied,self.qpos[:,self.qadr],joint_velocity,self.home,self.scale,self.kp,
                                        self.kd,self.joint_low,self.joint_high,-self.unclamped,self.unclamped,limit)
-                    torque = task.motor_torque(torque,joint_velocity,*self.motors).clamp(min=self.torque_low,
-                                                                                          max=self.torque_high)
+                    friction = dict(friction_scale=self.friction_scale) if self.motor_frictions else {}
+                    torque = task.motor_torque(torque,joint_velocity,*self.motors,**friction).clamp(min=self.torque_low,
+                                                                                                    max=self.torque_high)
                 self.ctrl.copy_(torque)
                 if self.force_pushes:
                     self.xfrc_applied[:,self.push_body,:3] = pushes[:,substep]
@@ -522,7 +546,8 @@ class TensorG1Env:
         the threshold in any substep (task.contact_step), while foot_collision is on (those contacts are in
         rollout/self_contact too); rollout/arm_press, mean Σ over the arm joints of (PD target − angle)² per
         world-step (rad², unweighted), while that term is on; rollout/arm_perturb, share of world-steps whose arms
-        followed a perturbation segment, while arm_perturb is on."""
+        followed a perturbation segment, while arm_perturb is on; rollout/motor_friction, the worlds' mean motor
+        friction multiplier now, while motor_friction is on."""
         metrics = {}
         if self.reference.reward_weights['yaw_drift']:
             count = self._yaw_drift_count.item()
@@ -549,6 +574,8 @@ class TensorG1Env:
             metrics['rollout/arm_perturb'] = self._arm_perturb_sum.item() / count if count else float('nan')
             self._arm_perturb_sum.zero_()
             self._arm_perturb_count = 0
+        if self.reference.motor_friction:
+            metrics['rollout/motor_friction'] = self.friction_scale.mean().item()
         return metrics
 
     def check_health(self):

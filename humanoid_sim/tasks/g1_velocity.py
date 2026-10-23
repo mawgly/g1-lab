@@ -12,7 +12,7 @@ from gymnasium import spaces
 import mujoco
 import numpy as np
 import torch
-from .config import CRITIC_EXTRAS, FORCE_PUSH_RANGE, g1_commands, g1_gait, g1_reward_weights
+from .config import CRITIC_EXTRAS, FORCE_PUSH_RANGE, MOTOR_FRICTION_RANGE, g1_commands, g1_gait, g1_reward_weights
 from . import g1_tensor_math as task
 
 ASSETS = Path(__file__).resolve().parents[2] / 'assets' / 'robots' / 'g1'
@@ -144,8 +144,18 @@ class G1VelocityEnv(gym.Env):
                  commands=None, legs_only=False, gait=None, action_limit=1., real_robot=False, critic_extras=False,
                  training_realism=1., history=1, stand_heading_hold=True, phase_stop=False, sole_contact=False,
                  random_phase=False, action_delay=0., arm_perturb=0., lock_wrists=False, knee_floor=None,
-                 force_push=0., feet_flat_stance=False, foot_collision=False):
+                 force_push=0., feet_flat_stance=False, foot_collision=False, side_heading_hold=True,
+                 motor_friction=0.):
         self.real_robot = bool(real_robot)
+        # Largest multiplier of the motor model's joint friction; a reset without a set command draws the episode's
+        # m ~ U(0, motor_friction) (task.motor_friction_draw), as the CUDA task does per world. 0: the original task.
+        self.motor_friction = float(motor_friction)
+        if not MOTOR_FRICTION_RANGE[0] <= self.motor_friction <= MOTOR_FRICTION_RANGE[1]:
+            raise ValueError(f'motor_friction must be in [{MOTOR_FRICTION_RANGE[0]:g}, {MOTOR_FRICTION_RANGE[1]:g}]')
+        if self.motor_friction and not self.real_robot:
+            raise ValueError('motor_friction requires real_robot')
+        # Heading hold also steers a purely sideways command (task.effective_command); False: its turn stays zero.
+        self.side_heading_hold = bool(side_heading_hold)
         # The feet collide with each other through Unitree's foot capsules (load_model), as the CUDA task's model.
         self.foot_collision = bool(foot_collision)
         # The feet_flat reward term counts only the feet in contact (task.reward_components), as the CUDA task does.
@@ -286,6 +296,10 @@ class G1VelocityEnv(gym.Env):
             self.foot_geoms = apply_real_robot_physics(self.model, self.joints, self.kp, self.feet)
             self.motors = motor_parameters(names)
             self._motor_tensors = tuple(torch.from_numpy(row.copy()) for row in self.motors)
+        # motor_friction: this episode's multiplier m of the motor model's joint friction (1: as measured) and the
+        # (1,) tensor motor_torque gets (None while m is 1, the original expression).
+        self.friction_scale = 1.
+        self._friction_scale = None
         self.action_space = spaces.Box(-self.action_limit, self.action_limit, (self.model.nu,), dtype=np.float32)
         # Simulation profile: body angular+linear velocity, gravity, command, joint offsets/velocities,
         # previous action, gait clock. Real robot: the controller's layout without linear velocity.
@@ -339,6 +353,19 @@ class G1VelocityEnv(gym.Env):
         self.push_force = task.force_push_force(_batch(velocity), heading, self.mass, torch.tensor([substeps]),
                                                 self.model.opt.timestep)[0].numpy()
 
+    def set_motor_friction(self, scale):
+        """Scale the motor model's joint friction (static and viscous) by `scale` from the next physics substep until
+        the next reset (tests, probes), as the reset option motor_friction_scale and the CUDA task's
+        set_motor_friction; real robot only (the simulation profile has no motor model)."""
+        if self.motors is None:
+            raise ValueError('motor friction needs the real-robot motor model')
+        if isinstance(scale, bool) or not isinstance(scale, (int, float, np.floating, np.integer)) \
+                or not np.isfinite(scale) or scale < 0:
+            raise ValueError('motor_friction_scale must be a finite non-negative number')
+        self.friction_scale = float(scale)
+        self._friction_scale = (None if self.friction_scale == 1.
+                                else torch.tensor([self.friction_scale], dtype=torch.float64))
+
     def set_arm_perturb(self, steps, action):
         """Start a perturbation segment now (tests, probes): for the next `steps` control steps the arm joints follow
         `action` (its arm entries, clipped to the action box), as the CUDA task's set_arm_perturb."""
@@ -389,7 +416,8 @@ class G1VelocityEnv(gym.Env):
         rotation = _batch(self.data.xmat[self.pelvis].reshape(3, 3))
         command = _batch(self.command)
         if self.heading_hold:
-            command = task.effective_command(command, rotation, _batch(self.heading_target), self.stand_heading_hold)
+            command = task.effective_command(command, rotation, _batch(self.heading_target), self.stand_heading_hold,
+                                             self.side_heading_hold)
         self.observed_command = command[0].numpy().copy()
         velocity = _batch(self._velocity())
         parts = (velocity, rotation, command, _batch(self.data.qpos[self.qadr]), _batch(self.data.qvel[self.vadr]),
@@ -464,6 +492,18 @@ class G1VelocityEnv(gym.Env):
         self.push_left, self.push_force = 0, np.zeros(3)
         self.push_timer = (int(task.force_push_interval(lambda n: torch.from_numpy(self.np_random.random(n)), 1,
                                                         self.dt)[0]) if self.push_live else 0)
+        # motor_friction: training resets (no command given) draw the episode's friction multiplier m, after every other
+        # draw, so those stay the old ones, and not at all without motor_friction; resets with a command keep m = 1.
+        # options['motor_friction_scale'] sets m (probes, evaluation in another friction; real robot only).
+        if 'motor_friction_scale' in options:
+            scale = options['motor_friction_scale']
+        elif self.motor_friction and options.get('command') is None:
+            scale = float(task.motor_friction_draw(lambda n: torch.from_numpy(self.np_random.random(n)), 1,
+                                                   self.motor_friction)[0])
+        else:
+            scale = 1.
+        if 'motor_friction_scale' in options or self.motors is not None:
+            self.set_motor_friction(scale)
         return self._observation('fill'), {'x_position': float(self.data.qpos[0])}
 
     def _target(self, action):
@@ -528,9 +568,10 @@ class G1VelocityEnv(gym.Env):
         for substep, lag in enumerate(self.delay_lags):
             joint_velocity = self.data.qvel[self.vadr]
             torque = self.kp*(targets[lag]-self.data.qpos[self.qadr])-self.kd*joint_velocity
-            if self.motors is not None:
+            if self.motors is not None:  # motor_friction: m only while it is not 1, so the call stays the old one
+                friction = {} if self._friction_scale is None else dict(friction_scale=self._friction_scale)
                 torque = task.motor_torque(torch.from_numpy(torque), torch.from_numpy(joint_velocity.copy()),
-                                           *self._motor_tensors).numpy()
+                                           *self._motor_tensors, **friction).numpy()
             self.data.ctrl[:] = np.clip(torque, self.model.actuator_ctrlrange[:, 0],
                                        self.model.actuator_ctrlrange[:, 1])
             if pushes is not None:

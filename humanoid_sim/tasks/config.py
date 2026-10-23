@@ -42,18 +42,23 @@ G1_LABELS = dict(velocity='Следование скорости', forward='Ск
 # most their share −min_speed / (max_speed − min_speed); side_stop: after such a command, the probability that a
 # fresh command other than forward becomes "stand" (iteration 19: in the Unitree bridge copy the stages fell only
 # on stops after a sideways step). Both 0 (missing) is the original draw, bit for bit.
+# side_speed (needs side_share): the top sideways speed of the purely sideways commands alone (the others keep
+# ±lateral_speed; iteration 25: side steps to ±1 m/s with the diagonals and forward commands unchanged); 0 or null
+# (missing) is off, the original draw bit for bit, otherwise above SIDE_MIN_SPEED.
 G1_COMMANDS = dict(min_speed=0., max_speed=1.5, stand_probability=.2, lateral_speed=0., yaw_rate=0.,
-                   straight_probability=0., side_share=0., side_stop=0.)
+                   straight_probability=0., side_share=0., side_stop=0., side_speed=0.)
 G1_COMMAND_LIMITS = dict(min_speed=(-1., 2.), max_speed=(0., 2.), stand_probability=(0., 1.),
                          lateral_speed=(0., 1.), yaw_rate=(0., 2.), straight_probability=(0., 1.),
-                         side_share=(0., 1.), side_stop=(0., 1.))
+                         side_share=(0., 1.), side_stop=(0., 1.), side_speed=(0., 1.5))
 G1_COMMAND_LABELS = dict(min_speed='Скорость команд от, м/с (минус — назад)', max_speed='Скорость команд до, м/с',
                          stand_probability='Доля команд «стоять» (0–1)', lateral_speed='Команды вбок до ±, м/с',
                          yaw_rate='Команды поворота до ±, рад/с',
                          straight_probability='Доля команд «прямо» без поворота, курс держится (0–1)',
                          side_share='Доля команд «чисто вбок» без поворота, за счёт команд назад (0–1)',
                          side_stop=('Стоп после шага вбок: вероятность, что следующая команда (кроме «вперёд») — '
-                                    '«стоять» (0–1)'))
+                                    '«стоять» (0–1)'),
+                         side_speed=('Команды «чисто вбок» до ±, м/с (0 — как у остальных команд вбок; диагонали '
+                                     'и «вперёд» не меняются)'))
 # Lowest sideways speed of a purely sideways command: g1_tensor_math.STAND_SPEED (below it the task asks to stand).
 SIDE_MIN_SPEED = .1
 # Gait clock rewarded by the `gait` term: cycle length (s) and the share of it each foot is on the ground.
@@ -98,6 +103,12 @@ ARM_PERTURB_RANGE = (0., .5)
 # training_realism; resets with a command and set_command (evaluation, scenarios) have none. Observations and actions
 # are unchanged, so it is not part of the policy contract. 0 (missing) is the original task.
 FORCE_PUSH_RANGE = (0., 2.)
+# motor_friction (real robot only): the largest multiplier of the motor model's joint friction (static and viscous,
+# tasks/g1_tensor_math.motor_torque) in training. Each training episode draws m ~ U(0, motor_friction) per world
+# (motor_friction_draw; 1.25 is the working value of iteration 27); resets with a command (evaluation, scenarios) keep
+# m = 1 unless reset options give motor_friction_scale. Not scaled by training_realism. Observations and actions are
+# unchanged, so it is not part of the policy contract. 0 (missing or null) is the original task.
+MOTOR_FRICTION_RANGE = (0., 2.)
 # lock_wrists (29-DoF G1): the wrist pitch and yaw joints always get action 0, so their motors hold the home pose
 # (tasks/g1_tensor_math.lock_joints); the applied action is the policy's with those entries zeroed, in everything
 # after it. Same layout, different meaning of four action entries: its own action contract (action_schema
@@ -127,6 +138,10 @@ G1_PARAMETERS = (
     # Missing in a saved config means on (the original task); new experiments start with it off.
     dict(group=None, key='stand_heading_hold', default=False, type='bool',
          label='Держать курс и стоя (поворот на месте к курсу; выкл. — команда «стоять» нулевая, как в Isaac Lab)'),
+    # Missing in a saved config means on (heading hold steered side steps too); new experiments start with it off.
+    dict(group=None, key='side_heading_hold', default=False, type='bool',
+         label=('Держать курс и при шаге «чисто вбок» (выкл. — поворот в команде нулевой, как от стика на роботе; '
+                'увод виден награде)')),
     # Missing in a saved config means off (the phase always ticked); new real-robot runs match g1_ctrl.
     dict(group=None, key='phase_stop', default=True, type='bool',
          label='Фаза шага = 0, когда команда почти нулевая (как в программе Unitree на роботе)'),
@@ -150,6 +165,11 @@ G1_PARAMETERS = (
     dict(group=None, key='force_push',
          label='Толчки силой на таз в обучении: наибольшее Δv, м/с (0 — без толчков; сила M·Δv/T раз в 2–4 с)',
          default=0., min=FORCE_PUSH_RANGE[0], max=FORCE_PUSH_RANGE[1]),
+    # Real robot only; missing (or null) in a saved config means 0 (the motor friction as Unitree measured it).
+    dict(group=None, key='motor_friction',
+         label=('Разброс трения моторов в обучении: верхняя граница множителя трения суставов (0 — без разброса; '
+                'на эпизод множитель от 0 до этого числа)'),
+         default=0., min=MOTOR_FRICTION_RANGE[0], max=MOTOR_FRICTION_RANGE[1]),
     # Missing in a saved config means off (the policy drove the wrists); a different action contract.
     dict(group=None, key='lock_wrists', default=False, type='bool',
          label='Закрепить запястья (тангаж и рыскание) в исходной позе: команда на них всегда 0'),
@@ -201,6 +221,8 @@ def backward_share(min_speed, max_speed):
 
 
 def g1_commands(values=None):
+    if isinstance(values, dict) and values.get('side_speed', 0.) is None:
+        values = {**values, 'side_speed': 0.}  # null: off, as missing
     result = _bounded(values, G1_COMMANDS, G1_COMMAND_LIMITS, 'command')
     if result['min_speed'] > result['max_speed']:
         raise ValueError('G1 command min_speed exceeds max_speed')
@@ -212,6 +234,11 @@ def g1_commands(values=None):
             raise ValueError(f'G1 command side_share needs lateral_speed above {SIDE_MIN_SPEED:g}')
     if result['side_stop'] and not result['side_share']:
         raise ValueError('G1 command side_stop requires side_share')
+    if result['side_speed']:  # the purely sideways commands' own top speed, still a real sideways step
+        if not result['side_share']:
+            raise ValueError('G1 command side_speed requires side_share')
+        if result['side_speed'] <= SIDE_MIN_SPEED:
+            raise ValueError(f'G1 command side_speed must be 0 (off) or above {SIDE_MIN_SPEED:g}')
     return result
 
 
@@ -229,16 +256,17 @@ def g1_config(values):
     lock_wrists missing means off (the policy drove the wrist pitch and yaw joints). knee_floor missing means None (no
     floor: the knee target went down to the joint range). force_push missing means 0 (no force pushes).
     feet_flat_stance missing means off (feet_flat charged both feet, every step). foot_collision missing means off (the
-    feet passed through each other).
+    feet passed through each other). side_heading_hold missing means on (heading hold steered purely sideways
+    commands too). motor_friction missing or null means 0 (the motor model's friction as measured, every episode).
     """
     keys = {'reward_weights', 'heading_hold', 'commands', 'gait', 'action_limit', 'real_robot', 'critic_extras',
             'training_realism', 'history', 'stand_heading_hold', 'phase_stop', 'sole_contact', 'random_phase',
             'action_delay', 'arm_perturb', 'lock_wrists', 'knee_floor', 'force_push', 'feet_flat_stance',
-            'foot_collision'}
+            'foot_collision', 'side_heading_hold', 'motor_friction'}
     if not isinstance(values, dict) or set(values)-keys:
         raise ValueError('Unknown G1 task setting')
     for key in ('heading_hold', 'real_robot', 'critic_extras', 'stand_heading_hold', 'phase_stop', 'sole_contact',
-                'random_phase', 'lock_wrists', 'feet_flat_stance', 'foot_collision'):
+                'random_phase', 'lock_wrists', 'feet_flat_stance', 'foot_collision', 'side_heading_hold'):
         if type(values.get(key, False)) is not bool:
             raise ValueError(f'{key} must be true or false')
     if values.get('critic_extras') and not values.get('real_robot'):
@@ -263,6 +291,13 @@ def g1_config(values):
     low, high = FORCE_PUSH_RANGE
     if type(push) not in (int, float) or not math.isfinite(push) or not low <= push <= high:
         raise ValueError(f'G1 force_push must be in [{low:g},{high:g}] m/s')
+    friction = values.get('motor_friction')
+    friction = 0. if friction is None else friction
+    low, high = MOTOR_FRICTION_RANGE
+    if type(friction) not in (int, float) or not math.isfinite(friction) or not low <= friction <= high:
+        raise ValueError(f'G1 motor_friction must be in [{low:g},{high:g}]')
+    if friction and not real:  # only the real-robot profile has the motor model and its friction
+        raise ValueError('motor_friction requires real_robot')
     floor = values.get('knee_floor')
     low, high = KNEE_FLOOR_RANGE
     if floor is not None and (type(floor) not in (int, float) or not math.isfinite(floor) or not low <= floor <= high):
@@ -296,7 +331,9 @@ def g1_config(values):
             'knee_floor': None if floor is None else float(floor),
             'force_push': float(push),
             'feet_flat_stance': values.get('feet_flat_stance', False),
-            'foot_collision': values.get('foot_collision', False)}
+            'foot_collision': values.get('foot_collision', False),
+            'side_heading_hold': values.get('side_heading_hold', True),
+            'motor_friction': float(friction)}
 
 
 # Bumped when the real-robot physics or observation layout changes.

@@ -4,9 +4,9 @@
 # Run as root from Windows (PowerShell), after setup.sh:
 #   wsl.exe -d Ubuntu -u root -e bash /mnt/c/Users/Admin/Documents/Codex/Sim/scripts/sim2sim/run.sh [export dir] [gamepad.py options]
 # export dir: output of `python -m humanoid_sim.export_g1` (policy.onnx + deploy.yaml), as a WSL path.
-# gamepad.py options: --scenario walk|turn|side|stopstart|passive|stand|push (default walk), --walk, --yaw,
-#   --side, --stand-seconds, --push-walking, --push-strength weak|strong|both, --push-dv 1.25,1.5, --push-order,
-#   ... (push needs setup.sh's unitree_mujoco push patch)
+# gamepad.py options: --scenario walk|turn|side|sidestop|stopstart|passive|stand|push (default walk), --walk,
+#   --yaw, --side, --stand-seconds, --push-walking, --push-strength weak|strong|both, --push-dv 1.25,1.5,
+#   --push-order, ... (push needs setup.sh's unitree_mujoco push patch)
 # run.sh options:
 #   --fixstand-wrist left|right[=rad]  FixStand ends with that wrist pitch (SDK 20 left, 27 right) at this target
 #                                      instead of Unitree's 0 (default 0.699999988: candidate 2's own target for
@@ -15,8 +15,9 @@
 #                                      build dir, so the run edits that file (fixstand.py) and puts the original
 #                                      back when it ends; without the option the file is not touched.
 #   --fixstand-left-wrist[=rad]        the same as --fixstand-wrist left[=rad] (its first name)
-# Results: $ROOT/sim2sim_logs/<export>-<time>[-<scenario>[-walking][-dv<v>[_<v>...]]][-leftwrist|-rightwrist]/
-# (CSV logs, process logs, g1_ctrl_config.yaml as used, report.txt / report.json).
+# Results: $ROOT/sim2sim_logs/<export>-<time>[-<scenario>[<side>][-walking][-dv<v>[_<v>...]]]
+#   [-leftwrist|-rightwrist]/ (CSV logs, process logs, g1_ctrl_config.yaml as used, report.txt / report.json);
+#   <side> is --side's value for side / sidestop when given (side0.5, sidestop-0.3).
 set -u
 export LC_ALL=C
 
@@ -50,12 +51,15 @@ esac
 SCENARIO=""
 WALKING=""
 DV=""
+SIDE=""
 for i in "${!ARGS[@]}"; do
   [ "${ARGS[$i]}" = --scenario ] && SCENARIO=-${ARGS[$((i + 1))]:-}
   [ "${ARGS[$i]}" = --push-walking ] && WALKING=-walking
   [ "${ARGS[$i]}" = --push-dv ] && DV=-dv${ARGS[$((i + 1))]:-}
+  [ "${ARGS[$i]}" = --side ] && SIDE=${ARGS[$((i + 1))]:-}
 done
 [ "$SCENARIO" = -walk ] && SCENARIO=""
+[[ $SCENARIO == -side || $SCENARIO == -sidestop ]] && SCENARIO=$SCENARIO$SIDE
 SCENARIO=$SCENARIO$WALKING${DV//,/_}
 TAG=""
 [ -n "$WRIST_SIDE" ] && TAG=-${WRIST_SIDE}wrist

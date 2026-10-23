@@ -41,19 +41,27 @@ def segment(run, name, n=0):
 
 def test_runs_of_the_two_steps(ss, tmp_path):
     """Step 2: stand_turn's bridge group (ours and Unitree +6 ms, 20 each) and side / walk 0.5 / walk 1.0 for the
-    other five variants, then the ±1 m/s side check in Unitree +6 ms with the foot capsules (the bridge procedure and
-    three reset starts); pushes in the bridge copy with the capsules (judged) and without (printed), 8 directions,
-    standing 10 moments x 6 dv, walking 6 phases x 3 dv. Step 3: the critic's fresh check, timing windows step 2
-    does not use, no pushes."""
+    other five variants, every side step of these again at ±0.5 m/s (iteration 27), then the ±1 m/s side check in
+    Unitree +6 ms with the foot capsules (the bridge procedure and three reset starts); pushes in the bridge copy with
+    the capsules (judged) and without (printed), 8 directions, standing 10 moments x 6 dv, walking 6 phases x 3 dv.
+    Step 3: the critic's fresh check, timing windows step 2 does not use, no pushes."""
     select = ss.select_jobs(stage(tmp_path))
     every = [job for kind, job in select if kind == 'run']
-    assert len(select) == 55 + 4 + 2 * (480 + 144) + 20 and len(every) == 59
+    assert len(select) == 55 + 23 + 4 + 2 * (480 + 144) + 20 and len(every) == 82
     checked = [case for case in every if case['plan'] == 'side1']
     runs = [case for case in every if case['plan'] != 'side1']
-    assert len(runs) == 55 and [(c['physics'], c['stale'], c['delay'], c['start'], c.get('phase', 0)) for c in checked] \
+    assert len(runs) == 78 and [(c['physics'], c['stale'], c['delay'], c['start'], c.get('phase', 0)) for c in checked] \
         == [('um_caps', True, 3, 'fixair', 0)] + [('um_caps', True, 3, 'reset', 15 * k) for k in range(3)]
     assert [(name, vy) for name, _, vy, _, _ in ss.st.PLANS['side1'] if name != 'stop'] == [
         ('stand', 0.), ('left1', 1.), ('right1', -1.)]
+    side, side05 = ss.st.PLANS['side'], ss.st.PLANS['side05']  # the ±0.3 side step's segments at ±0.5, named apart
+    assert [(name, vy) for name, _, vy, _, _ in side05] == [('stand', 0.), ('left05', .5), ('stop', 0.),
+                                                           ('right05', -.5), ('stop', 0.)]
+    assert [(vx, wz, secs) for _, vx, _, wz, secs in side05] == [(vx, wz, secs) for _, vx, _, wz, secs in side]
+    assert ss.st.RUNS['side05'] == ss.st.RUNS['side']  # its real timing windows are the ±0.3 run's
+    rest = lambda case: sorted((k, str(v)) for k, v in case.items() if k != 'plan')  # physics, start, timing, ...
+    assert sorted(map(rest, (c for c in runs if c['plan'] == 'side05'))) == sorted(
+        map(rest, (c for c in runs if c['plan'] == 'side')))
     feet = [job for kind, job in select if kind == 'feet']  # foot_overlap: 4 side steps, 16 sideways pushes
     assert [job['cmd'] for job in feet if job['kind'] == 'side'] == [[0., .5, 0.], [0., -.5, 0.], [0., 1., 0.],
                                                                     [0., -1., 0.]]
@@ -61,9 +69,12 @@ def test_runs_of_the_two_steps(ss, tmp_path):
         (d, m, o) for d in 'lr' for m in (1., 1.25) for o in (0, 37, 71, 113))
     assert {(job['phys'], job['left']) for job in feet if job['kind'] == 'push'} == {('um', False)}
     count = {name: sum(ss.variant_of(case) == name for case in runs) for name, _, _ in ss.VARIANTS}
-    assert count == dict(ours=3, ours_6ms=20, fric=3, fric_6ms=3, nomotor=3, um=3, um_6ms=20)
+    assert count == dict(ours=4, ours_6ms=29, fric=4, fric_6ms=4, nomotor=4, um=4, um_6ms=29)
     for name in ('ours', 'fric', 'fric_6ms', 'nomotor', 'um'):
-        assert sorted(case['plan'] for case in runs if ss.variant_of(case) == name) == ['side', 'walk', 'walk1']
+        assert sorted(case['plan'] for case in runs if ss.variant_of(case) == name) == [
+            'side', 'side05', 'walk', 'walk1']
+    for name in ss.BRIDGE:  # regular timing, 5 real windows, 3 reset starts
+        assert sum(case['plan'] == 'side05' for case in runs if ss.variant_of(case) == name) == 9
     assert [ss.variant_of(case) for case in runs if case['plan'] == 'stand30'] == ['ours_6ms', 'um_6ms']
     every = [job for kind, job in select if kind == 'push']
     assert {(job['phys'], job['left']) for job in every} == {('um_caps', False), ('um', False)}
@@ -95,8 +106,11 @@ def test_a_stage_inside_every_limit_passes_both_steps(ss, tmp_path):
                           (ss.fresh_jobs(stage(tmp_path)), lambda runs, pushes: ss.fresh_summary(runs))):
         got = summary(*made_up(ss, jobs, rate=-.0499, stop=.299))
         assert got['passes'] and got['reasons'] == []
-        row = got['rows']['windows' if 'windows' in got['rows'] else 'um_6ms']
-        assert row['drift'] == dict(w05=-.0499, w1=-.0499, L=-.0499, R=-.0499) and row['stop'] == .299
+        step3 = 'windows' in got['rows']  # step 3 has no ±0.5 m/s side step
+        row = got['rows']['windows' if step3 else 'um_6ms']
+        side05 = None if step3 else -.0499
+        assert row['drift'] == dict(w05=-.0499, w1=-.0499, L=-.0499, R=-.0499, L05=side05, R05=side05)
+        assert row['stop'] == .299 and row['stop05'] == (None if step3 else .299)
 
 
 def test_step_2_fails_on_a_fall_a_drift_or_a_stop(ss, tmp_path):
@@ -130,6 +144,47 @@ def test_step_2_fails_on_a_fall_a_drift_or_a_stop(ss, tmp_path):
             segment(run, 'stop')['disp'] = 1.
 
     assert verdict(stop_after_walking)['passes']
+
+
+def test_step_2_judges_the_side_step_at_0_5_m_s_as_the_one_at_0_3(ss, tmp_path):
+    """Iteration 27: the ±0.5 m/s side step (the stick's limit of the export) by the same limits, |yaw rate| < 0.05 and
+    the stop after it < 0.3 m, in keys of its own: it does not enter the ±0.3 step's drift or stop, nor they its."""
+    jobs = ss.select_jobs(stage(tmp_path))
+    clean = made_up(ss, jobs)
+
+    def verdict(change):
+        runs, pushes = copy.deepcopy(clean)
+        change(runs)
+        return ss.select_summary(runs, pushes)
+
+    def drift(runs):  # 7121240064 in the bridge copy (lab-critic/it27/side05.log)
+        segment(where(runs, physics='um', stale=True, plan='side05')[0], 'right05')['yaw_rate'] = .062
+
+    got = verdict(drift)
+    assert got['reasons'] == ['увод вправо 0.5 м/с +0.062, |.| >= 0.05 (Unitree +6 мс (связка))']
+    assert got['rows']['um_6ms']['drift']['R05'] == .062 and got['rows']['um_6ms']['drift']['R'] == .01
+
+    def drift_at_0_3(runs):
+        segment(where(runs, physics='um', stale=True, plan='side')[0], 'left')['yaw_rate'] = -.057
+
+    got = verdict(drift_at_0_3)
+    assert got['reasons'] == ['увод влево -0.057, |.| >= 0.05 (Unitree +6 мс (связка))']
+    assert got['rows']['um_6ms']['drift']['L05'] == .01
+
+    def stop(runs):
+        segment(where(runs, physics='nomotor', plan='side05')[0], 'stop', 1)['disp'] = .33
+
+    got = verdict(stop)
+    assert got['reasons'] == ['сдвиг после стопа за шагом вбок 0.5 м/с: 0.33 м >= 0.3 (без моторной модели)']
+    assert got['rows']['nomotor']['stop'] == .05 and got['rows']['nomotor']['stop05'] == .33
+
+    def fall(runs):
+        where(runs, physics='ours', stale=True, plan='side05', start='reset')[2]['fell_at'] = 30.5
+
+    assert verdict(fall)['reasons'] == ['падений 1 (наша +6 мс: side05 старт reset 30.5 с)']
+    without = ss.select_summary([r for r in clean[0] if r['case']['plan'] != 'side05'], clean[1])
+    assert without['reasons'] == ['увод влево 0.5 м/с не измерен', 'увод вправо 0.5 м/с не измерен',
+                                  'сдвиг после стопа за шагом вбок 0.5 м/с: не измерен']
 
 
 def test_step_2_judges_the_pushes_by_the_critics_rule(ss, tmp_path):
@@ -188,6 +243,11 @@ def test_step_2_prints_the_30_s_turn_and_the_push_tables(ss, tmp_path, capsys):
     ss.report(dict(label='этап', select=summary, runs=dict(select=1307), seconds=dict(select=1.)))
     out = capsys.readouterr().out
     lines = [line.split() for line in out.splitlines()]
+    assert next(line for line in lines if line[:1] == ['прогонов']) == [
+        'прогонов', 'падений', '0.5', 'м/с', '1', 'м/с', 'влево', 'вправо', 'стоп,', 'м', 'влево', '0.5', 'вправо',
+        '0.5', 'стоп', '0.5', 'v', '0.5', '/', '1']  # the ±0.5 m/s side step in columns of its own
+    assert next(line for line in lines if line[:4] == ['Unitree', '+6', 'мс', '(связка)'])[4:] == [
+        '29', '0', '+0.010', '+0.010', '+0.010', '+0.010', '0.05', '+0.010', '+0.010', '0.05', '0.50', '/', '1.00']
     assert 'стояние 30 с (Unitree +6 мс): поворот -5.4°' in out
     heads = [k for k, line in enumerate(lines) if line == ['0.8', '0.9', '1.0', '1.1', '1.25', '1.5']]
     assert len(heads) == 2  # with the capsules (judged), then without (the sim2sim forecast)

@@ -10,8 +10,8 @@ probe lacks:
     Regular: O = 10 i, P = O + delay. timing 'real': gaps and delays tiled from a bridge run's targets_sim.csv
     (obs = arrived - 1 tick, applied as recorded);
   * the bridge procedure: band 0 -> 0.6 m over 7 s, FixStand, Velocity with the band for 1.4 s, band off, then the
-    scenario plan (stand / walk 0.5 / walk 1.0 / side +-0.3 / ...), per-second yaw rate per segment, gait phase at the
-    first walk 0.73 as in the logs; optional first-order lag on the command (lag, s);
+    scenario plan (stand / walk 0.5 / walk 1.0 / side +-0.3 / side05 +-0.5 / ...), per-second yaw rate per segment,
+    gait phase at the first walk 0.73 as in the logs; optional first-order lag on the command (lag, s);
   * motor-model splits (extra), forced joint targets (force), left-right symmetrised policy (sym), Unitree's shipped
     v0 policy (stage 'unitree_v0': obs 98, same layout, deploy/robots/g1/config/policy/velocity/v0);
   * an export_g1 folder instead of a stage: its policy.onnx acts (humanoid_sim.export_g1.ExportedPolicy: what
@@ -46,6 +46,7 @@ RUNS = {  # bridge runs of candidate 3 (targets_sim.csv): walk 0.5 / walk 1.0 / 
     'side': ['210612-side'],
     'stopstart': ['210706-stopstart'],
 }
+RUNS['side05'] = RUNS['side']  # the ±0.5 m/s side step tiles the timing windows of the ±0.3 one
 CAND3 = 'exp-6986f1d9544b4d00-5481431040-20261022-'
 TICK = 0.002
 STAGE3 = os.path.join(SIM, 'runs', 'humanoid_lab', 'exp-6986f1d9544b4d00', 'stage_005481431040')
@@ -63,6 +64,10 @@ PLANS = {  # (name, vx, vy, wz, seconds), after band_off
     # Side steps at the stage-2 goal ±1 m/s (stage_select's side check; segments named apart from 'side''s ±0.3).
     'side1': [('stand', 0., 0., 0., 5.), ('left1', 0., 1., 0., 10.), ('stop', 0., 0., 0., 3.),
               ('right1', 0., -1., 0., 10.), ('stop', 0., 0., 0., 5.)],
+    # Side steps at ±0.5 m/s, the stick's limit in the export's deploy.yaml (stage_select's step 2 since iteration 27;
+    # 'side''s segments at ±0.5, named apart from its 'left' / 'right' and side1's 'left1' / 'right1').
+    'side05': [('stand', 0., 0., 0., 5.), ('left05', 0., .5, 0., 10.), ('stop', 0., 0., 0., 3.),
+               ('right05', 0., -.5, 0., 10.), ('stop', 0., 0., 0., 5.)],
     'stopstart': [('stand', 0., 0., 0., 5.)] + [('walk', .5, 0., 0., 3.), ('stop', 0., 0., 0., 3.)] * 3,
 }
 _cache = {}
