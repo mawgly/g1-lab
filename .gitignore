@@ -1,0 +1,15 @@
+.venv/
+.venv-*/
+.tools/
+__pycache__/
+.pytest_cache/
+runs/
+.claude/launch.json
+humanoid_sim/figures/out/
+# Local Claude Code state and secrets
+.claude/settings.local.json
+.claude/worktrees/
+.claude/scheduled_tasks.*
+.env
+*.pem
+*.key

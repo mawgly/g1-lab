@@ -1,0 +1,266 @@
+/* The home page (site.html): the layout of its sections on top of site.css. */
+main [id] {
+  scroll-margin-top: 76px;
+}
+.page-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding-top: 12px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.page-nav a {
+  padding: 9px 11px;
+  border-radius: 8px;
+  text-decoration: none;
+  color: var(--ink-2);
+}
+.page-nav a:hover {
+  background: #e4e7e0;
+  color: var(--ink);
+}
+.hero {
+  padding-top: 44px;
+  padding-bottom: 32px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 44px;
+  align-items: center;
+}
+.hero-text {
+  flex: 999 1 520px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.hero-text .lead {
+  max-width: 640px;
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 6px;
+}
+.hero-figure {
+  flex: 1 1 340px;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.hero-figure .media {
+  border-radius: var(--radius);
+  aspect-ratio: 4 / 3;
+}
+.hero-figure figcaption,
+.story-wide figcaption {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink-3);
+}
+.stats {
+  padding-bottom: 48px;
+}
+.stats .card {
+  gap: 6px;
+}
+.stats .card > span:last-child {
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--ink-2);
+}
+.clip-card.accent {
+  border: 1.5px solid var(--accent);
+}
+.grid.cards-270 {
+  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+}
+.finding {
+  padding: 18px;
+  border-radius: 12px;
+}
+.finding .tag {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.finding b,
+.story-card b {
+  font-size: 16.5px;
+}
+.finding > span:last-child,
+.story-card .text {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.log-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.log-head h2 {
+  margin: 0;
+}
+.log-head a {
+  font-weight: 700;
+}
+.story-wide {
+  margin: 0 0 20px;
+}
+.story-wide .media {
+  border-radius: 12px 12px 0 0;
+  aspect-ratio: 1920 / 360;
+}
+.story-wide figcaption {
+  padding: 10px 16px;
+  background: #1b2027;
+  border-radius: 0 0 12px 12px;
+  color: var(--dark-ink-2);
+}
+.grid.stories {
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 18px;
+}
+.story-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.story-card .media {
+  border-radius: 0;
+  aspect-ratio: 960 / 360;
+}
+.story-card .body {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+/* A finding told with a single-robot clip (4:3): across the whole row, the clip beside the text. */
+.story-card.wide {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 320px) 1fr;
+  align-items: center;
+}
+.story-card.wide .media {
+  aspect-ratio: 4 / 3;
+}
+.story-card.wide .body {
+  padding: 16px 22px;
+  max-width: 760px;
+}
+@media (max-width: 640px) {
+  .story-card.wide {
+    grid-template-columns: 1fr;
+  }
+}
+.also {
+  margin: 18px 0 0;
+  font-size: 14.5px;
+  color: var(--ink-3);
+}
+.roles {
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px;
+  margin-bottom: 28px;
+}
+.role {
+  border: 1px solid var(--dark-line);
+  border-radius: 12px;
+  padding: 16px;
+}
+.dark .role p {
+  margin: 6px 0 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--dark-ink);
+}
+.lab-numbers {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 18px;
+  font-size: 14.5px;
+  color: var(--dark-ink);
+}
+.lab-numbers span {
+  display: block;
+  font-family: var(--mono);
+  font-size: 28px;
+  color: #f4f5f2;
+}
+.dark p.sieves {
+  margin: 26px 0 0;
+  font-size: 14.5px;
+  line-height: 1.6;
+  max-width: 900px;
+}
+.gaps {
+  padding-top: 48px;
+  padding-bottom: 8px;
+}
+.gaps h2 {
+  margin-bottom: 14px;
+  font-size: 24px;
+}
+.gaps ul {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 15.5px;
+  line-height: 1.7;
+  color: var(--ink-2);
+  max-width: 900px;
+}
+.about {
+  padding-top: 48px;
+  padding-bottom: 64px;
+}
+.about-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 28px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 32px;
+}
+.about-text {
+  flex: 2 1 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.about-text h2 {
+  margin: 0;
+  font-size: 28px;
+}
+.about-text p {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+.contact {
+  flex: 1 1 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  justify-content: center;
+}
+.contact .eyebrow {
+  letter-spacing: 0.05em;
+}
+.contact small {
+  font-size: 13px;
+  color: var(--ink-4);
+}
+.contact a.button.ghost {
+  overflow-wrap: anywhere;
+}

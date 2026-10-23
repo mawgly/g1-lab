@@ -1,0 +1,88 @@
+{
+  "additional_steps_per_run": 10000000,
+  "checkpoint_interval": 500000,
+  "reward_changed": false,
+  "experiments": [
+    {
+      "id": "exp-83ac813e6039460f",
+      "name": "\u0414\u043b\u0438\u043d\u043d\u043e\u0435 \u043e\u0431\u0443\u0447\u0435\u043d\u0438\u0435 \u00b7 \u043e\u0441\u0442\u043e\u0440\u043e\u0436\u043d\u043e\u0435 \u00b7 +10 \u043c\u043b\u043d",
+      "created_at": 1792401074.283837,
+      "config": {
+        "name": "\u0414\u043b\u0438\u043d\u043d\u043e\u0435 \u043e\u0431\u0443\u0447\u0435\u043d\u0438\u0435 \u00b7 \u043e\u0441\u0442\u043e\u0440\u043e\u0436\u043d\u043e\u0435 \u00b7 +10 \u043c\u043b\u043d",
+        "backend": "gpu",
+        "envs": 256,
+        "steps": 10000000,
+        "every": 500000,
+        "seed": 43,
+        "learning_rate": 5e-05,
+        "n_steps": 32,
+        "batch_size": 256,
+        "n_epochs": 5,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "ent_coef": 0.0,
+        "clip_range": 0.2,
+        "target_kl": 0.02,
+        "hours": 24,
+        "preset": "careful",
+        "source_id": "exp-e4ae6917dd2c41a4",
+        "source_stage": 2007040
+      },
+      "read_only": false
+    },
+    {
+      "id": "exp-36a90fbfb6274d0d",
+      "name": "\u0414\u043b\u0438\u043d\u043d\u043e\u0435 \u043e\u0431\u0443\u0447\u0435\u043d\u0438\u0435 \u00b7 \u0431\u043e\u043b\u044c\u0448\u0435 \u043f\u043e\u0438\u0441\u043a\u0430 \u00b7 +10 \u043c\u043b\u043d",
+      "created_at": 1792401074.2952087,
+      "config": {
+        "name": "\u0414\u043b\u0438\u043d\u043d\u043e\u0435 \u043e\u0431\u0443\u0447\u0435\u043d\u0438\u0435 \u00b7 \u0431\u043e\u043b\u044c\u0448\u0435 \u043f\u043e\u0438\u0441\u043a\u0430 \u00b7 +10 \u043c\u043b\u043d",
+        "backend": "gpu",
+        "envs": 256,
+        "steps": 10000000,
+        "every": 500000,
+        "seed": 43,
+        "learning_rate": 0.0001,
+        "n_steps": 32,
+        "batch_size": 256,
+        "n_epochs": 5,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "ent_coef": 0.002,
+        "clip_range": 0.2,
+        "target_kl": 0.03,
+        "hours": 24,
+        "preset": "explore",
+        "source_id": "exp-76dc32173b7c4391",
+        "source_stage": 2007040
+      },
+      "read_only": false
+    },
+    {
+      "id": "exp-edf43bbe91104974",
+      "name": "\u0414\u043b\u0438\u043d\u043d\u043e\u0435 \u043e\u0431\u0443\u0447\u0435\u043d\u0438\u0435 \u00b7 \u043f\u043e\u043b\u043d\u044b\u0439 GPU \u00b7 +10 \u043c\u043b\u043d",
+      "created_at": 1792401074.306009,
+      "config": {
+        "name": "\u0414\u043b\u0438\u043d\u043d\u043e\u0435 \u043e\u0431\u0443\u0447\u0435\u043d\u0438\u0435 \u00b7 \u043f\u043e\u043b\u043d\u044b\u0439 GPU \u00b7 +10 \u043c\u043b\u043d",
+        "backend": "full_gpu",
+        "envs": 256,
+        "steps": 10000000,
+        "every": 500000,
+        "seed": 43,
+        "learning_rate": 5e-05,
+        "n_steps": 32,
+        "batch_size": 256,
+        "n_epochs": 5,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "ent_coef": 0,
+        "clip_range": 0.2,
+        "target_kl": 0.02,
+        "hours": 24,
+        "preset": "careful",
+        "source_id": "exp-0183f7e4077145e6",
+        "source_stage": 2007040
+      },
+      "read_only": false
+    }
+  ]
+}

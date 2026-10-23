@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="site-mode" content="live" />
+    <title>G1 Lab · Лаборатория</title>
+    <link rel="stylesheet" href="site.css" />
+    <style>
+      /* The lab page (labtree.js): the branch tree, read-only. Lines of branches run top to bottom, parent above
+         child; a fork's other children hang off it as an indented side line. */
+      h1 + .lead {
+        margin-top: 16px;
+      }
+      .lab-tools {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin: 0 0 20px;
+      }
+      .lab-tools .chips {
+        min-width: 0;
+      }
+      .lab-tools .folds {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .static-note {
+        margin: 18px 0 0;
+        padding: 12px 16px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--card);
+        color: var(--ink-2);
+        max-width: 860px;
+      }
+      .now-list {
+        display: grid;
+        gap: 16px;
+      }
+      .now-card h3 {
+        overflow-wrap: anywhere;
+      }
+      .now-card progress {
+        width: 100%;
+        height: 10px;
+        accent-color: var(--accent);
+      }
+      .now-stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 18px;
+        font-family: var(--mono);
+        font-size: 14px;
+        color: var(--ink-2);
+      }
+      .lines {
+        display: grid;
+        gap: 4px;
+      }
+      .line {
+        border-top: 1px solid var(--line);
+      }
+      .line > summary {
+        list-style: none;
+        cursor: pointer;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 4px 12px;
+        padding: 16px 4px;
+        border-radius: 8px;
+      }
+      .line > summary::-webkit-details-marker {
+        display: none;
+      }
+      .line > summary::before {
+        content: '▸';
+        width: 1em;
+        color: var(--ink-3);
+      }
+      .line[open] > summary::before {
+        content: '▾';
+      }
+      .line > summary h3 {
+        flex: 1 1 260px;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      .line-meta {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px 10px;
+        font-size: 14px;
+        color: var(--ink-3);
+      }
+      .line-body {
+        padding: 0 0 20px;
+      }
+      .chain {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: grid;
+        gap: 10px;
+      }
+      .chain > li {
+        position: relative;
+        min-width: 0;
+        padding-left: 24px;
+        scroll-margin-top: 110px;
+      }
+      /* The connector: a vertical line from each branch to the next one of its line, a dot at each branch. */
+      .chain > li::before {
+        content: '';
+        position: absolute;
+        left: 7px;
+        top: 0;
+        bottom: -10px;
+        width: 2px;
+        background: #c9cdc4;
+      }
+      .chain > li:first-child::before {
+        top: 22px;
+      }
+      .chain > li:last-child::before {
+        bottom: auto;
+        height: 22px;
+      }
+      .chain > li:first-child:last-child::before {
+        display: none;
+      }
+      .chain.side {
+        margin-top: 10px;
+      }
+      .chain.side > li:first-child::before {
+        top: -10px;
+      }
+      .chain.side > li:first-child:last-child::before {
+        display: block;
+        height: 32px;
+      }
+      .chain > li::after {
+        content: '';
+        position: absolute;
+        left: 2px;
+        top: 16px;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 2px solid var(--ink-4);
+        background: var(--ground);
+      }
+      .chain > li.best::after {
+        border-color: var(--good);
+        background: var(--good);
+      }
+      .chain > li.dead::after {
+        border-color: var(--bad);
+      }
+      .chain > li.running::after {
+        border-color: var(--accent);
+        background: var(--accent);
+      }
+      .branch {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 12px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-width: 0;
+      }
+      .branch:focus {
+        outline: none;
+      }
+      li.found > .branch,
+      .branch:focus-visible {
+        outline: 3px solid var(--link);
+        outline-offset: 2px;
+      }
+      .branch.running {
+        border-color: var(--accent-line);
+        background: var(--accent-soft);
+      }
+      .branch-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px 10px;
+      }
+      .branch-name {
+        font-size: 16px;
+        font-weight: 800;
+        overflow-wrap: anywhere;
+      }
+      .branch.dead .branch-name {
+        color: var(--ink-3);
+      }
+      .branch-meta {
+        margin: 0;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 2px 14px;
+        font-family: var(--mono);
+        font-size: 13px;
+        color: var(--ink-3);
+      }
+      .branch-meta > span {
+        overflow-wrap: anywhere;
+      }
+      .branch-note {
+        margin: 0;
+        font-size: 14.5px;
+        line-height: 1.5;
+        color: var(--ink-2);
+        overflow-wrap: anywhere;
+      }
+      details.branch-note > summary {
+        cursor: pointer;
+      }
+      details.branch-note > summary::marker {
+        color: var(--ink-4);
+      }
+      details.branch-note p {
+        margin: 6px 0 0;
+      }
+      /* Notes keep their own line breaks (one fact per line). */
+      p.branch-note,
+      details.branch-note p {
+        white-space: pre-line;
+      }
+      .branch-links {
+        margin: 2px 0 0;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 18px;
+        font-size: 14.5px;
+        font-weight: 700;
+      }
+      .tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 2px 9px;
+        border: 1px solid #bfc4bb;
+        border-radius: 999px;
+        font: 700 12.5px var(--sans);
+        color: var(--ink-2);
+        white-space: nowrap;
+      }
+      .tag.best {
+        border-color: #9bc8ae;
+        background: #eef7f1;
+        color: var(--good);
+      }
+      .tag.active {
+        border-color: var(--accent-line);
+        background: var(--accent-soft);
+        color: #a63f08;
+      }
+      .tag.dead {
+        border-color: #e3b5a8;
+        background: #fbefec;
+        color: var(--bad);
+      }
+      .tag.running {
+        border-color: var(--accent);
+        background: var(--accent-soft);
+        color: #a63f08;
+      }
+      .tag.running::before {
+        content: '';
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent);
+        animation: pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        50% {
+          opacity: 0.35;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .tag.running::before {
+          animation: none;
+        }
+      }
+      a:focus-visible,
+      summary:focus-visible,
+      button:focus-visible {
+        outline: 3px solid var(--link);
+        outline-offset: 2px;
+      }
+      #error {
+        margin: 0 0 16px;
+        padding: 12px 16px;
+        border: 1px solid #e3b5a8;
+        border-radius: 10px;
+        background: #fbefec;
+        color: var(--bad);
+      }
+      @media (max-width: 640px) {
+        .branch {
+          padding: 10px 12px;
+        }
+        .chain > li {
+          padding-left: 20px;
+          scroll-margin-top: 150px;
+        }
+        .chain > li::before {
+          left: 5px;
+        }
+        .chain > li::after {
+          left: 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="section">
+        <div class="wrap">
+          <p class="eyebrow">G1 Lab</p>
+          <h1>Лаборатория</h1>
+          <p class="lead">
+            Каждая ветка — одно изменение рецепта обучения, начатое с этапа (сохранения) родительской ветки.
+            Оценки и заметки к веткам пишет руководитель лаборатории; страница их только показывает.
+          </p>
+          <p id="static-note" class="static-note" hidden>
+            Это снимок для чтения: отчёты и живой 3D-забег открываются только на компьютере лаборатории.
+          </p>
+        </div>
+      </section>
+      <section class="band section" aria-labelledby="now-title">
+        <div class="wrap">
+          <h2 id="now-title">Сейчас</h2>
+          <div id="now" class="now-list"><p class="muted">Загружаем данные лаборатории…</p></div>
+        </div>
+      </section>
+      <section class="section" aria-labelledby="tree-title">
+        <div class="wrap">
+          <h2 id="tree-title">Дерево веток</h2>
+          <p id="error" role="alert" hidden></p>
+          <div class="lab-tools">
+            <div id="robots" class="chips" role="group" aria-label="Робот"></div>
+            <div class="folds">
+              <button id="open-all" class="chip" type="button">Развернуть всё</button
+              ><button id="close-all" class="chip" type="button">Свернуть всё</button>
+            </div>
+          </div>
+          <div id="tree" class="lines"></div>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="labtree.js"></script>
+  </body>
+</html>

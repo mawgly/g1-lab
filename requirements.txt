@@ -1,0 +1,9 @@
+mujoco>=3.3,<4
+gymnasium[mujoco]>=1.0,<2
+stable-baselines3>=2.6,<3
+numpy>=2,<3
+pytest>=8,<10
+pillow>=11
+onnx>=1.17,<2
+onnxruntime>=1.20,<2
+pyyaml>=6,<7

@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="site-mode" content="live" />
+    <title>G1 Lab — Павел Мальцев</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="site.css" />
+    <link rel="stylesheet" href="home.css" />
+    <script type="module" src="home.js"></script>
+  </head>
+  <body>
+    <main id="top">
+      <nav class="page-nav wrap" aria-label="На этой странице">
+        <a href="#skills">Навыки</a><a href="#stack">На стеке Unitree</a><a href="#compare">Против штатной политики</a
+        ><a href="#log">Журнал исследований</a><a href="#lab">Как устроена лаборатория</a><a href="#about">Обо мне</a>
+      </nav>
+
+      <section class="hero wrap">
+        <div class="hero-text">
+          <p class="eyebrow">Обновлено 23 октября 2026 · этап 2 из 9 · только симуляция, робота пока нет</p>
+          <h1>Политика ходьбы для Unitree G1, проверенная на симуляторе и контроллере самой Unitree</h1>
+          <p class="lead" data-rich>
+            Лаборатория из одного человека на одном домашнем ПК: я ставлю цели и основные правила, а код пишут и
+            эксперименты ведут ИИ-агенты — руководитель, который планирует и обучает, и критик, который атакует каждое
+            изменение до запуска. Текущий кандидат работает в **unitree_mujoco + g1_ctrl** со штатным разъёмом
+            `deploy.yaml`.
+          </p>
+          <div class="actions">
+            <a class="button" href="#skills">Посмотреть, что он умеет</a
+            ><a class="button ghost" href="#stack">Что я нашёл в g1_ctrl</a>
+          </div>
+        </div>
+        <figure class="hero-figure">
+          <div class="media">
+            <img data-clip="walk" alt="Unitree G1 идёт вперёд со скоростью 1 м/с в симуляции, вид сбоку" />
+          </div>
+          <figcaption>Кандидат 7, команда 1 м/с, наша физика MuJoCo</figcaption>
+        </figure>
+      </section>
+
+      <section class="stats" aria-label="Ключевые числа">
+        <div class="wrap grid cards-220">
+          <div class="card">
+            <span class="stat">0 / 22</span><span>падений в 22 прогонах в unitree_mujoco + g1_ctrl</span>
+          </div>
+          <div class="card">
+            <span class="stat">52 / 52</span
+            ><span>толчков выдержано там же — стоя до Δv 1,5 м/с (527 Н, 0,1 с), на ходу до 1,0</span>
+          </div>
+          <div class="card">
+            <span class="stat">0 / 400</span
+            ><span>падений на сетке толчков стоя — в физике Unitree с их капсулами стоп</span>
+          </div>
+          <div class="card accent">
+            <span class="stat">1,94 м/с</span
+            ><span
+              >при команде 2 м/с (штатная v0: 1,78); в связке стик даёт не больше 1 м/с, поэтому бег проверен только в
+              нашей физике</span
+            >
+          </div>
+        </div>
+      </section>
+
+      <section id="skills" class="band section" aria-labelledby="skills-title">
+        <div class="wrap">
+          <h2 id="skills-title">Что умеет кандидат 7</h2>
+          <p class="note" data-rich>
+            Одна политика, 29 суставов, 50 Гц. Ролики — наша физика MuJoCo на CPU; числа с пометкой **связка** — из
+            симулятора Unitree с их контроллером. Слабые места написаны рядом с сильными.
+          </p>
+          <div class="grid cards-260">
+            <figure class="clip-card">
+              <div class="media"><img data-clip="walk" alt="Идёт со скоростью 1 м/с" /></div>
+              <figcaption>
+                <b>Ходьба 1 м/с</b
+                ><span
+                  >связка 0,97 м/с, 9,2 м за 10 с · у нас 9,6 м, курс 0,4° ·
+                  <span class="weak">слабое место: курс в связке +12…+13° за 10 с</span></span
+                >
+              </figcaption>
+            </figure>
+            <figure class="clip-card">
+              <div class="media"><img data-clip="slow_front" alt="Идёт со скоростью 0,5 м/с, вид спереди" /></div>
+              <figcaption>
+                <b>Ходьба 0,5 м/с</b
+                ><span>связка 0,51 м/с, увод −0,004…+0,001 рад/с, курс −1,7…−3,1° за 10 с</span>
+              </figcaption>
+            </figure>
+            <figure class="clip-card">
+              <div class="media"><img data-clip="back" alt="Идёт назад" /></div>
+              <figcaption>
+                <b>Назад 0,5 м/с</b
+                ><span>3,5 м за 8 с, без падений · <span class="weak">в связке ещё не измерено</span></span>
+              </figcaption>
+            </figure>
+            <figure class="clip-card">
+              <div class="media"><img data-clip="side_left" alt="Шаг вбок влево" /></div>
+              <figcaption>
+                <b>Шаг вбок 0,3 м/с</b
+                ><span
+                  >связка 0,26–0,27 м/с, увод ≤ 0,005 рад/с ·
+                  <span class="weak">слабое место: чуть медленнее команды</span></span
+                >
+              </figcaption>
+            </figure>
+            <figure class="clip-card">
+              <div class="media"><img data-clip="turn_left" alt="Поворачивается на месте" /></div>
+              <figcaption>
+                <b>Поворот на месте</b><span>команда ±0,5 рад/с → связка +0,505 / −0,453 рад/с</span>
+              </figcaption>
+            </figure>
+            <figure class="clip-card">
+              <div class="media"><img data-clip="walk_turn" alt="Идёт и поворачивает" /></div>
+              <figcaption>
+                <b>Ходьба с поворотом</b><span>0,5 м/с с ±0,5 рад/с → связка +0,500 / −0,461 рад/с</span>
+              </figcaption>
+            </figure>
+            <figure class="clip-card">
+              <div class="media"><img data-clip="stop_start" alt="Стоит, идёт, останавливается" /></div>
+              <figcaption>
+                <b>Стоять, идти, остановиться</b
+                ><span
+                  >в связке тормозит за 0,23–0,25 м с 0,5 м/с ·
+                  <span class="weak"
+                    >слабое место: после остановки таз докатывается на 7–9 см, один раз шаг назад после стопа с 1 м/с (1
+                    из 17)</span
+                  ></span
+                >
+              </figcaption>
+            </figure>
+            <figure class="clip-card">
+              <div class="media"><img data-clip="side_stop" alt="Шаг вбок, затем остановка" /></div>
+              <figcaption>
+                <b>Шаг вбок, затем стоп</b
+                ><span>когда-то за всеми 29 падениями итерации 18 · в связке 0,08–0,11 м после остановки</span>
+              </figcaption>
+            </figure>
+            <figure class="clip-card">
+              <div class="media"><img data-clip="push_back" alt="Толчок назад, стоя" /></div>
+              <figcaption>
+                <b>Толчок спереди</b><span>в связке Δv 1,25: 0 из 20, Δv 1,5: 0 из 8, наклон ≤ 11°</span>
+              </figcaption>
+            </figure>
+            <figure class="clip-card">
+              <div class="media"><img data-clip="push_left" alt="Толчок вбок, стоя" /></div>
+              <figcaption>
+                <b>Толчок сбоку</b
+                ><span
+                  >сетка с капсулами стоп Unitree: 0 из 400 ·
+                  <span class="weak"
+                    >слабое место: при боковых толчках Δv ≥ 1 стопы всё ещё встречаются (коснулись бы в 12 из 18
+                    толчков в связке, захлёст ≤ 1,7 см) — боковых толчков на роботе не делаем</span
+                  ></span
+                >
+              </figcaption>
+            </figure>
+            <figure class="clip-card">
+              <div class="media"><img data-clip="push_walk" alt="Толчок на ходу" /></div>
+              <figcaption>
+                <b>Толчок на ходу</b><span>связка Δv 0,5 и 1,0: 0 из 8</span>
+              </figcaption>
+            </figure>
+            <figure class="clip-card accent">
+              <div class="media"><img data-clip="sprint" alt="Бег по команде 2 м/с" /></div>
+              <figcaption>
+                <b>Бег, команда 2 м/с</b
+                ><span
+                  >1,94 м/с в нашей физике, 0 падений со старта стоя (приёмка скорости 7 из 7) ·
+                  <span class="weak">стик связки ограничен 1 м/с</span></span
+                >
+              </figcaption>
+            </figure>
+          </div>
+        </div>
+      </section>
+
+      <section id="stack" class="section" aria-labelledby="stack-title">
+        <div class="wrap">
+          <h2 id="stack-title">Проверено на стеке Unitree</h2>
+          <p class="note" data-rich>
+            Мы проверяем политику не только у себя. Сеть сохраняется в формате, который читает штатная программа
+            управления роботом от Unitree (`g1_ctrl`), и запускается в их симуляторе (`unitree_mujoco`) — той же
+            программой, что будет работать на настоящем роботе. Управляем виртуальным геймпадом, как человек пультом.
+            Отдельная проверка сверяет числа: то, что программа Unitree подаёт сети, и то, что уходит на моторы,
+            совпадает с нашим расчётом до 0,0000001 радиана. Прогонов в этой связке — 199. По дороге нашлись пять мест,
+            где что-то работало не так; у каждого есть исправление и замер.
+          </p>
+          <div class="grid cards-340">
+            <article class="card finding">
+              <span class="tag">g1_ctrl · State_RLBase</span>
+              <b>Рывок при включении ходьбы</b>
+              <span
+                >При переключении в режим ходьбы программа могла на одну миллисекунду послать всем 29 моторам команду «в
+                ноль» — уже с жёсткостью ходьбы, то есть дёрнуть все суставы. Так было в 2 включениях из 11. Исправление
+                держит прежнюю позу до первого ответа сети; с тех пор — ни одного такого рывка.</span
+              >
+            </article>
+            <article class="card finding">
+              <span class="tag">g1_ctrl · JointAction::process_actions</span>
+              <b>Команды за пределом сустава</b>
+              <span
+                >Программа сначала масштабирует ответ сети, потом обрезает его по пределам суставов — в два прохода, а
+                другой поток 1000 раз в секунду копирует эти числа, не дожидаясь конца. Иногда на моторы уходило
+                необрезанное значение: например, голеностоп на 0,63 рад за пределом, около 18 Н·м примерно на 1 мс. В
+                стресс-тесте испорчены 91% копий; с замком, который не даёт копировать на середине, — ни одной. В
+                симуляторе Unitree — 0 плохих команд из 202 500.</span
+              >
+            </article>
+            <article class="card finding">
+              <span class="tag">g1_ctrl · mdp::bad_orientation</span>
+              <b>Проверка падения выключена</b>
+              <span
+                >В коде есть проверка «наклонился сильнее предела — отпустить моторы», но её рабочая строка
+                закомментирована, и функция всегда отвечает «не упал»: упавший робот продолжает пытаться идти.
+                Исправление включает ту же проверку по датчику наклона на каждом такте: 3 падения из 3 → моторы отпущены
+                при наклоне 57,5–57,9°, ложных срабатываний 0 в 7 сценариях.</span
+              >
+            </article>
+            <article class="card finding">
+              <span class="tag">unitree_mujoco · simulate</span>
+              <b>Робота нечем толкнуть</b>
+              <span
+                >В симуляторе Unitree нельзя ударить робота с известной силой. Мы добавили клавиши, которые толкают таз
+                точно заданным импульсом (масса × изменение скорости за 0,1 с, Δv от 0,5 до 2,25 м/с) и записывают
+                каждый толчок. Обучение теперь воспроизводит ровно этот толчок.</span
+              >
+            </article>
+            <article class="card finding">
+              <span class="tag">unitree_mujoco · модель стопы</span>
+              <b>Стопы проходили друг сквозь друга</b>
+              <span
+                >В симуляторе Unitree (и у нас раньше) стопа касается мира только точками подошвы, а в модели, на которой
+                учит сама Unitree, у стопы 7 капсул с трением. Без них ноги могли заходить одна сквозь другую, и ни один
+                симулятор этого не видел — на роботе это подножка. С капсулами Unitree в обучении при шаге вбок ±1 м/с
+                ноги заходят накрест в 0–0,3% шагов вместо 9–10%, а боковые толчки больше не роняют робота.</span
+              >
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="compare" class="band section" aria-labelledby="compare-title">
+        <div class="wrap">
+          <h2 id="compare-title">Против штатной политики Unitree</h2>
+          <p class="note">
+            Политику ходьбы, которую Unitree поставляет с роботом (v0), мы запустили в той же обвязке, что и свои: наша
+            физика с кривыми моторов Unitree, одинаковые старты. В симуляторе Unitree она не запускалась. Где v0 лучше,
+            так и написано.
+          </p>
+          <div class="scroll-x">
+            <table class="data">
+              <thead>
+                <tr>
+                  <th>Тест</th>
+                  <th>Кандидат 7</th>
+                  <th>Кандидат 6</th>
+                  <th>Штатная v0</th>
+                  <th>Лучше</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Скорость при команде 1 / 1,5 / 2 м/с</td>
+                  <td class="num">1,02 / 1,54 / 1,94</td>
+                  <td class="num">0,90 / 1,17 / 1,29</td>
+                  <td class="num">0,94 / 1,38 / 1,78</td>
+                  <td>кандидат 7</td>
+                </tr>
+                <tr>
+                  <td>Толчок таза стоя Δv 1,0, 16 случаев</td>
+                  <td class="num">0 падений</td>
+                  <td class="num">0 падений</td>
+                  <td class="num">0 падений</td>
+                  <td>ничья</td>
+                </tr>
+                <tr>
+                  <td>Уползание через 2–6 с после остановки с 1,5 / 2 м/с</td>
+                  <td class="num">0,7–0,9 / 2,9–5,8 см</td>
+                  <td class="num">2,8–3,2 / 1,9–2,7 см</td>
+                  <td class="num">0,2 / 0,2–0,4 см</td>
+                  <td><b>v0</b></td>
+                </tr>
+                <tr>
+                  <td>Торможение с 2 м/с до &lt; 0,1 м/с</td>
+                  <td class="num">0,90 м (с 1,93 м/с)</td>
+                  <td class="num">— (разгоняется только до 1,30)</td>
+                  <td class="num">0,86 м (с 1,78 м/с)</td>
+                  <td>почти поровну</td>
+                </tr>
+                <tr>
+                  <td>Наклон опорной стопы при 1 / 2 м/с</td>
+                  <td class="num">1,7° / 5,0°</td>
+                  <td class="num">1,3° / 1,7°</td>
+                  <td class="num">4,9° / 12,7°</td>
+                  <td>кандидат 6 и 7</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="log" class="section" aria-labelledby="log-title">
+        <div class="wrap">
+          <div class="log-head">
+            <h2 id="log-title">Журнал исследований: что шло не так и как это нашли</h2>
+            <a href="journal.html">Открыть весь журнал: 67 записей, 25 протоколов совета →</a>
+          </div>
+          <figure class="story-wide">
+            <div class="media">
+              <img
+                data-clip="story-path"
+                alt="Четыре этапа на одной команде 1 м/с: только стоит, ныряет, первые шаги, кандидат 7"
+              />
+            </div>
+            <figcaption>
+              одна и та же команда, 1 м/с, в четырёх точках пути: только стоит → ныряет → первые шаги → кандидат 7
+            </figcaption>
+          </figure>
+          <div class="grid stories">
+            <article class="story-card">
+              <div class="media">
+                <img
+                  data-clip="story-arms"
+                  alt="Было: робот опирается на собственные руки; стало: руки свободны"
+                />
+              </div>
+              <div class="body">
+                <b>Он стоял на собственных руках</b>
+                <span class="text" data-rich
+                  >300–425 Н самоконтакта на 100% шагов; бинарный штраф почти ничего не сдвинул. Сдвинул штраф за
+                  расхождение цели и угла руки: **0 Н**, момент руки 100–128 → 11–12 Н·м.</span
+                >
+              </div>
+            </article>
+            <article class="story-card">
+              <div class="media">
+                <img
+                  data-clip="story-wrist"
+                  alt="Было: одно запястье согнуто на 40 градусов; стало: запястья закреплены"
+                />
+              </div>
+              <div class="body">
+                <b>Однобитная память в запястье</b>
+                <span class="text"
+                  >Ровно одно запястье согнуто на +40°; какое именно — решало знак увода в связке (7 влево / 2 вправо из
+                  FixStand). Это единственные суставы, у которых коробка действий лежит внутри диапазона, — их
+                  закрепили в исходной позе: 11 из 11 прогонов в связке чистые.</span
+                >
+              </div>
+            </article>
+            <article class="story-card">
+              <div class="media">
+                <img data-clip="story-push" alt="До и после обучения с толчками силой в таз" />
+              </div>
+              <div class="body">
+                <b>Толчок, которого обучение не показывало</b>
+                <span class="text"
+                  >Ни один из 28 этапов не выдержал толчка таза 1,25 м/с назад: обучение толкало всё тело, а симулятор —
+                  таз. Обучение с толчком как в симуляторе: 0 из 16 на всех 6 проверенных этапах.</span
+                >
+              </div>
+            </article>
+            <article class="story-card">
+              <div class="media">
+                <img data-clip="story-heel" alt="Было: шаркает на одной пятке; стало: стопа плоско" />
+              </div>
+              <div class="body">
+                <b>Шарканье пряталось за порогом контакта</b>
+                <span class="text"
+                  >Носок вверх на 46–52°: награда видела 0% опоры у стопы, которая несла вес 57% времени. Контакт по
+                  подошве и штраф за наклон стопы: подъём 8 → 55 мм, наклон в опоре 1°.</span
+                >
+              </div>
+            </article>
+            <article class="story-card">
+              <div class="media">
+                <img data-clip="story-ppo" alt="Одинаковое число шагов: сломанный и исправленный PPO" />
+              </div>
+              <div class="body">
+                <b>σ выросла до 10¹⁰</b>
+                <span class="text"
+                  >При обрезанных действиях шум бесплатен, и энтропия его раздувает: каждый мотор — релейный
+                  переключатель. Ограничение σ и штраф за выход за границы: 15,9 м за 10 с на 109 млн шагов против 3,5 м
+                  раньше.</span
+                >
+              </div>
+            </article>
+            <article class="story-card">
+              <div class="media">
+                <img data-clip="story-speed" alt="Кандидат 6 против этапа 2 при команде 2 м/с" />
+              </div>
+              <div class="body">
+                <b>Наша награда ставила бег v0 ниже шарканья</b>
+                <span class="text"
+                  >Штраф за наклон стопы брал с переката v0 с пятки на носок 0,79 за шаг. Исправление было готово — но
+                  одно расширение команд дало 1,81 м/с за 50 млн шагов. Критик ошибся, и это тоже записано.</span
+                >
+              </div>
+            </article>
+            <article class="story-card wide">
+              <div class="media">
+                <img data-clip="push_left" alt="Толчок вбок, стоя" />
+              </div>
+              <div class="body">
+                <b>Ноги проходили друг сквозь друга</b>
+                <span class="text"
+                  >Стопа касалась мира только точками подошвы, а Unitree учит с 7 капсулами с трением на каждой стопе.
+                  Без них ноги заходили одна сквозь другую — на роботе это подножка. С капсулами Unitree в обучении при
+                  шаге вбок ±1 м/с ноги заходят накрест в 0–0,3% шагов вместо 9–10%, боковые толчки больше не роняют
+                  робота.</span
+                >
+              </div>
+            </article>
+          </div>
+          <p class="also">
+            Ещё в журнале: колени, лежащие на механическом упоре, падения только после «шаг вбок, затем стоп», увод от
+            команды, которой обучение никогда не давало, старт с правой ноги, которому ничто не учило.
+          </p>
+        </div>
+      </section>
+
+      <section id="lab" class="dark section" aria-labelledby="lab-title">
+        <div class="wrap">
+          <h2 id="lab-title">Как устроена лаборатория</h2>
+          <p class="note">
+            Я ставлю цель и основные правила и настраиваю агентов; ИИ-руководитель (Claude) пишет код и ведёт
+            исследование изо дня в день вместе со специализированными агентами, а я наблюдаю и направляю. Каждое
+            изменение разбирают до обучения и записывают вместе с результатом, включая тупики.
+          </p>
+          <p class="note own">
+            Всё обучение — наше собственное: каждая политика выучена в этой лаборатории с нуля, из случайных
+            весов. Чужих обученных моделей и контрольных точек мы не берём; стоковая политика Unitree здесь —
+            только мерка для сравнения.
+          </p>
+          <div class="grid roles">
+            <div class="role">
+              <b>Руководитель</b>
+              <p>планирует итерации, пишет код, запускает и останавливает ветки, решает после разбора</p>
+            </div>
+            <div class="role">
+              <b>Критик</b>
+              <p>атакует каждое предложение измерениями до обучения: риск, скрытые эффекты, более сильный рычаг</p>
+            </div>
+            <div class="role">
+              <b>Разведчик</b>
+              <p>читает репозитории Unitree, Isaac Lab, mjlab и свежие статьи — берёт оттуда настройки и идеи с источниками, но не обученные модели</p>
+            </div>
+            <div class="role">
+              <b>Инженер · Аналитик</b>
+              <p>одно согласованное изменение с тестами для обоих бэкендов · ответ на «почему» через CPU-пробы</p>
+            </div>
+            <div class="role">
+              <b>Дежурный · Летописец · Переводчик</b>
+              <p>проверки здоровья каждые полчаса · журнал · английская и китайская версии</p>
+            </div>
+          </div>
+          <div class="grid lab-numbers">
+            <div><span>24</span>итерации с разбором</div>
+            <div><span>72</span>ветки обучения G1, по одному изменению в каждой</div>
+            <div><span>12,6 млрд</span>шагов симуляции всего, из них 6,37 млрд — за кандидатом 7</div>
+            <div><span>3,5 дня</span>первый запуск G1 → этап 1 закрыт</div>
+            <div><span>~50 тыс.</span>шагов/с: 4096 миров, MuJoCo Warp + PyTorch на одной RTX 4080 SUPER</div>
+          </div>
+          <p class="sieves">
+            Четыре сита, прежде чем что-то назвать кандидатом: 10 условий ходьбы · тот же этап в 7 вариантах физики
+            (задержка, трение моторов, без модели моторов, физика Unitree) · сетка толчков, теперь в физике Unitree с их
+            капсулами стоп · настоящая связка. Соседние этапы сильно различаются — в ветке, давшей кандидата 6, прошли 3
+            из 12.
+          </p>
+        </div>
+      </section>
+
+      <section class="gaps wrap" aria-labelledby="gaps-title">
+        <h2 id="gaps-title">Что ещё не сделано</h2>
+        <ul>
+          <li>
+            Запусков на настоящем G1 ещё не было — пакет для железа (кандидат 7, запасной — кандидат 6, три патча
+            g1_ctrl, протокол «сначала на подвесе» с критериями остановки) готов.
+          </li>
+          <li>
+            Штатную v0 сравнивали в нашей CPU-обвязке, а не в связке; ходьбу назад и трение пола в связке не проверяли.
+          </li>
+          <li>Бег 2 м/с проверен только в нашей физике: стик связки ограничен 1 м/с.</li>
+        </ul>
+      </section>
+
+      <section id="about" class="about wrap" aria-labelledby="about-title">
+        <div class="about-card">
+          <div class="about-text">
+            <h2 id="about-title">Павел Мальцев</h2>
+            <p data-rich>
+              Энтузиаст робототехники. Я собрал умную колонку, телефон и колёсного робота с лидаром и стеком нейросетей
+              (moe3d.ru); сделал несколько игр, в том числе большой открытый мир в духе GTA на Unity (mawgly.ru);
+              marketplacehero.ru — сервис, который генерирует карточки товаров для маркетплейсов; и CRM, связанную с
+              почтой и звонками, с живым помощником в разговоре и ИИ-менеджером продаж, который ставит задачи.
+            </p>
+            <p>
+              Я верю, что следующие — гуманоиды. Роботов я пока не продаю, но хочу: стать партнёром Unitree, который
+              продаёт роботов G1 бизнесу и программирует их под его задачи. Эта лаборатория — то, как я осваиваю
+              программный стек G1 до своего первого робота; дальше я планирую купить G1 и испытать его дома.
+            </p>
+          </div>
+          <div class="contact">
+            <span class="eyebrow">Ищу: партнёрство с Unitree как дилер / интегратор</span>
+            <a class="button" href="https://t.me/mawgly">Telegram @mawgly</a>
+            <button type="button" class="button ghost" id="show-email">Показать e-mail</button>
+            <small>Адрес собирается по клику, чтобы его не видели сборщики адресов.</small>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,301 @@
+/* Stage race: fills the window — the scene stretches, one lane table below it. A window too short for the
+   tables (also "Подробно по составляющим" when opened) scrolls the page instead of cutting them. */
+:root {
+  color-scheme: dark;
+  --bg: #121b1f;
+  --panel: #182327;
+  --line: #2c3a3f;
+  --text: #dde8e4;
+  --muted: #8ea1a3;
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px;
+  overflow-y: auto;
+  background: var(--bg);
+  color: var(--text);
+  font:
+    13px/1.35 system-ui,
+    sans-serif;
+}
+button,
+select {
+  font: inherit;
+  color: var(--text);
+  background: #213035;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+a.back {
+  color: var(--text);
+  text-decoration: none;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 10px;
+}
+a.back:hover {
+  background: #213035;
+}
+a.back:focus-visible {
+  outline: 2px solid #86c5e8;
+  outline-offset: 2px;
+}
+button.primary {
+  background: #2c4a36;
+  border-color: #3f6a4c;
+  color: #e3f7e3;
+}
+button.selected {
+  background: #3a5a45;
+  color: #eaffea;
+}
+.race-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.race-bar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.race-bar label[hidden] {
+  display: none;
+}
+.speeds {
+  display: inline-flex;
+  gap: 2px;
+}
+.speeds button {
+  padding: 5px 8px;
+}
+.clock {
+  margin-left: auto;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.race-viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 220px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #1c272c;
+}
+.race-viewport:fullscreen {
+  border: 0;
+  border-radius: 0;
+}
+.race-viewport canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+#loading,
+#banner {
+  position: absolute;
+  left: 50%;
+  top: 14px;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: #151c20cc;
+  color: var(--text);
+  pointer-events: none;
+}
+#loading {
+  top: 45%;
+}
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.legend i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+table.lanes {
+  width: 100%;
+  flex-shrink: 0;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.lanes th,
+.lanes td {
+  padding: 1px 6px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.lanes th {
+  color: var(--muted);
+  font-weight: 500;
+}
+.lanes td:nth-child(n + 3):nth-child(-n + 6),
+.lanes th:nth-child(n + 3):nth-child(-n + 6) {
+  text-align: right;
+}
+.lanes td:last-child {
+  width: 34%;
+  min-width: 120px;
+}
+.lanes tr.done td:not(:first-child):not(:nth-child(2)):not(:last-child) {
+  color: var(--muted);
+}
+.swatch {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  vertical-align: -2px;
+}
+.lanes select {
+  padding: 1px 4px;
+  max-width: 17em;
+}
+.lanes button {
+  padding: 1px 7px;
+}
+/* Diverging stacked bar: positive terms right of the zero mark, penalties to its left. */
+.stack-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.stack {
+  position: relative;
+  flex: 1;
+  height: 14px;
+  border-radius: 3px;
+  background: #0f171a;
+}
+.stack i {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+.stack .zero {
+  width: 2px;
+  margin-left: -1px;
+  background: #e8efe9;
+}
+.stack-row b {
+  min-width: 3.2em;
+  text-align: right;
+  font-weight: 500;
+}
+.rewards {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.rewards summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.hint {
+  margin: 6px 0 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.scroll {
+  overflow-x: auto;
+}
+#rewards {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+#rewards th,
+#rewards td {
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+#rewards th {
+  color: var(--muted);
+  font-weight: 500;
+}
+#rewards tr.total td {
+  font-weight: 600;
+  border-bottom: 0;
+}
+.cell {
+  position: relative;
+  min-width: 64px;
+  text-align: right;
+}
+.cell .bar {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  border-radius: 3px;
+  opacity: 0.45;
+}
+.cell .bar.pos {
+  left: 0;
+  background: #6fcf86;
+}
+.cell .bar.neg {
+  right: 0;
+  background: #e0786a;
+}
+.cell b {
+  position: relative;
+  font-weight: 500;
+}
+#error {
+  margin: 0;
+  flex-shrink: 0;
+  color: #ffb4a8;
+}
+@media (max-width: 900px) {
+  body {
+    font-size: 12px;
+  }
+  .lanes th:nth-child(5),
+  .lanes td:nth-child(5),
+  .lanes th:nth-child(6),
+  .lanes td:nth-child(6) {
+    display: none;
+  }
+  .lanes td:last-child {
+    min-width: 90px;
+  }
+  .clock {
+    margin-left: 0;
+  }
+}

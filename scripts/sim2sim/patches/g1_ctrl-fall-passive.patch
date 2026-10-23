@@ -1,0 +1,68 @@
+--- a/deploy/include/FSM/State_RLBase.h
++++ b/deploy/include/FSM/State_RLBase.h
+@@ -52,6 +52,8 @@
+     }
+ 
+     void run();
++    // sim2sim patch: Unitree's bad_orientation, from this FSM tick's IMU (tilt in rad); logs when it fires
++    bool fell_over(float limit_angle);
+     
+     void exit()
+     {
+--- a/deploy/robots/g1/src/State_RLBase.cpp
++++ b/deploy/robots/g1/src/State_RLBase.cpp
+@@ -31,6 +31,11 @@
+ 
+ }
+ 
++// sim2sim patch: tilt from vertical (rad) past which Velocity goes to Passive. It is the limit Unitree passes to
++// isaaclab::mdp::bad_orientation below; that check is commented out in terminations.h (returns false).
++static constexpr float kFallTilt = 1.0f;
++static constexpr float kRadToDeg = 57.2957795f;
++
+ State_RLBase::State_RLBase(int state_mode, std::string state_string)
+ : FSMState(state_mode, state_string) 
+ {
+@@ -45,10 +50,12 @@
+ 
+     this->registered_checks.emplace_back(
+         std::make_pair(
+-            [&]()->bool{ return isaaclab::mdp::bad_orientation(env.get(), 1.0); },
++            [&]()->bool{ return fell_over(kFallTilt); },  // sim2sim patch: was bad_orientation(env.get(), 1.0)
+             FSMStringMap.right.at("Passive")
+         )
+     );
++    spdlog::info("{}: pelvis tilt past {:.1f} deg goes to Passive (sim2sim fall-passive patch)", state_string,
++                 kFallTilt * kRadToDeg);
+ }
+ 
+ void State_RLBase::run()
+@@ -69,4 +76,27 @@
+     for(int i(0); i < env->robot->data.joint_ids_map.size(); i++) {
+         lowcmd->msg_.motor_cmd()[env->robot->data.joint_ids_map[i]].q() = action[i];
+     }
++}
++
++bool State_RLBase::fell_over(float limit_angle)
++{
++    // sim2sim patch: bad_orientation's test, acos(-g_z) > limit with g the gravity in the pelvis IMU frame as
++    // BaseArticulation::update computes it, but on the lowstate of this FSM tick: env's projected_gravity_b is
++    // refreshed only by the policy thread, once a policy step.
++    Eigen::Quaternionf quat;
++    uint32_t tick;
++    {
++        std::lock_guard<std::mutex> lock(lowstate->mutex_);
++        const auto & q = lowstate->msg_.imu_state().quaternion();
++        quat = Eigen::Quaternionf(q[0], q[1], q[2], q[3]);
++        tick = lowstate->msg_.tick();
++    }
++    Eigen::Vector3f gravity = quat.conjugate() * Eigen::Vector3f(0.0f, 0.0f, -1.0f);
++    float tilt = std::acos(std::clamp(-gravity[2], -1.0f, 1.0f));
++    if (tilt <= limit_angle) {
++        return false;
++    }
++    spdlog::warn("{}: pelvis tilt {:.1f} deg > {:.1f} deg at lowstate tick {}, going to Passive "
++                 "(sim2sim fall-passive patch)", getStateString(), tilt * kRadToDeg, limit_angle * kRadToDeg, tick);
++    return true;
+ }
+\ No newline at end of file

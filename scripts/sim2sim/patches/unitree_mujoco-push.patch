@@ -1,0 +1,125 @@
+--- a/simulate/src/main.cc
++++ b/simulate/src/main.cc
+@@ -18,6 +18,7 @@
+ #undef private
+ 
+ #include <chrono>
++#include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -84,6 +85,84 @@
+ };
+ inline ElasticBand elastic_band;
+ 
++// sim2sim (lab repo, scripts/sim2sim/patches/unitree_mujoco-push.patch): a push on the pelvis, like the
++// velocity pushes of the G1 training. Window keys, numpad (the same on any keyboard layout): 8 forward,
++// 2 back, 4 left, 6 right in the pelvis heading frame; dv 0.5 m/s, plus 0.25 with Ctrl, 0.5 with Shift and
++// 1.0 with Alt (Shift 1.0 m/s, Ctrl+Shift 1.25, Alt 1.5, ..., all three 2.25). A push is the
++// horizontal force M dv / T on the pelvis for T = 0.1 s (M: total mass), written into xfrc_applied before
++// every mj_step while it lasts, as the band does (Simulate::Sync zeroes xfrc_applied every frame), and
++// zeroed after it. Start and end go to stdout.
++class Push
++{
++public:
++  static constexpr double kSeconds = 0.1;
++
++  // render thread (key callback)
++  void Request(const char *name, double forward, double left, double dv)
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    name_ = name;
++    forward_ = forward;
++    left_ = left;
++    dv_ = dv;
++    requested_ = true;
++  }
++
++  // physics thread, before every mj_step
++  void Apply(const mjModel *m, mjData *d)
++  {
++    if (body_ < 0 && (body_ = mj_name2id(m, mjOBJ_BODY, "pelvis")) < 0)
++      return;
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (requested_)
++      {
++        requested_ = false;
++        const mjtNum *q = d->xquat + 4 * body_;
++        const double yaw = std::atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] * q[2] + q[3] * q[3]));
++        const double mass = mj_getTotalmass(m);
++        const double force = mass * dv_ / kSeconds;
++        fx_ = force * (forward_ * std::cos(yaw) - left_ * std::sin(yaw));
++        fy_ = force * (forward_ * std::sin(yaw) + left_ * std::cos(yaw));
++        steps_left_ = (int)std::lround(kSeconds / m->opt.timestep);
++        steps_done_ = 0;
++        std::printf("sim2sim push start t=%.4f dir=%s dv=%.2f mass=%.3f force=%.1f fx=%.1f fy=%.1f "
++                    "heading_deg=%.1f steps=%d dt=%g\n",
++                    d->time, name_, dv_, mass, force, fx_, fy_, yaw * 180 / mjPI, steps_left_, m->opt.timestep);
++        std::fflush(stdout);
++      }
++    }
++    mjtNum *f = d->xfrc_applied + 6 * body_;
++    if (steps_left_ > 0)
++    {
++      f[0] = fx_;
++      f[1] = fy_;
++      f[2] = 0;
++      --steps_left_;
++      ++steps_done_;
++      written_ = true;
++    }
++    else if (written_)
++    {
++      f[0] = f[1] = f[2] = 0;
++      written_ = false;
++      std::printf("sim2sim push end t=%.4f steps=%d impulse=%.3f\n", d->time, steps_done_,
++                  steps_done_ * m->opt.timestep * std::hypot(fx_, fy_));
++      std::fflush(stdout);
++    }
++  }
++
++private:
++  std::mutex mutex_;
++  bool requested_ = false;
++  const char *name_ = "";
++  double forward_ = 0, left_ = 0, dv_ = 0;
++  int body_ = -1, steps_left_ = 0, steps_done_ = 0;
++  double fx_ = 0, fy_ = 0;
++  bool written_ = false;
++};
++inline Push push;
++
+ 
+ namespace
+ {
+@@ -461,6 +540,7 @@
+               sim.speed_changed = false;
+ 
+               // run single step, let next iteration deal with timing
++              push.Apply(m, d);
+               mj_step(m, d);
+               stepped = true;
+             }
+@@ -500,6 +580,7 @@
+                     d->xfrc_applied[param::config.band_attached_link + 2] = elastic_band.f_[2];
+                   }
+                 }
++                push.Apply(m, d);
+ 
+                 // call mj_step
+                 mj_step(m, d);
+@@ -640,6 +721,13 @@
+         elastic_band.length_ += 0.1;
+       }
+     }
++    // sim2sim: pushes on the pelvis (class Push), dv 0.5 m/s + 0.25 Ctrl + 0.5 Shift + 1.0 Alt
++    const double dv = 0.5 + ((mods & GLFW_MOD_CONTROL) ? 0.25 : 0) + ((mods & GLFW_MOD_SHIFT) ? 0.5 : 0) +
++                      ((mods & GLFW_MOD_ALT) ? 1.0 : 0);
++    if (key==GLFW_KEY_KP_8) push.Request("forward", 1, 0, dv);
++    if (key==GLFW_KEY_KP_2) push.Request("back", -1, 0, dv);
++    if (key==GLFW_KEY_KP_4) push.Request("left", 0, 1, dv);
++    if (key==GLFW_KEY_KP_6) push.Request("right", 0, -1, dv);
+     if(key==GLFW_KEY_BACKSPACE) {
+       mj_resetData(m, d);
+       mj_forward(m, d);

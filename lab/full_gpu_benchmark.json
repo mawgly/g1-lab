@@ -1,0 +1,80 @@
+{
+  "backend": "full_gpu",
+  "device": "NVIDIA GeForce RTX 4080 SUPER",
+  "created_at": 1792396637.4561677,
+  "versions": {
+    "torch": "2.14.1+cu130",
+    "mujoco": "3.16.0",
+    "mujoco-warp": "3.16.0",
+    "stable-baselines3": "2.9.0"
+  },
+  "includes": "physics, observation/reward, normalization, rollout and PPO updates",
+  "excludes": "checkpoint export, CPU evaluation and browser rendering",
+  "rollout_size": 8192,
+  "preset": "careful",
+  "seed": 42,
+  "parameters": {
+    "learning_rate": 5e-05,
+    "n_epochs": 5,
+    "ent_coef": 0.0,
+    "target_kl": 0.02,
+    "batch_size": 256,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2
+  },
+  "comparison_note": "Same work budget; CUDA and NumPy reset RNGs produce different trajectories. Short throughput test, not a learning-quality comparison.",
+  "results": [
+    {
+      "n_envs": 256,
+      "n_steps": 32,
+      "iterations": 8,
+      "setup_seconds": 5.933400499983691,
+      "training_seconds": 10.08544160000747,
+      "training_steps_per_second": 6498.079370163767,
+      "hybrid_steps_per_second": 4064.5946805654607,
+      "speedup_vs_hybrid": 1.59870291648853,
+      "hybrid": {
+        "training_steps_per_second": 4064.5946805654607,
+        "training_seconds": 16.12362490000669,
+        "setup_seconds": 2.4899282000260428,
+        "torch_version": "2.14.1+cpu"
+      },
+      "torch_peak_memory_mb": 35.09228515625
+    },
+    {
+      "n_envs": 512,
+      "n_steps": 16,
+      "iterations": 8,
+      "setup_seconds": 1.5592567000421695,
+      "training_seconds": 8.904180100013036,
+      "training_steps_per_second": 7360.138638694432,
+      "hybrid_steps_per_second": 4875.254601432838,
+      "speedup_vs_hybrid": 1.5096931833121672,
+      "hybrid": {
+        "training_steps_per_second": 4875.254601432838,
+        "training_seconds": 13.442579999973532,
+        "setup_seconds": 2.875967899977695,
+        "torch_version": "2.14.1+cpu"
+      },
+      "torch_peak_memory_mb": 37.537109375
+    },
+    {
+      "n_envs": 1024,
+      "n_steps": 8,
+      "iterations": 8,
+      "setup_seconds": 1.3959420999744907,
+      "training_seconds": 8.391122000000905,
+      "training_steps_per_second": 7810.159356519061,
+      "hybrid_steps_per_second": 3556.4047938429776,
+      "speedup_vs_hybrid": 2.196082788449839,
+      "hybrid": {
+        "training_steps_per_second": 3556.4047938429776,
+        "training_seconds": 18.427598599984776,
+        "setup_seconds": 6.29289380001137,
+        "torch_version": "2.14.1+cpu"
+      },
+      "torch_peak_memory_mb": 62.68115234375
+    }
+  ]
+}

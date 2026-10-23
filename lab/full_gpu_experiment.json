@@ -1,0 +1,27 @@
+{
+  "id": "exp-0183f7e4077145e6",
+  "name": "\u041f\u043e\u043b\u043d\u044b\u0439 GPU \u00b7 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u00b7 seed 43",
+  "created_at": 1792396243.26829,
+  "config": {
+    "name": "\u041f\u043e\u043b\u043d\u044b\u0439 GPU \u00b7 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u00b7 seed 43",
+    "backend": "full_gpu",
+    "envs": 256,
+    "steps": 2000000,
+    "every": 500000,
+    "seed": 43,
+    "learning_rate": 5e-05,
+    "n_steps": 32,
+    "batch_size": 256,
+    "n_epochs": 5,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "ent_coef": 0,
+    "clip_range": 0.2,
+    "target_kl": 0.02,
+    "hours": 1,
+    "preset": "careful",
+    "source_id": null,
+    "source_stage": null
+  },
+  "read_only": false
+}

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Humanoid — лаборатория движения</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%23b9ebbd'/%3E%3Cpath d='M12 10v20m16-20v20M12 20h16' stroke='%23141b18' stroke-width='4'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/style.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three.module.js",
+          "three/addons/controls/OrbitControls.js": "/vendor/OrbitControls.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Humanoid — главная"
+        ><span class="brand-mark">h<span>·</span></span
+        ><span>humanoid<span class="brand-sub">motion lab</span></span></a
+      >
+      <div class="top-label">ЭКСПЕРИМЕНТ 01 <span>/</span> ОБУЧЕНИЕ ХОДЬБЕ</div>
+      <div class="connection">
+        <span class="dot" id="connection-dot"></span><span id="connection-text">Подключение…</span>
+      </div>
+    </header>
+    <main>
+      <section class="heading">
+        <div>
+          <div class="eyebrow">ОТ ПЕРВОГО ПАДЕНИЯ К ПЕРВОМУ ШАГУ</div>
+          <h1>Смотри, как он учится<span>.</span></h1>
+          <p>Выбирай этапы, сравнивай движения и наблюдай за прогрессом.</p>
+        </div>
+        <div class="model-tag">
+          <span class="tag-icon">◈</span>
+          <div>Humanoid-v5<small>MuJoCo · PPO</small></div>
+        </div>
+      </section>
+      <div id="error" class="error" role="alert" hidden></div>
+      <div class="workspace">
+        <div class="main-column">
+          <section class="viewer-card" aria-label="Просмотр симуляции">
+            <div class="viewer-head">
+              <div class="viewer-title">
+                <span class="dot"></span>Симуляция <span class="pill" id="view-mode">Последний этап</span>
+              </div>
+              <button class="icon-button" id="fullscreen" title="На весь экран" aria-label="На весь экран">
+                ⛶
+              </button>
+            </div>
+            <div id="viewport">
+              <div id="loading"><span class="spinner"></span>Загружаем модель и физику…</div>
+              <div class="stage-overlay">
+                <span class="eyebrow">ТЕКУЩИЙ ЭТАП</span><strong id="stage-step">—</strong
+                ><span id="stage-caption">шагов обучения</span>
+              </div>
+              <div class="attempt">
+                <span id="attempt-label">Попытка 1</span><span><b id="episode-time">0,0</b> с</span
+                ><span><b id="episode-distance">0,00</b> м</span
+                ><span id="speed-box" hidden title="Средняя скорость за последние 2 секунды"
+                  ><b id="episode-speed">—</b> м/с<span id="speed-command"></span
+                ></span>
+              </div>
+              <button class="camera-button" id="camera-reset" title="Вернуть камеру">↺ Камера</button>
+              <div class="viewport-tip">Мышь — вращение <span>·</span> Колёсико — масштаб</div>
+            </div>
+            <div class="playback">
+              <div class="playback-left">
+                <button class="play-button" id="pause" aria-label="Пауза">
+                  <span id="pause-icon">Ⅱ</span><span id="pause-label">Пауза</span></button
+                ><button
+                  class="icon-button"
+                  id="reset"
+                  title="Начать попытку заново"
+                  aria-label="Начать попытку заново"
+                >
+                  ↻</button
+                ><span class="divider"></span>
+                <div class="speed-control" aria-label="Скорость просмотра">
+                  <button data-speed="0.5">0,5×</button><button data-speed="1" class="selected">1×</button
+                  ><button data-speed="2">2×</button>
+                </div>
+              </div>
+              <label class="follow-toggle"
+                ><input type="checkbox" id="follow" checked /><span class="switch"></span>Следить за
+                новыми</label
+              >
+            </div>
+          </section>
+          <section class="timeline-card">
+            <div class="timeline-toolbar">
+              <button class="primary-button" id="tour-start">▶ Все этапы подряд</button
+              ><label
+                >Секунд на этап
+                <input id="stage-duration" type="number" min="1" max="600" value="10" /></label
+              ><button id="first-stage">Начало</button><button id="latest-stage">Последний</button>
+              <details class="view-options">
+                <summary>Настройки просмотра</summary>
+                <div>
+                  <label
+                    >Переходить дальше
+                    <select id="tour-mode">
+                      <option value="time">По выбранному времени</option>
+                      <option value="attempt">После одной попытки</option>
+                    </select></label
+                  ><label
+                    ><input id="full-fall" type="checkbox" /> Показывать падение целиком + 2 секунды</label
+                  >
+                  <p>По умолчанию — короткая остановка при потере равновесия.</p>
+                </div>
+              </details>
+            </div>
+            <div class="timeline">
+              <button class="arrow-button" id="previous" aria-label="Предыдущий этап">←</button
+              ><input
+                id="timeline"
+                type="range"
+                min="0"
+                max="0"
+                value="0"
+                aria-label="Выбор этапа обучения"
+              /><button class="arrow-button" id="next" aria-label="Следующий этап">→</button>
+            </div>
+            <div class="timeline-labels">
+              <span id="stage-count">Загружаем этапы…</span><span id="timeline-position">—</span
+              ><span id="timeline-end">—</span><span id="tour-status"></span>
+            </div>
+          </section>
+          <section class="chart-card">
+            <div class="section-top">
+              <div>
+                <h2>Как меняется результат</h2>
+                <p>Одинаковые 5 начальных состояний на каждом этапе</p>
+              </div>
+              <div class="chart-tabs">
+                <button data-metric="reward" class="selected">Награда</button
+                ><button data-metric="seconds">Время</button><button data-metric="distance">Дистанция</button>
+              </div>
+            </div>
+            <div class="chart-wrap">
+              <svg id="chart" viewBox="0 0 800 180" role="img" aria-label="График результатов обучения"></svg>
+              <div class="chart-empty" id="chart-empty" hidden>
+                После первой проверки здесь появятся результаты.
+              </div>
+            </div>
+            <div class="chart-footer">
+              <span><i></i>Среднее по 5 попыткам</span><span>Нажми на точку, чтобы посмотреть этап</span>
+            </div>
+          </section>
+        </div>
+        <aside>
+          <section class="results-card">
+            <div class="section-top">
+              <h2>Этот этап</h2>
+              <span class="small-tag">ПРОВЕРКА</span>
+            </div>
+            <div class="metric">
+              <div><span>Средняя награда</span><small>Выше — лучше по условиям задачи</small></div>
+              <strong id="metric-reward">—</strong>
+            </div>
+            <div class="metric">
+              <div><span>Длительность попытки</span><small>До падения или лимита 15 секунд</small></div>
+              <strong id="metric-seconds">—</strong>
+            </div>
+            <div class="metric">
+              <div><span>Продвижение вперёд</span><small>Отрицательное — движение назад</small></div>
+              <strong id="metric-distance">—</strong>
+            </div>
+            <div class="insight" id="insight">Здесь появится сравнение с исходной моделью.</div>
+          </section>
+          <section class="help-card">
+            <span class="help-symbol">✳</span>
+            <h3>Падение — тоже опыт</h3>
+            <p>
+              Модель пробует движения и учится на результате. Поздний этап не всегда лучше раннего — сравни их
+              сам.
+            </p>
+            <div class="key-hints"><kbd>←</kbd><kbd>→</kbd><span>выбор этапа</span></div>
+            <div class="key-hints"><kbd>Space</kbd><span>пауза просмотра</span></div>
+          </section>
+        </aside>
+      </div>
+      <footer>
+        <span><span class="dot"></span>Работает на твоём компьютере</span
+        ><span>Физика MuJoCo · реальные сохранения обучения</span>
+      </footer>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,85 @@
+{
+  "backend": "full_gpu",
+  "robot_id": "g1_29dof",
+  "task_id": "g1_velocity",
+  "device": "NVIDIA GeForce RTX 4080 SUPER",
+  "created_at": 1792421334.3767364,
+  "versions": {
+    "torch": "2.14.1+cu130",
+    "mujoco": "3.16.0",
+    "mujoco-warp": "3.16.0",
+    "stable-baselines3": "2.9.0"
+  },
+  "includes": "physics, observation/reward, normalization, rollout and PPO updates",
+  "excludes": "checkpoint export, CPU evaluation and browser rendering",
+  "preset": "careful",
+  "window_seconds": 20.0,
+  "results": [
+    {
+      "n_envs": 64,
+      "n_steps": 128,
+      "batch_size": 256,
+      "iterations": 6,
+      "setup_seconds": 6.804283399997075,
+      "training_seconds": 20.926225699997303,
+      "training_steps_per_second": 2348.8229891358924,
+      "rollout_share": 0.8416248803049766,
+      "torch_peak_memory_mb": 25.62841796875
+    },
+    {
+      "n_envs": 256,
+      "n_steps": 32,
+      "batch_size": 256,
+      "iterations": 14,
+      "setup_seconds": 1.6148533999985375,
+      "training_seconds": 20.089266199996928,
+      "training_steps_per_second": 5708.919323296017,
+      "rollout_share": 0.5779544053231257,
+      "torch_peak_memory_mb": 25.7314453125
+    },
+    {
+      "n_envs": 256,
+      "n_steps": 32,
+      "batch_size": 2048,
+      "iterations": 23,
+      "setup_seconds": 1.0911381999976584,
+      "training_seconds": 20.76403779999964,
+      "training_steps_per_second": 9074.150308087152,
+      "rollout_share": 0.9252292634525863,
+      "torch_peak_memory_mb": 41.06396484375
+    },
+    {
+      "n_envs": 1024,
+      "n_steps": 32,
+      "batch_size": 8192,
+      "iterations": 18,
+      "setup_seconds": 1.426120500000252,
+      "training_seconds": 20.18767630000002,
+      "training_steps_per_second": 29217.032769640722,
+      "rollout_share": 0.9307167214684633,
+      "torch_peak_memory_mb": 106.58984375
+    },
+    {
+      "n_envs": 2048,
+      "n_steps": 32,
+      "batch_size": 16384,
+      "iterations": 16,
+      "setup_seconds": 1.775003700000525,
+      "training_seconds": 20.893950499998027,
+      "training_steps_per_second": 50185.6266961147,
+      "rollout_share": 0.9373768211044545,
+      "torch_peak_memory_mb": 194.82373046875
+    },
+    {
+      "n_envs": 4096,
+      "n_steps": 24,
+      "batch_size": 24576,
+      "iterations": 15,
+      "setup_seconds": 2.004771799998707,
+      "training_seconds": 20.174412699998356,
+      "training_steps_per_second": 73090.60352473706,
+      "rollout_share": 0.9401157586111284,
+      "torch_peak_memory_mb": 281.60009765625
+    }
+  ]
+}

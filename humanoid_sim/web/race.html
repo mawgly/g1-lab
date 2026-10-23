@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Забег этапов</title>
+    <link rel="stylesheet" href="/race.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three.module.js",
+          "three/addons/controls/OrbitControls.js": "/vendor/OrbitControls.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div class="race-bar">
+      <a id="back" class="back" href="lab.html"><span aria-hidden="true">←</span> Лаборатория</a
+      ><button id="pause" class="primary">Ⅱ Пауза</button
+      ><button id="restart" title="Начать забег заново с той же стартовой позиции">↺ Заново</button>
+      <span class="speeds" aria-label="Скорость просмотра"
+        ><button data-speed="0.5">0,5×</button><button data-speed="1">1×</button
+        ><button data-speed="2">2×</button></span
+      >
+      <label id="scenario-wrap" hidden
+        >Команда
+        <select id="scenario">
+          <option value="stand">Стоять</option>
+          <option value="slow">Идти 0,5 м/с</option>
+          <option value="walk">Идти 1,0 м/с</option>
+          <option value="brisk">Идти 1,4 м/с</option>
+          <option value="stop_start">Стоп-старт (0 → 1 → 0 → 1 м/с)</option>
+          <option value="sprint">Бежать 2 м/с (беговые ветки)</option>
+        </select></label
+      >
+      <label title="Этапы распределяются равномерно; последняя дорожка следит за новыми сохранениями"
+        >Дорожек <select id="lane-count"></select
+      ></label>
+      <button id="fullscreen" title="Сцена на весь экран">⛶ На весь экран</button>
+      <span id="race-clock" class="clock">—</span>
+    </div>
+    <div id="viewport" class="race-viewport">
+      <div id="loading">Загружаем модели и физику…</div>
+      <div id="banner" hidden></div>
+    </div>
+    <div id="reward-legend" class="legend" aria-label="Составляющие награды"></div>
+    <table class="lanes">
+      <thead>
+        <tr>
+          <th></th>
+          <th>Ветка · этап</th>
+          <th title="Средняя горизонтальная скорость за последние 2 секунды">Скорость, м/с</th>
+          <th title="Смещение вперёд по оси X от старта">Вперёд, м</th>
+          <th title="Смещение вбок по оси Y от старта: увод с курса">Вбок, м</th>
+          <th title="Новая опора стопы на землю (сила ≥ 5 Н, ≥ 40 мс), как в «Проверить походку»">
+            Шагов/мин
+          </th>
+          <th>Состояние</th>
+          <th
+            title="Средняя награда за шаг управления (0,02 с) с начала забега: вправо от черты — за что поощряют, влево — штрафы"
+          >
+            За что награда
+          </th>
+        </tr>
+      </thead>
+      <tbody id="lanes"></tbody>
+    </table>
+    <details id="reward-details" class="rewards">
+      <summary>Подробно по составляющим</summary>
+      <p class="hint">
+        Средний вклад каждой составляющей за один шаг управления (0,02 с) с начала забега. Каждый этап
+        считается по весам своей задачи.
+      </p>
+      <div class="scroll"><table id="rewards"></table></div>
+    </details>
+    <p id="error" role="alert" hidden></p>
+    <script type="module" src="/race.js"></script>
+  </body>
+</html>

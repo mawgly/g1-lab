@@ -1,0 +1,44 @@
+--- a/deploy/include/isaaclab/envs/mdp/actions/joint_actions.h
++++ b/deploy/include/isaaclab/envs/mdp/actions/joint_actions.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <mutex>
+ #include <eigen3/Eigen/Dense>
+ #include <yaml-cpp/yaml.h>
+ #include "isaaclab/envs/manager_based_rl_env.h"
+@@ -34,12 +35,17 @@
+         if(!cfg["clip"].IsNull()) {
+             _clip = cfg["clip"].as<std::vector<std::vector<float> >>();
+         }
++        spdlog::info("JointAction: targets are published clipped (sim2sim clip-race patch)");
+     }
+ 
+     virtual void process_actions(std::vector<float> actions)
+     {
+         // TODO: modify action by joint_ids
+         _raw_actions = actions;
++        // sim2sim patch: the FSM thread copies processed_actions() every tick while the policy thread writes
++        // them here. Hold the lock from the scaling to the clip, so a copy never takes targets that are scaled
++        // but not clipped yet (or half of the previous step's).
++        std::lock_guard<std::mutex> lock(_processed_mutex);
+         for(int i(0); i<_action_dim; ++i)
+         {
+             if(!_scale.empty()) {
+@@ -72,6 +78,7 @@
+     
+     std::vector<float> processed_actions() 
+     {
++        std::lock_guard<std::mutex> lock(_processed_mutex);  // sim2sim patch: see process_actions
+         return _processed_actions;
+     }
+ 
+@@ -86,6 +93,7 @@
+ 
+     std::vector<float> _raw_actions;
+     std::vector<float> _processed_actions;
++    std::mutex _processed_mutex;  // sim2sim patch: guards _processed_actions (policy thread vs FSM thread)
+ 
+     std::vector<float> _scale;
+     std::vector<float> _offset;

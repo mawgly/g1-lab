@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="site-mode" content="live" />
+    <title>Журнал · G1 Lab</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap"
+    />
+    <link rel="stylesheet" href="site.css" />
+    <style>
+      /* The journal page only; the shared tokens and components are in site.css. */
+      .j-page {
+        padding-top: 44px;
+        padding-bottom: 64px;
+        overflow-wrap: anywhere;
+      }
+      .j-page :is(a, button, summary, [role='tabpanel']):focus-visible {
+        outline: 2px solid var(--link);
+        outline-offset: 2px;
+      }
+      .j-head h1 {
+        margin-bottom: 10px;
+      }
+      .j-head .lead {
+        margin-bottom: 22px;
+      }
+      .j-tabs {
+        margin-bottom: 22px;
+      }
+      .j-tabs .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .j-count {
+        font-family: var(--mono);
+        font-size: 12.5px;
+        font-weight: 500;
+        opacity: 0.8;
+      }
+      .j-count:empty {
+        display: none;
+      }
+      .j-status {
+        margin: 0 0 16px;
+        color: var(--ink-3);
+      }
+      .j-status.error {
+        color: var(--bad);
+      }
+      .j-status:empty {
+        display: none;
+      }
+      .j-sr {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+      }
+
+      /* Text */
+      .j-meta {
+        margin: 0;
+        font-family: var(--mono);
+        font-size: 12.5px;
+        color: var(--ink-3);
+      }
+      .j-meta a {
+        color: inherit;
+        text-decoration: none;
+      }
+      .j-meta a:hover {
+        color: var(--link);
+        text-decoration: underline;
+      }
+      .j-title {
+        margin: 0;
+        font-size: 19px;
+        line-height: 1.3;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+      .j-title a {
+        color: inherit;
+        text-decoration: none;
+      }
+      .j-title a:hover {
+        color: var(--link);
+      }
+      .j-text p,
+      .j-body > p {
+        margin: 0 0 10px;
+        max-width: 78ch;
+        font-size: 15.5px;
+        line-height: 1.62;
+        color: var(--ink-2);
+        white-space: pre-line;
+      }
+      .j-text p:last-child,
+      .j-body > p:last-child {
+        margin-bottom: 0;
+      }
+      .j-body > p b,
+      .j-text b {
+        color: var(--ink);
+      }
+      .j-tag {
+        font-family: var(--mono);
+        font-size: 12.5px;
+        white-space: nowrap;
+        color: var(--ink-4);
+      }
+      .j-tag.done {
+        color: var(--good);
+      }
+      .j-tag.active {
+        color: #b8470a;
+      }
+      .j-small {
+        align-self: flex-start;
+        min-height: 40px;
+        padding: 0 16px;
+        font-size: 14.5px;
+      }
+
+      /* Clips, pictures, figures */
+      .j-clip {
+        margin: 4px 0 0;
+        max-width: 100%;
+      }
+      .j-play {
+        position: relative;
+        display: inline-block;
+        max-width: 100%;
+        padding: 0;
+        border: 0;
+        border-radius: 10px;
+        overflow: hidden;
+        background: #1b2027;
+        cursor: pointer;
+        vertical-align: top;
+      }
+      .j-play img,
+      .j-still img {
+        display: block;
+        max-width: 100%;
+        height: auto;
+      }
+      .j-play-label {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        padding: 9px 18px;
+        border-radius: 999px;
+        background: rgba(21, 24, 28, 0.84);
+        color: #f4f5f2;
+        font: 700 14px var(--sans);
+        white-space: nowrap;
+      }
+      .j-play[aria-pressed='true'] .j-play-label {
+        display: none;
+      }
+      .j-still {
+        display: inline-block;
+        max-width: 100%;
+        margin-top: 4px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        align-self: flex-start;
+      }
+      .j-figure {
+        margin: 6px 0 0;
+      }
+      .j-figure iframe {
+        display: block;
+        width: 100%;
+        height: 680px; /* until the figure reports its own height */
+        border: 0;
+        border-radius: 10px;
+        background: transparent;
+      }
+      .j-figure a {
+        display: inline-block;
+        margin-top: 6px;
+        font-size: 13px;
+      }
+
+      /* Entries: the list, and beside it the plan, the latest check and the latest council */
+      .j-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 20px;
+        align-items: start;
+      }
+      .j-list,
+      .j-aside {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        min-width: 0;
+      }
+      @media (min-width: 980px) {
+        .j-layout {
+          grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+          gap: 28px;
+        }
+        .j-list {
+          grid-column: 1;
+          grid-row: 1;
+        }
+        .j-aside {
+          grid-column: 2;
+          grid-row: 1;
+        }
+      }
+      .j-entry {
+        gap: 10px;
+      }
+      .j-entry.j-focus {
+        border-color: var(--accent-line);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+      .j-more {
+        align-self: flex-start;
+      }
+      .j-aside .card {
+        gap: 10px;
+      }
+      .j-aside .j-title {
+        font-size: 17px;
+        line-height: 1.35;
+      }
+      .j-aside h2.eyebrow {
+        font-weight: 400;
+      }
+      .j-aside p {
+        margin: 0;
+        font-size: 14.5px;
+        line-height: 1.55;
+        color: var(--ink-2);
+      }
+      .j-plan {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      .j-plan li {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 10px;
+        padding: 9px 0;
+        border-bottom: 1px solid var(--line-soft);
+        font-size: 14.5px;
+      }
+      .j-plan li:last-child {
+        border-bottom: 0;
+      }
+      .j-plan a {
+        color: var(--ink);
+        text-decoration: none;
+      }
+      .j-plan a:hover {
+        color: var(--link);
+        text-decoration: underline;
+      }
+      .j-ticks {
+        font-family: var(--mono);
+        font-weight: 700;
+        letter-spacing: 2px;
+      }
+      .j-ticks .ok {
+        color: var(--good);
+      }
+      .j-ticks .fail {
+        color: var(--bad);
+      }
+      .j-ticks .unknown {
+        color: var(--ink-4);
+      }
+      .j-now p {
+        margin: 0;
+        font-size: 14.5px;
+        line-height: 1.55;
+        color: var(--ink-2);
+      }
+      .j-now p + p {
+        margin-top: 6px;
+      }
+      .j-stale {
+        padding: 8px 12px;
+        border-radius: 8px;
+        background: var(--accent-soft);
+        border: 1px solid var(--accent-line);
+      }
+
+      /* Folding blocks (council iterations, path steps) */
+      details.j-fold > summary {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding-left: 22px;
+        list-style: none;
+        cursor: pointer;
+      }
+      details.j-fold > summary::-webkit-details-marker {
+        display: none;
+      }
+      details.j-fold > summary::before {
+        content: '▸';
+        position: absolute;
+        left: 0;
+        top: 0;
+        color: var(--ink-3);
+      }
+      details.j-fold[open] > summary::before {
+        content: '▾';
+      }
+      details.j-fold[open] > summary .j-note {
+        display: none;
+      }
+      .j-note {
+        font-size: 14.5px;
+        line-height: 1.5;
+        color: var(--ink-3);
+      }
+      .j-body {
+        margin-top: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-width: 0;
+      }
+
+      /* Lab council */
+      .j-council {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .j-said {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .j-said li {
+        display: grid;
+        grid-template-columns: 112px minmax(0, 1fr);
+        gap: 12px;
+        align-items: start;
+      }
+      .j-said p {
+        margin: 0;
+        font-size: 15px;
+        line-height: 1.58;
+        color: var(--ink-2);
+        white-space: pre-line;
+      }
+      .j-role {
+        padding: 4px 6px;
+        border-radius: 6px;
+        background: var(--ink-3);
+        color: #ffffff;
+        font-size: 12.5px;
+        font-weight: 700;
+        text-align: center;
+      }
+      .j-role.lead {
+        background: var(--ink);
+      }
+      .j-role.scout {
+        background: var(--link);
+      }
+      .j-role.critic {
+        background: var(--bad);
+      }
+      .j-role.analyst {
+        background: var(--good);
+      }
+      .j-role.watch {
+        background: #6b5617;
+      }
+      .j-role.chronicler {
+        background: #6c4a96;
+      }
+      .j-role.engineer {
+        background: #24676b;
+      }
+      .j-decision {
+        padding: 12px 14px;
+        border-radius: 10px;
+        background: var(--ground);
+        font-size: 15px;
+        line-height: 1.58;
+        white-space: pre-line;
+      }
+      @media (max-width: 560px) {
+        .j-said li {
+          grid-template-columns: minmax(0, 1fr);
+          gap: 4px;
+        }
+        .j-role {
+          justify-self: start;
+          padding: 3px 10px;
+        }
+      }
+
+      /* Stages: the roadmap, and one stage's story */
+      .j-stages {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
+        gap: 16px;
+      }
+      .j-stage {
+        gap: 10px;
+      }
+      /* The stages done and under way are told at full width, the ones ahead side by side. */
+      .j-stage.done,
+      .j-stage.active {
+        grid-column: 1 / -1;
+      }
+      .j-stage .j-text p {
+        font-size: 15px;
+      }
+      .j-stage .button {
+        margin-top: auto;
+      }
+      .j-back {
+        margin: 0 0 14px;
+        font-weight: 700;
+      }
+      .j-story {
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+      .j-story-head {
+        gap: 10px;
+      }
+      .j-story-head h2 {
+        font-size: clamp(24px, 3.4vw, 30px);
+        line-height: 1.15;
+      }
+      .j-toc {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 6px;
+      }
+      .j-toc button {
+        max-width: 100%;
+        min-height: 36px;
+        padding: 6px 12px;
+        border: 1px solid #bfc4bb;
+        border-radius: 999px;
+        background: var(--card);
+        color: var(--ink);
+        font: 600 13.5px var(--sans);
+        text-align: left;
+        cursor: pointer;
+      }
+      .j-section {
+        gap: 12px;
+      }
+      .j-section h3 {
+        font-size: 20px;
+      }
+      .v-best {
+        --v: var(--good);
+        --vt: var(--good);
+      }
+      .v-control {
+        --v: #9aa3ab;
+        --vt: var(--ink-3);
+      }
+      .v-dead_end {
+        --v: var(--bad);
+        --vt: var(--bad);
+      }
+      .v-active {
+        --v: var(--accent);
+        --vt: #b8470a;
+      }
+      .j-strip {
+        display: flex;
+        gap: 2px;
+      }
+      .j-strip button {
+        flex: 1 1 0;
+        min-width: 0;
+        height: 34px;
+        padding: 0;
+        border: 0;
+        border-radius: 3px;
+        background: var(--v, var(--line));
+        cursor: pointer;
+      }
+      .j-strip button:hover {
+        outline: 2px solid var(--ink);
+        outline-offset: 1px;
+      }
+      .j-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 16px;
+        margin: 0;
+        font-size: 13.5px;
+        color: var(--ink-2);
+      }
+      .j-legend i {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        margin-right: 6px;
+        border-radius: 2px;
+        background: var(--v);
+      }
+      .j-hint {
+        margin: 0;
+        font-size: 14px;
+        line-height: 1.5;
+        color: var(--ink-3);
+      }
+      .j-link {
+        padding: 0;
+        border: 0;
+        background: none;
+        color: var(--link);
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .j-steps {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        border-top: 1px solid var(--line-soft);
+      }
+      .j-steps > li {
+        padding: 10px 0 10px 12px;
+        border-left: 3px solid var(--v, var(--line));
+        border-bottom: 1px solid var(--line-soft);
+      }
+      details.j-step > summary {
+        flex-direction: row;
+        flex-wrap: wrap;
+        align-items: baseline;
+        column-gap: 10px;
+      }
+      .j-step-n {
+        min-width: 2ch;
+        font-family: var(--mono);
+        font-size: 13px;
+        color: var(--ink-4);
+      }
+      .j-step-title {
+        margin: 0;
+        font-size: 15.5px;
+        line-height: 1.4;
+        font-weight: 700;
+      }
+      .j-verdict {
+        font-family: var(--mono);
+        font-size: 12.5px;
+        color: var(--vt, var(--ink-3));
+        white-space: nowrap;
+      }
+      .j-has-clip {
+        font-size: 12px;
+        color: var(--ink-3);
+      }
+      .j-steps .j-body > p {
+        font-size: 15px;
+      }
+      .j-races {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+        gap: 16px;
+      }
+      .j-race-card {
+        gap: 10px;
+        background: var(--ground);
+      }
+      .j-race-card .j-text p {
+        font-size: 14.5px;
+      }
+
+      /* The latest goal check */
+      .j-check {
+        gap: 12px;
+      }
+      .j-score {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 700;
+      }
+      table.j-checks {
+        min-width: 0;
+      }
+      table.j-checks .j-mark {
+        display: inline-block;
+        min-width: 1.4em;
+        font-family: var(--mono);
+        font-weight: 700;
+        color: var(--ink-4);
+      }
+      table.j-checks .ok .j-mark {
+        color: var(--good);
+      }
+      table.j-checks .fail .j-mark,
+      table.j-checks .fail td.num {
+        color: var(--bad);
+      }
+      @media (max-width: 640px) {
+        table.j-checks thead {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          overflow: hidden;
+          clip: rect(0 0 0 0);
+        }
+        table.j-checks tr {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+          column-gap: 12px;
+          padding: 10px 0;
+          border-bottom: 1px solid var(--line);
+        }
+        table.j-checks td {
+          display: block;
+          padding: 2px 0;
+          border: 0;
+        }
+        table.j-checks td:first-child {
+          grid-column: 1 / -1;
+          font-weight: 700;
+        }
+        table.j-checks td[data-label]::before {
+          content: attr(data-label);
+          display: block;
+          font: 700 11.5px var(--sans);
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: var(--ink-3);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="wrap j-page">
+      <div class="j-head">
+        <h1>Журнал</h1>
+        <p class="lead">
+          Каждое решение лаборатории записывается тогда, когда его принимают: записи о ходе работы,
+          обсуждения совета лаборатории, подробный рассказ о каждом этапе плана и последняя проверка цели.
+        </p>
+      </div>
+      <div id="journal-tabs" class="chips j-tabs" role="tablist" aria-label="Разделы журнала">
+        <button
+          type="button"
+          class="chip"
+          role="tab"
+          id="tab-entries"
+          data-view="entries"
+          aria-controls="view-entries"
+          aria-selected="true"
+        >
+          Записи <span class="j-count" data-count="entries"></span>
+        </button>
+        <button
+          type="button"
+          class="chip"
+          role="tab"
+          id="tab-council"
+          data-view="council"
+          aria-controls="view-council"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          Совет лаборатории <span class="j-count" data-count="council"></span>
+        </button>
+        <button
+          type="button"
+          class="chip"
+          role="tab"
+          id="tab-stages"
+          data-view="stages"
+          aria-controls="view-stages"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          Этапы <span class="j-count" data-count="stages"></span>
+        </button>
+        <button
+          type="button"
+          class="chip"
+          role="tab"
+          id="tab-check"
+          data-view="check"
+          aria-controls="view-check"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          Последняя проверка <span class="j-count" data-count="check"></span>
+        </button>
+      </div>
+      <p id="journal-status" class="j-status" role="status">Загружаем журнал…</p>
+      <section id="view-entries" role="tabpanel" aria-labelledby="tab-entries" tabindex="0"></section>
+      <section id="view-council" role="tabpanel" aria-labelledby="tab-council" tabindex="0" hidden></section>
+      <section id="view-stages" role="tabpanel" aria-labelledby="tab-stages" tabindex="0" hidden></section>
+      <section id="view-check" role="tabpanel" aria-labelledby="tab-check" tabindex="0" hidden></section>
+    </main>
+    <script type="module" src="journal.js"></script>
+  </body>
+</html>

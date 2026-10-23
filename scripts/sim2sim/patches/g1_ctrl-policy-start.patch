@@ -1,0 +1,58 @@
+--- a/deploy/include/FSM/State_RLBase.h
++++ b/deploy/include/FSM/State_RLBase.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include "FSMState.h"
+ #include "isaaclab/envs/mdp/actions/joint_actions.h"
+ #include "isaaclab/envs/mdp/terminations.h"
+@@ -24,6 +25,9 @@
+         }
+ 
+         env->robot->update();
++        // sim2sim patch: run() keeps the previous target until the first policy step of this entry
++        policy_stepped = false;
++        held_ticks = 0;
+         // Start policy thread
+         policy_thread_running = true;
+         policy_thread = std::thread([this]{
+@@ -38,6 +42,7 @@
+             while (policy_thread_running)
+             {
+                 env->step();
++                policy_stepped = true;
+ 
+                 // Sleep
+                 std::this_thread::sleep_until(sleepTill);
+@@ -61,6 +66,8 @@
+ 
+     std::thread policy_thread;
+     bool policy_thread_running = false;
++    std::atomic<bool> policy_stepped{false};  // the policy thread has processed an action since enter()
++    int held_ticks = -1;  // FSM ticks run() kept the previous target for; -1 once reported
+ };
+ 
+ REGISTER_FSM(State_RLBase)
+--- a/deploy/robots/g1/src/State_RLBase.cpp
++++ b/deploy/robots/g1/src/State_RLBase.cpp
+@@ -53,6 +53,18 @@
+ 
+ void State_RLBase::run()
+ {
++    // sim2sim patch: until the policy thread has made its first step, processed_actions are the action
++    // term's initial zeros (on a later entry: the previous entry's last targets). Keep the target lowcmd
++    // already holds instead (FixStand's pose), now with this state's gains.
++    if (!policy_stepped) {
++        ++held_ticks;
++        return;
++    }
++    if (held_ticks >= 0) {
++        spdlog::info("{}: kept the previous target for {} FSM ticks until the first policy step",
++                     getStateString(), held_ticks);
++        held_ticks = -1;
++    }
+     auto action = env->action_manager->processed_actions();
+     for(int i(0); i < env->robot->data.joint_ids_map.size(); i++) {
+         lowcmd->msg_.motor_cmd()[env->robot->data.joint_ids_map[i]].q() = action[i];

@@ -1,0 +1,70 @@
+{
+  "backend": "mujoco-warp",
+  "solver": "Newton (Gym default PGS unsupported)",
+  "integrator": "RK4",
+  "frame_skip": 5,
+  "includes": "physics, observation/reward, CPU copies, automatic resets; excludes PPO",
+  "versions": {
+    "mujoco": "3.16.0",
+    "mujoco-warp": "3.16.0",
+    "warp-lang": "1.18.0",
+    "gymnasium": "1.4.0",
+    "stable-baselines3": "2.9.0",
+    "torch": "2.14.1"
+  },
+  "results": [
+    {
+      "n_envs": 128,
+      "vector_steps": 500,
+      "warmup_steps": 100,
+      "elapsed_seconds": 3.837565199995879,
+      "environment_steps_per_second": 16677.24107985676,
+      "completed_episodes": 1537,
+      "setup_and_warmup_seconds": 1.152934700017795
+    },
+    {
+      "n_envs": 256,
+      "vector_steps": 500,
+      "warmup_steps": 100,
+      "elapsed_seconds": 4.1555782000068575,
+      "environment_steps_per_second": 30801.971191346795,
+      "completed_episodes": 3073,
+      "setup_and_warmup_seconds": 1.0128006999730133
+    },
+    {
+      "n_envs": 512,
+      "vector_steps": 500,
+      "warmup_steps": 100,
+      "elapsed_seconds": 4.849630300013814,
+      "environment_steps_per_second": 52787.528979120485,
+      "completed_episodes": 6147,
+      "setup_and_warmup_seconds": 1.1368222999735735
+    },
+    {
+      "n_envs": 1024,
+      "vector_steps": 500,
+      "warmup_steps": 100,
+      "elapsed_seconds": 6.259483699977864,
+      "environment_steps_per_second": 81795.8835809111,
+      "completed_episodes": 12291,
+      "setup_and_warmup_seconds": 1.4246661000070162
+    }
+  ],
+  "correctness": {
+    "seed": 42,
+    "steps": 33,
+    "reset_max_abs_error": 6.558087726205031e-07,
+    "newton_obs_max_abs_error": 0.006025434153002607,
+    "newton_reward_max_abs_error": 6.095542594231063e-06,
+    "cpu_pgs_vs_newton_obs_max_abs_error": 0.0012725720012838337
+  },
+  "cpu_baseline": {
+    "backend": "Gymnasium DummyVecEnv serial CPU",
+    "solver": "default PGS",
+    "n_envs": 128,
+    "vector_steps": 500,
+    "elapsed_seconds": 28.322332000010647,
+    "environment_steps_per_second": 2259.700931405505
+  },
+  "device": "NVIDIA GeForce RTX 4080 SUPER"
+}

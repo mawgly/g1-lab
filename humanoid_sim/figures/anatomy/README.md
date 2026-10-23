@@ -1,0 +1,1 @@
+﻿Vendored from https://github.com/wheresryan22/anatomy (MIT, commit 1482e8469b0a9e0d8cc18ea2740a01423d29ae80): kit/iso-kit.mjs and scripts/inline-kit.mjs, unchanged. Used by ../connector.mjs to build the journal's interactive figures with .tools/node.
