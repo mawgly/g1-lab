@@ -2,7 +2,10 @@
 torso (tension only, 20 kN/m, 1 kN s/m, anchor 3 m above the start), FixStand 2 s (g1_ctrl gains), then Velocity.
 Plans: air5 / air15 (feet 5 / 15 cm above the floor; cmd 0 10 s, then 0.5 m/s 5 s), half (feet on the floor, rope
 holds ~50% of the weight; cmd 0 10 s), lower (air5, cmd 0 3 s, then the rope paid out 2 cm/s for 6 s, stand 8 s,
-walk 0.5 m/s 5 s, stand 4 s), slack (rope 5 cm slack; stand 10 s, walk 0.5 5 s, stand 4 s), floor (no rope, ref)."""
+walk 0.5 m/s 5 s, stand 4 s), slack (rope 5 cm slack; stand 10 s, walk 0.5 5 s, stand 4 s), floor (no rope, ref).
+A height-command stage (task_config height_command) runs them at the nominal height c = 0.78 (the right stick
+centred, height term 0; `height` in each segment) and also air5_crouch (air5, cmd 0: c 0.78 5 s, 0.70 8 s, 0.64 8 s,
+0.78 5 s), the first crouch check on the robot (docs/robot-first-run.md, «Экспериментальный пакет №9 (присед)»)."""
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = ''
 import json, math, sys
@@ -47,6 +50,18 @@ PLANS = {
     'slack': [('stand', 500, 0.), ('walk', 250, .5), ('stop', 200, 0.)],
     'floor': [('stand', 500, 0.), ('walk', 250, .5), ('stop', 200, 0.)],
 }
+# Height-command stages only: segments (name, steps, v, c), c the height command set at the segment's start.
+CROUCH_PLANS = {
+    'air5_crouch': [('stand', 250, 0., .78), ('crouch70', 400, 0., .70), ('crouch64', 400, 0., .64),
+                    ('rise', 250, 0., .78)],
+}
+
+
+def plans(stage):
+    """The plans a stage runs: CROUCH_PLANS too with task_config height_command."""
+    from pathlib import Path
+    from humanoid_sim.core import stage_task_config
+    return list(PLANS) + (list(CROUCH_PLANS) if stage_task_config(Path(stage)).get('height_command') else [])
 
 
 def run(job):
@@ -66,7 +81,7 @@ def run(job):
     st.anchor = np.array([raw.data.xpos[st.torso][0], raw.data.xpos[st.torso][1], 3.])
     base = 3. - torso_z
     stretch = g / K
-    if plan_name in ('air5', 'lower'):
+    if plan_name in ('air5', 'lower', 'air5_crouch'):
         st.rope = base - .05 - stretch
     elif plan_name == 'air15':
         st.rope = base - .15 - stretch
@@ -85,8 +100,10 @@ def run(job):
     legs = [i for i, n in enumerate(names) if any(p in n for p in ('hip', 'knee', 'ankle'))]
     segs, prev_a, fell_at, t = [], None, None, 0
     sole_min = None
-    for name, n, v in PLANS[plan_name]:
+    for name, n, v, *height in {**PLANS, **CROUCH_PLANS}[plan_name]:
         raw.set_command(np.array([v, 0., 0.]))
+        if height:
+            raw.set_height(height[0])
         obs = raw._observation('replace')
         rec = dict(qv=[], tau=[], at_lim=[], da=[], selff=[], rope=[], tilt=[], footz=[], kneeq=[], pelz=[],
                    contacts=[])
@@ -136,7 +153,7 @@ def run(job):
                          tilt_max=float(R['tilt'].max()), footz_min=float(R['footz'].min()),
                          footz_mean=float(R['footz'].mean()), knee_min=float(R['kneeq'].min()),
                          pelz_min=float(R['pelz'].min()), floor_contact_share=float((R['contacts'] > 0).mean()),
-                         xy=d.qpos[:2].tolist()))
+                         xy=d.qpos[:2].tolist(), **({'height': raw.height} if raw.height_command else {})))
         if fell_at is not None:
             break
     over = (st.over / max(st.n, 1))
@@ -149,7 +166,7 @@ def run(job):
 if __name__ == '__main__':
     stage, out = sys.argv[1], sys.argv[2]
     workers = int(sys.argv[3]) if len(sys.argv) > 3 else 8
-    todo = [(stage, ph, p) for ph in ('ours', 'um') for p in PLANS]
+    todo = [(stage, ph, p) for ph in ('ours', 'um') for p in plans(stage)]
     with Pool(workers) as pool:
         res = pool.map(run, todo, chunksize=1)
     open(out, 'w', encoding='utf-8').write(json.dumps(res, indent=1))
@@ -157,7 +174,7 @@ if __name__ == '__main__':
         print('%-5s %-6s fell %s  fix z %.3f  over_peak %.3f (%s)' % (r['physics'], r['plan'], r['fell_at'], r['fix']['z'],
               r['over_peak_max'], r['over_peak_joint']))
         for s in r['segs']:
-            print('   %-6s v%.1f n%4d qv_leg max %5.1f p95 %5.1f  tau_leg %5.0f/%5.0f  lim %.2f  da %.4f/%.3f  self %5.0fN %.2f  rope %.2f/%.2f  tilt %4.1f  footz %.3f  knee_min %.3f  pelz %.3f  floor %.2f  xy %+.2f %+.2f' % (
-                s['name'], s['v'], s['steps'], s['qv_leg_max'], s['qv_leg_p95'], s['tau_leg_mean'], s['tau_leg_max'],
+            print('   %-8s v%.1f%s n%4d qv_leg max %5.1f p95 %5.1f  tau_leg %5.0f/%5.0f  lim %.2f  da %.4f/%.3f  self %5.0fN %.2f  rope %.2f/%.2f  tilt %4.1f  footz %.3f  knee_min %.3f  pelz %.3f  floor %.2f  xy %+.2f %+.2f' % (
+                s['name'], s['v'], ' c%.2f' % s['height'] if 'height' in s else '', s['steps'], s['qv_leg_max'], s['qv_leg_p95'], s['tau_leg_mean'], s['tau_leg_max'],
                 s['at_lim'], s['da'], s['da_max'], s['self_max'], s['self_share'], s['rope_mean'], s['rope_max'],
                 s['tilt_max'], s['footz_min'], s['knee_min'], s['pelz_min'], s['floor_contact_share'], *s['xy']))

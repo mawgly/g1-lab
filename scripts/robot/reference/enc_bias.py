@@ -1,7 +1,8 @@
 ﻿"""CPU only. enc_bias.py <stage> <out.json> [workers]. Drift of a stage under a constant joint encoder offset b
 (uniform +-0.015 rad per joint, as ENCODER_BIAS in training), two models: 'obs' (only the observed angle is q + b,
 as in training) and 'calib' (the real robot: the observed angle and the motor PD both use q + b). Our physics,
-deterministic, heading hold off; walk 0.5 / 1.0 m/s 10 s from reset (yaw rate after 2 s), stand 30 s (heading change)."""
+deterministic, heading hold off; walk 0.5 / 1.0 m/s 10 s from reset (yaw rate after 2 s), stand 30 s (heading change).
+A height-command stage (task_config height_command) runs at the nominal height c = 0.78 (`height` in each result)."""
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = ''
 import json, math, sys
@@ -86,7 +87,7 @@ def run(job):
     env.close()
     return dict(model=model_kind, draw=draw, plan=plan, fell=fell, yaw_rate=float((tr[-1] - tr[0]) / secs),
                 heading_deg=float(math.degrees(tr[-1] - tr[0])), speed=float(np.linalg.norm(moved) / secs),
-                bias=bias.tolist())
+                bias=bias.tolist(), **({'height': raw.height} if raw.height_command else {}))
 
 
 if __name__ == '__main__':

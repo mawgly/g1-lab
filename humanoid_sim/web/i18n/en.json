@@ -909,5 +909,18 @@
   "слабое место: уводит влево на +0,032…+0,037 рад/с, курс +17…+20° за 10 с — на полу подруливать стиком": "weak spot: drifts left at +0.032…+0.037 rad/s, heading +17…+20° in 10 s — on the floor, steer slightly with the stick",
   "слабое место: шаг вправо 0,3 уводит на +0,012…+0,017 рад/с, курс +9…+10° за 10 с": "weak spot: a step to the right at 0.3 drifts by +0.012…+0.017 rad/s, heading +9…+10° in 10 s",
   "Во время помехи на руки касания рук не штрафуются (касания ног, стоп, корпуса и таза — как раньше)": "During arm disturbance, arm contacts are not penalized (contacts of legs, feet, torso and pelvis — as before)",
-  "Помехи на руки: размах случайной позы каждого сустава руки, ± рад (0,4 — прежний)": "Arm disturbances: amplitude of the random pose of each arm joint, ± rad (0.4 — the old value)"
+  "Помехи на руки: размах случайной позы каждого сустава руки, ± рад (0,4 — прежний)": "Arm disturbances: amplitude of the random pose of each arm joint, ± rad (0.4 — the old value)",
+  "Слепые руки: политика не видит углы, скорости и прошлые команды суставов рук (их входы — постоянные числа этапа-родителя)": "Blind arms: the policy does not see the angles, velocities and past joint commands of the arms (their inputs are constant numbers of the parent stage)",
+  "Бонус за стойку: макушка выше 1,15 м, наклон меньше 15°, таз выше 0,70 м, обе стопы на полу": "Standing bonus: head top above 1.15 m, tilt less than 15°, pelvis above 0.70 m, both feet on the floor",
+  "Вставание после падения": "Getting up after a fall",
+  "Высота макушки: от 0,15 до 1,20 м": "Head top height: from 0.15 to 1.20 m",
+  "Кисти сталкиваются с полом и телом, как в модели Unitree (капсула на кисть)": "Hands collide with the floor and the body, as in Unitree's model (one capsule per hand)",
+  "Корпус вертикально (при тазе выше 0,4 м)": "Torso upright (with the pelvis above 0.4 m)",
+  "Подтяжка за таз вверх в начале обучения, Н (у мира, который встал, убывает на 20 Н)": "Upward pull on the pelvis at the start of training, N (in a world that has stood up it decreases by 20 N)",
+  "Поза стоя близко к исходной (только в стойке)": "Standing pose close to the home pose (only while standing)",
+  "Трение тела и пола на эпизод: от и до, пара чисел": "Friction of the body and the floor per episode: from and to, a pair of numbers",
+  "Штраф за моменты моторов": "Penalty for motor torques",
+  "Штраф за ноги у упоров (последние 5% хода бедра, колена, голеностопа)": "Penalty for legs at the stops (last 5% of the travel of hip, knee and ankle)",
+  "Штраф за скорости суставов": "Penalty for joint velocities",
+  "Штраф за скорость таза в стойке": "Penalty for pelvis speed while standing"
 }

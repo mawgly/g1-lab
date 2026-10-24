@@ -1,13 +1,15 @@
-"""Batched G1 task equations (g1_velocity obs-v2); shared by the CPU and CUDA environments.
+"""Batched G1 task equations (g1_velocity obs-v2, g1_getup); shared by the CPU and CUDA environments.
 
-Device and dtype follow the inputs; no host copies or physics calls.
+Device and dtype follow the inputs; no host copies or physics calls. The g1_getup functions (the end of the file)
+take numpy arrays or torch tensors alike.
 velocity is MuJoCo object velocity at the pelvis COM in local coordinates:
 angular xyz then linear xyz. Free-joint qvel is not a substitute for it.
 rotation maps pelvis local coordinates to world coordinates.
 """
 import math
+import numpy as np
 import torch
-from .config import ARM_PERTURB_RADIANS, G1_COMMANDS, G1_REWARD_WEIGHTS, backward_share
+from .config import ARM_PERTURB_RADIANS, G1_COMMANDS, G1_GETUP_REWARD_WEIGHTS, G1_REWARD_WEIGHTS, backward_share
 
 # Gait clock: each leg is in stance for the first 55% of its 0.8 s cycle, legs half a cycle apart.
 # Defaults of the task's `gait` setting; a stance share below 0.5 adds flight phases (running).
@@ -97,6 +99,15 @@ UPPER_BODY_SIZE = 18
 # observations, so new columns would keep any estimate for good; set by hand (std 0.05 m: c − 0.78 in [−0.14, 0] reads
 # −2.8…0) and frozen in TensorNormalize.
 TERM_NORMALIZATION = {HEIGHT_TERM: (0., .0025), UPPER_BODY_TERM: (0., 1.)}
+# task_config arm_blind (iteration 31; the critic's lab-critic/it30 blind_const.py): the policy (actor and critic, one
+# input) does not see its arms. The arm columns, joint_pos_rel, joint_vel_rel and last_action (ARM_BLIND_TERMS) of the
+# ARM_JOINT_PARTS joints in every history frame (joint_positions; 14 · 3 · 5 = 210 on the 29-DoF G1 at history 5), keep
+# the variance ARM_BLIND_SCALE² and a mean −z·ARM_BLIND_SCALE in the normalization, frozen as TERM_NORMALIZATION's, so
+# the normalized input is z + x/ARM_BLIND_SCALE: the constant z (the stage's own mean normalized arm inputs,
+# warm_start.blind_arms) within ~1e-5 whatever the arms do (|x| ≤ 10 rad, rad/s or action units). The observation
+# itself is unchanged.
+ARM_BLIND_TERMS = (4, 5, 6)  # deploy_terms' joint_pos_rel, joint_vel_rel, last_action
+ARM_BLIND_SCALE = 1e6
 # "Faster is better" (Humanoid-v5 style): reward grows with ground speed along the episode's target
 # heading (world +x unless the start was turned), not along the pelvis axis, so running in circles
 # earns nothing. Clipped so a lunge cannot dominate the return; moving backwards is penalised up to 1 m/s.
@@ -632,6 +643,14 @@ def term_positions(joints, history, terms, name):
     return [position for frame in history_index(joints, history, sizes) for position in frame[start:end]]
 
 
+def joint_positions(joints, history, extra, terms, entries):
+    """Positions in the history observation of entries `entries` (joint indices) of the deploy terms `terms`
+    (deploy_terms' numbers), term by term, every frame (oldest first), entries in the given order; extra as
+    deploy_terms. task_config arm_blind's columns: joint_positions(nu, history, extra, ARM_BLIND_TERMS, arm joints)."""
+    spans, index = deploy_terms(joints, extra), history_index(joints, history, extra)
+    return [index[frame][spans[term][0] + entry] for term in terms for frame in range(history) for entry in entries]
+
+
 def sole_height(sphere_height, radius):
     """Height (m) of each foot's lowest sole point, (n, 2). sphere_height: (n, 2, k) world z of the centres of
     each foot's k collision spheres; radius: (2, k)."""
@@ -835,3 +854,153 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
         'fall': -weights['fall']*fell.to(dtype),
     }
     return components, fell
+
+
+# --- g1_getup (iteration 33): getting up after a fall ------------------------------------------------------------------
+# The critic's specification (lab-critic/it33): a dense reward on the height of the top of the head and the torso's
+# uprightness, a bonus for standing, regularization always; a vertical assist force on the pelvis while it is nearly
+# upright, lowered as the worlds get up (HoST's curriculum). Every function takes numpy arrays (the CPU task) or torch
+# tensors (the CUDA one) and gives the same numbers.
+# Top of the head in the torso_link frame: the highest vertex of the head_link mesh in the home pose (critic,
+# lab-critic/it33/mechanics.py; 1.324 m above the floor standing in home, the pelvis at 0.793).
+HEAD_TOP = (.005, 0., .477)
+# Head term: clip((head − GETUP_HEAD_LOW) / GETUP_HEAD_SPAN, 0, 1): 0 lying (the head at 0.07-0.2 m), 1 from 1.20 m.
+GETUP_HEAD_LOW, GETUP_HEAD_SPAN = .15, 1.05
+# Upright term: (1 + cos tilt) / 2 of the torso, counted only with the pelvis above GETUP_UPRIGHT_PELVIS (m), so a torso
+# propped up on the floor earns nothing.
+GETUP_UPRIGHT_PELVIS = .4
+# Standing (the bonus and its pose and stillness terms): head above GETUP_STAND_HEAD, torso tilt below GETUP_STAND_TILT,
+# pelvis above GETUP_STAND_PELVIS, both feet in contact (the lowest sole point below SOLE_CONTACT_HEIGHT).
+GETUP_STAND_HEAD, GETUP_STAND_TILT, GETUP_STAND_PELVIS = 1.15, math.radians(15.), .70
+# Pose term while standing: exp(−mean over the joints of (q − home)² / GETUP_POSE_STD²).
+GETUP_POSE_STD = .1
+# Joint limit term: the leg joints (hip, knee, ankle) beyond GETUP_SOFT_LIMIT of their range, centred (the last 5 % at
+# each end, Unitree's soft_joint_pos_limit_factor 0.9; the knee's lower one is then 0.061, task_config knee_floor's),
+# linear in the excess (rad), as legged_gym's dof_pos_limits. Getting up uses the knee to 2.5-2.85 (stop 2.88) and the
+# hip pitch to −2.3…−2.5 (stop −2.53) for a moment; resting on the stops costs.
+GETUP_SOFT_LIMIT = .9
+# Assist (HoST's "pull"): a vertical force GETUP_ASSIST_FORCE (N) on the pelvis, per world, while its projected gravity's
+# z is below GETUP_ASSIST_GRAVITY (tilt under ~37°); at each reset a world whose head stood above GETUP_ASSIST_HEAD (m)
+# on average over the last GETUP_ASSIST_SECONDS of its episode gets GETUP_ASSIST_STEP less, down to 0.
+GETUP_ASSIST_FORCE, GETUP_ASSIST_STEP = 200., 20.
+GETUP_ASSIST_GRAVITY, GETUP_ASSIST_HEAD, GETUP_ASSIST_SECONDS = -.8, 1., 2.
+# Success (evaluation, not the reward): up within GETUP_SUCCESS_WITHIN seconds (pelvis ≥ 0.70, head ≥ 1.20, tilt ≤ 15°,
+# both feet in contact), then GETUP_SUCCESS_HOLD seconds without leaving that pose (the feet may step).
+GETUP_SUCCESS_HEAD, GETUP_SUCCESS_WITHIN, GETUP_SUCCESS_HOLD = 1.20, 6., 3.
+
+
+def _module(value):
+    """torch for a tensor, numpy otherwise: the g1_getup functions run on both."""
+    return torch if isinstance(value, torch.Tensor) else np
+
+
+def _like(value, like):
+    """value (an array of the same module) in like's dtype."""
+    return value.to(like.dtype) if isinstance(like, torch.Tensor) else value.astype(like.dtype)
+
+
+def _constant(values, like):
+    """A constant vector in like's module, dtype and device."""
+    if isinstance(like, torch.Tensor):
+        return torch.as_tensor(values, dtype=like.dtype, device=like.device)
+    return np.asarray(values, dtype=like.dtype)
+
+
+def head_position(torso_position, torso_rotation):
+    """(n, 3) world position of the top of the head, torso + R·HEAD_TOP; torso_position (n, 3), torso_rotation (n, 3, 3)
+    world <- torso_link."""
+    return torso_position + (torso_rotation * _constant(HEAD_TOP, torso_rotation)[None, None, :]).sum(-1)
+
+
+def head_height(torso_position, torso_rotation):
+    """(n,) height (m) of the top of the head (head_position's z)."""
+    return head_position(torso_position, torso_rotation)[:, 2]
+
+
+def soft_limits(low, high, factor=GETUP_SOFT_LIMIT):
+    """(soft low, soft high) of joint ranges low, high: the middle ± factor/2 of the range."""
+    middle, half = (low + high) / 2, (high - low) / 2 * factor
+    return middle - half, middle + half
+
+
+def getup_standing(head, height, torso_rotation, sole_height):
+    """(n,) bool, the standing state of the bonus: head above GETUP_STAND_HEAD, torso tilt below GETUP_STAND_TILT, pelvis
+    above GETUP_STAND_PELVIS, both soles (sole_height (n, 2)) below SOLE_CONTACT_HEIGHT."""
+    return ((head > GETUP_STAND_HEAD) & (torso_rotation[:, 2, 2] > math.cos(GETUP_STAND_TILT))
+            & (height > GETUP_STAND_PELVIS) & (sole_height < SOLE_CONTACT_HEIGHT).all(-1))
+
+
+def getup_success_pose(head, height, torso_rotation, sole_height=None):
+    """(n,) bool, the evaluation's "up": pelvis ≥ GETUP_STAND_PELVIS, head ≥ GETUP_SUCCESS_HEAD, torso tilt ≤
+    GETUP_STAND_TILT and, given sole_height (n, 2), both feet in contact (without it: the hold after getting up, the feet
+    may step)."""
+    up = ((height >= GETUP_STAND_PELVIS) & (head >= GETUP_SUCCESS_HEAD)
+          & (torso_rotation[:, 2, 2] >= math.cos(GETUP_STAND_TILT)))
+    return up if sole_height is None else up & (sole_height < SOLE_CONTACT_HEIGHT).all(-1)
+
+
+def getup_reward_components(head, height, torso_rotation, velocity, position, home, soft_low, soft_high, limit_joints,
+                            sole_height, torque, joint_velocity, action, previous_action, weights=None):
+    """The g1_getup reward terms, each (n,), and the standing state (getup_standing), (n,) bool.
+    head: (n,) top of the head (head_height); height: (n,) pelvis height; torso_rotation: (n, 3, 3); velocity: (n, 6)
+    pelvis object velocity as reward_components'; position, joint_velocity, torque: (n, joints) after the step (the
+    torque the motors gave, ctrl); home, soft_low, soft_high: (joints,) (soft_limits of the joint ranges); limit_joints:
+    the joints of the limit term (the legs); sole_height: (n, 2) lowest sole point per foot; action, previous_action:
+    (n, joints) this step's applied action and the one before. weights: config.G1_GETUP_REWARD_WEIGHTS' keys.
+
+    head          w·clip((head − 0.15)/1.05, 0, 1)
+    upright       w·(1 + cos tilt)/2·[pelvis > 0.4]
+    stand         w·[standing]  (head > 1.15, tilt < 15°, pelvis > 0.70, both feet in contact)
+    stand_pose    w·[standing]·exp(−mean((q − home)²)/0.1²)
+    stand_still   −w·[standing]·‖v‖²  (pelvis linear velocity, m²/s²)
+    effort        −w·Στ²
+    joint_speed   −w·Σq̇²
+    action_change −w·Σ(a − a_prev)²
+    joint_limits  −w·Σ over limit_joints of the excess beyond the soft limits (rad)"""
+    weights = G1_GETUP_REWARD_WEIGHTS if weights is None else weights
+    xp = _module(head)
+    standing = getup_standing(head, height, torso_rotation, sole_height)
+    stand = _like(standing, head)
+    upright = (1 + torso_rotation[:, 2, 2]) / 2 * _like(height > GETUP_UPRIGHT_PELVIS, head)
+    pose = xp.exp(-((position - home) ** 2).mean(-1) / GETUP_POSE_STD ** 2)
+    joints = list(limit_joints)
+    excess = (xp.clip(position[:, joints] - soft_high[joints], 0, None)
+              + xp.clip(soft_low[joints] - position[:, joints], 0, None))
+    components = {
+        'head': weights['head'] * xp.clip((head - GETUP_HEAD_LOW) / GETUP_HEAD_SPAN, 0, 1),
+        'upright': weights['upright'] * upright,
+        'stand': weights['stand'] * stand,
+        'stand_pose': weights['stand_pose'] * stand * pose,
+        'stand_still': -weights['stand_still'] * stand * (velocity[:, 3:6] ** 2).sum(-1),
+        'effort': -weights['effort'] * (torque ** 2).sum(-1),
+        'joint_speed': -weights['joint_speed'] * (joint_velocity ** 2).sum(-1),
+        'action_change': -weights['action_change'] * ((action - previous_action) ** 2).sum(-1),
+        'joint_limits': -weights['joint_limits'] * excess.sum(-1),
+    }
+    return components, standing
+
+
+def assist_force(rotation, force):
+    """(n,) vertical force (N, upwards) on the pelvis this control step: each world's assist force (n,) while its pelvis
+    (rotation (n, 3, 3) world <- pelvis) is nearly upright, projected gravity z −R[2, 2] below GETUP_ASSIST_GRAVITY, else
+    0."""
+    xp = _module(force)
+    return xp.where(-rotation[:, 2, 2] < GETUP_ASSIST_GRAVITY, force, xp.zeros_like(force))
+
+
+def assist_update(force, head_mean):
+    """(n,) assist forces after a reset: GETUP_ASSIST_STEP less, not below 0, where the mean head height over the last
+    GETUP_ASSIST_SECONDS of the episode (head_mean (n,); NaN: the episode was shorter) was above GETUP_ASSIST_HEAD."""
+    xp = _module(force)
+    return xp.where(head_mean > GETUP_ASSIST_HEAD, xp.clip(force - GETUP_ASSIST_STEP, 0, None), force)
+
+
+def assist_resample(forces, n):
+    """(n,) assist forces for n worlds from saved ones (a stage's training_state): as they are for as many worlds, else
+    their sorted values at evenly spread quantiles, so the distribution carries over to another number of worlds."""
+    if len(forces) == n:
+        return forces
+    index = ((np.arange(n) + .5) * len(forces) / n).astype(np.int64)
+    if isinstance(forces, torch.Tensor):
+        return torch.sort(forces).values[torch.as_tensor(index, device=forces.device)]
+    return np.sort(forces)[index]

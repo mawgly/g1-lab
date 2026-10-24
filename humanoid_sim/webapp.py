@@ -65,12 +65,14 @@ def run_task(run_dir):
 
 def shown_geoms(model):
     """Geoms the browser draws, in model order: all but G1 foot_collision's capsules (hidden group 3, contact bit
-    FOOT_COLLISION_BIT). They sit between the feet's other geoms, so a race lane with them and one without would
-    otherwise shift every later transform onto the wrong mesh."""
-    from .tasks.g1_velocity import FOOT_COLLISION_BIT
-    return [i for i in range(model.ngeom) if not (
-        model.geom_group[i] == 3 and model.geom_contype[i] == FOOT_COLLISION_BIT
-        and model.geom_conaffinity[i] == FOOT_COLLISION_BIT)]
+    FOOT_COLLISION_BIT) and hand_collision's (group 3, named as HAND_CAPSULES). They sit between the other geoms of
+    their links, so a race lane with them and one without would otherwise shift every later transform onto the wrong
+    mesh."""
+    from .tasks.g1_velocity import FOOT_COLLISION_BIT, HAND_CAPSULES
+    hands = {f'{body.split("_")[0]}_hand_collision' for body in HAND_CAPSULES}
+    return [i for i in range(model.ngeom) if not model.geom_group[i] == 3 or not (
+        model.geom_contype[i] == FOOT_COLLISION_BIT and model.geom_conaffinity[i] == FOOT_COLLISION_BIT
+        or mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) in hands)]
 
 
 def model_geometry(model):

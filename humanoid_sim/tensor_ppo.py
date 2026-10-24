@@ -36,7 +36,9 @@ class TensorNormalize:
     def __init__(self, obs_shape, n_envs, device, gamma=.99, fixed=None):
         """fixed: (positions, mean, variance) of observation columns whose statistics are set, not estimated, or None:
         the task's fixed_normalization (G1 height_command / upper_body_slot terms, which a warm-started stage's 7e9
-        counted observations would never estimate). They stay at those values through every update and import."""
+        counted observations would never estimate; arm_blind's arm columns). They stay at those values through every
+        update and import; a NaN mean is the column's own, kept as initialised (0) or as the last import has it (G1
+        arm_blind: −z·ARM_BLIND_SCALE of warm_start.blind_arms)."""
         self.obs = RunningMoments(obs_shape, device)
         self.ret = RunningMoments((), device)
         self.returns = torch.zeros(n_envs, dtype=torch.float64, device=device)
@@ -44,12 +46,17 @@ class TensorNormalize:
         self.fixed = None if fixed is None else (
             torch.as_tensor(fixed[0], dtype=torch.long, device=device),
             *(torch.as_tensor(values, dtype=torch.float64, device=device) for values in fixed[1:]))
+        self._keep()
         self._freeze()
+
+    def _keep(self):
+        """The fixed columns' current means, which a NaN fixed mean keeps."""
+        self.kept = None if self.fixed is None else self.obs.mean[self.fixed[0]].clone()
 
     def _freeze(self):
         if self.fixed is not None:
             positions, mean, variance = self.fixed
-            self.obs.mean[positions] = mean
+            self.obs.mean[positions] = torch.where(mean.isnan(), self.kept, mean)
             self.obs.var[positions] = variance
 
     def observation(self, value, update=True):
@@ -67,6 +74,7 @@ class TensorNormalize:
 
     def import_normalizer(self, normalizer):
         self.obs.import_rms(normalizer.obs_rms)
+        self._keep()
         self._freeze()
         if normalizer.gamma == self.gamma:
             self.ret.import_rms(normalizer.ret_rms)

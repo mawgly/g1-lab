@@ -10,6 +10,12 @@ G1_REWARD_WEIGHTS = dict(velocity=2., forward=0., sideways=0., heading=0., yaw=1
                          hips=0., effort=1e-5, action_change=.01, fall=5.)
 # Values the browser form starts with for a new experiment.
 G1_RECOMMENDED = {**G1_REWARD_WEIGHTS, 'torso': 2.}
+# g1_getup weights (iteration 33, the critic's specification; tasks/g1_tensor_math.getup_reward_components): the task
+# (head height 1, torso upright 0.5), the standing state (bonus 1, pose 0.5, pelvis stillness), regularization always
+# (torques 2e-5, joint speeds 1e-4, action change as the walking recipe's 0.05, legs beyond the soft joint limits).
+# stand_still and joint_limits were not given numbers: 1 each, to be tuned by branches.
+G1_GETUP_REWARD_WEIGHTS = dict(head=1., upright=.5, stand=1., stand_pose=.5, stand_still=1., effort=2e-5,
+                               joint_speed=1e-4, action_change=.05, joint_limits=1.)
 G1_LABELS = dict(velocity='Следование скорости', forward='Скорость вперёд: чем быстрее, тем больше (до 4 м/с)',
                  sideways='Штраф за бег боком (боковая скорость таза)',
                  heading='Штраф за корпус, отвёрнутый от курса (бег наискось)', yaw='Следование повороту / курсу',
@@ -154,6 +160,19 @@ KNEE_FLOOR_RANGE = (0., 1.)
 # each other (iteration 23). Observations and actions are unchanged, the physics is not: its own model revision
 # (FOOT_COLLISION_SUFFIX), a stage moves there with warm_start.carry_over. False (missing) is the original model.
 FOOT_COLLISION_SUFFIX = '-footcol'
+# hand_collision (29-DoF G1, iteration 33): Unitree's hand capsules (unitree_rl_mjlab g1.xml left/right_hand_collision:
+# radius 0.035 on the wrist_yaw links; tasks/g1_velocity.HAND_CAPSULES) collide with the floor and the robot; ours had
+# no hand collision at all, so leaning on a hand rested on the wrist edge. Observations and actions are unchanged, the
+# physics is not: its own model revision (HAND_COLLISION_SUFFIX, after FOOT_COLLISION_SUFFIX), a stage moves there with
+# warm_start.carry_over. False (missing) is the original model.
+HAND_COLLISION_SUFFIX = '-handcol'
+# arm_blind (real robot only, iteration 31): the policy does not see its arms. The observation is unchanged; its arm
+# columns (joint angles, velocities and last actions of the shoulders, elbows and wrists, every history frame) keep a
+# fixed normalization that maps them onto one constant, the parent stage's own mean normalized arm inputs
+# (tasks/g1_tensor_math.ARM_BLIND_SCALE, G1VelocityEnv.fixed_normalization; written by warm_start.blind_arms,
+# scripts/lab/blind_branch.py), frozen in training. Same layout, different content: its own observation contract
+# (observation_schema …-armblind, ARM_BLIND_SUFFIX). False (missing) is the original task, bit for bit.
+ARM_BLIND_SUFFIX = '-armblind'
 G1_PARAMETERS = (
     dict(group=None, key='real_robot', label='Реальный робот: моторы, датчики и разброс Unitree', default=False,
          type='bool'),
@@ -218,6 +237,9 @@ G1_PARAMETERS = (
     dict(group=None, key='foot_collision', default=False, type='bool',
          label='Стопы сталкиваются друг с другом, как в модели Unitree (7 капсул на стопу; касание стоп идёт в штраф '
                'касания тела)'),
+    # Missing in a saved config means off (the hands touched nothing); a different model revision; 29-DoF only.
+    dict(group=None, key='hand_collision', default=False, type='bool',
+         label='Кисти сталкиваются с полом и телом, как в модели Unitree (капсула на кисть)'),
     # Real robot only; missing in a saved config means off. Observation terms after last_action: their own observation
     # contract (…-hcmd, …-ubslot); a stage moves there with warm_start.insert_terms.
     dict(group=None, key='height_command', default=False, type='bool',
@@ -226,6 +248,11 @@ G1_PARAMETERS = (
     dict(group=None, key='upper_body_slot', default=False, type='bool',
          label=('Место во входе под команду верха тела: 18 нулей (флаг и цели талии и рук), пока не '
                 'используется')),
+    # Real robot only; missing in a saved config means off (the policy saw its arms). Its own observation contract
+    # (…-armblind); a stage moves there with warm_start.blind_arms (scripts/lab/blind_branch.py).
+    dict(group=None, key='arm_blind', default=False, type='bool',
+         label=('Слепые руки: политика не видит углы, скорости и прошлые команды суставов рук (их входы — '
+                'постоянные числа этапа-родителя)')),
     dict(group=None, key='action_limit', label='Предел команды моторов (1 — прежний, 4 — почти весь ход суставов)',
          default=1., min=ACTION_LIMIT_RANGE[0], max=ACTION_LIMIT_RANGE[1]),
     *(dict(group='commands', key=key, label=G1_COMMAND_LABELS[key], default=G1_COMMANDS[key],
@@ -319,18 +346,19 @@ def g1_config(values):
     commands too). motor_friction missing or null means 0 (the motor model's friction as measured, every episode).
     height_command and upper_body_slot missing mean off (no such observation terms). arm_perturb_radians missing means
     ARM_PERTURB_RADIANS (the original arm poses), arm_perturb_contact_mask missing means off (arm contacts charged in a
-    perturbation segment too).
+    perturbation segment too). arm_blind missing means off (the policy saw its arms). hand_collision missing means off
+    (the hands touched nothing).
     """
     keys = {'reward_weights', 'heading_hold', 'commands', 'gait', 'action_limit', 'real_robot', 'critic_extras',
             'training_realism', 'history', 'stand_heading_hold', 'phase_stop', 'sole_contact', 'random_phase',
             'action_delay', 'arm_perturb', 'arm_perturb_radians', 'arm_perturb_contact_mask', 'lock_wrists',
             'knee_floor', 'force_push', 'feet_flat_stance', 'foot_collision', 'side_heading_hold', 'motor_friction',
-            'height_command', 'upper_body_slot'}
+            'height_command', 'upper_body_slot', 'arm_blind', 'hand_collision'}
     if not isinstance(values, dict) or set(values)-keys:
         raise ValueError('Unknown G1 task setting')
     for key in ('heading_hold', 'real_robot', 'critic_extras', 'stand_heading_hold', 'phase_stop', 'sole_contact',
                 'random_phase', 'arm_perturb_contact_mask', 'lock_wrists', 'feet_flat_stance', 'foot_collision',
-                'side_heading_hold', 'height_command', 'upper_body_slot'):
+                'side_heading_hold', 'height_command', 'upper_body_slot', 'arm_blind', 'hand_collision'):
         if type(values.get(key, False)) is not bool:
             raise ValueError(f'{key} must be true or false')
     if values.get('critic_extras') and not values.get('real_robot'):
@@ -381,7 +409,7 @@ def g1_config(values):
         raise ValueError('history requires real_robot')
     if values.get('phase_stop') and not real:
         raise ValueError('phase_stop requires real_robot')
-    for key in ('height_command', 'upper_body_slot'):  # terms of the deploy observation layout
+    for key in ('height_command', 'upper_body_slot', 'arm_blind'):  # about the deploy observation layout
         if values.get(key) and not real:
             raise ValueError(f'{key} requires real_robot')
     commands = g1_commands(values.get('commands'))
@@ -415,7 +443,9 @@ def g1_config(values):
             'side_heading_hold': values.get('side_heading_hold', True),
             'motor_friction': float(friction),
             'height_command': values.get('height_command', False),
-            'upper_body_slot': values.get('upper_body_slot', False)}
+            'upper_body_slot': values.get('upper_body_slot', False),
+            'arm_blind': values.get('arm_blind', False),
+            'hand_collision': values.get('hand_collision', False)}
 
 
 # Bumped when the real-robot physics or observation layout changes.
@@ -436,11 +466,14 @@ def g1_config_identity(identity, config):
                   + ('-phasestop' if config.get('phase_stop') else '')
                   + ('-hcmd' if config.get('height_command') else '')
                   + ('-ubslot' if config.get('upper_body_slot') else '')
+                  + (ARM_BLIND_SUFFIX if config.get('arm_blind') else '')
                   + (f'-critic{CRITIC_EXTRAS}' if config.get('critic_extras') else ''))
         identity = {**identity, 'observation_schema': f"{identity['task_id']}:{schema}",
                     'model_revision': hashlib.sha256(f"{identity['model_revision']}:{REAL_ROBOT_REVISION}".encode()).hexdigest()}
     if config.get('foot_collision'):  # contacts added, the same bodies, joints and layout (warm_start.carry_over)
         identity = {**identity, 'model_revision': f"{identity['model_revision']}{FOOT_COLLISION_SUFFIX}"}
+    if config.get('hand_collision'):  # likewise
+        identity = {**identity, 'model_revision': f"{identity['model_revision']}{HAND_COLLISION_SUFFIX}"}
     return identity
 
 

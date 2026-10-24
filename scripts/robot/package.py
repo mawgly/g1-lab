@@ -1,17 +1,30 @@
 """Robot package for the first G1 run on the hoist (CPU only): runs/humanoid_lab/robot/<name>/.
 
-Usage: .venv\\Scripts\\python.exe scripts\\robot\\package.py [--name NAME]
+Usage: .venv\\Scripts\\python.exe scripts\\robot\\package.py --candidate n8|n9|n10 [--name NAME]
 
+Three packages (PACKAGES):
+  n8   the first floor run: candidate 8 (main) and 7 (spare), one contract (ONNX obs [1, 490]), the g1_ctrl patches
+       without g1_ctrl-height.patch
+  n9   experimental, with the crouch: candidate 9 (exp-04f74e3838184b82 @ 7741440000, ONNX obs [1, 585]: the terms
+       height_command and upper_body_command of g1_ctrl-height.patch) and candidate 8 as the spare (the n8 package's
+       export, run on the g1_ctrl build without the height patch); every patch, apply_patches.sh --no-height for n8
+  n10  experimental, blind arms and the crouch: candidate 10 (exp-fa2450e3a6af4bf4 @ 8784248832, task_config
+       arm_blind: the 210 arm inputs are constants after the normalization inside policy.onnx; the same contract and
+       height patch as candidate 9) and candidate 8 as the spare, as in n9
 Puts together, for the person at the robot:
-  policy/      candidate 8 (main) and 7 (spare) as exported (policy.onnx + deploy.yaml), after checking they share one
-               contract (deploy.yaml equal but for comments; ONNX obs [1, 490] -> actions [1, 29]; locked wrists
-               exactly 0; actions within +-10; command ranges within the floor's -0.5..1 / +-0.5 / +-1)
-  patches/     every scripts/sim2sim/patches/g1_ctrl-*.patch, applied by apply_patches.sh in the order
-               scripts/sim2sim/setup.sh applies them (others after, by name), on unitree_rl_mjlab at setup.sh's commit
+  policy/      the candidates as exported (policy.onnx + deploy.yaml), after checking each one's contract (ONNX obs
+               [1, 490] or [1, 585] -> actions [1, 29]; the height terms with the patch's params; locked wrists exactly
+               0; actions within +-10; command ranges within the floor's -0.5..1 / +-0.5 / +-1; a blind-arm policy:
+               the ONNX property arm_blind, and random arm inputs leave the actions as they are) and that deploy.yaml
+               is the same for all but for comments and the height terms
+  patches/     scripts/sim2sim/patches/g1_ctrl-*.patch (g1_ctrl-height.patch only in a package with a height
+               policy), applied by apply_patches.sh in the order scripts/sim2sim/setup.sh applies them (others after,
+               by name), on unitree_rl_mjlab at setup.sh's commit
   tools/       the DDS recorder (scripts/sim2sim/probe), analyze.py and record_check.py (checks a robot recording)
   reference/   the hoist, FixStand and encoder probes (scripts/robot/reference, <probe>_<stage>.json per candidate),
-               REFERENCE.md: those tables and the sim2sim numbers of docs/sim2sim.md (each candidate's section)
-  PROTOCOL.md  docs/robot-first-run.md;  README.md;  install_policy.sh;  package.json;  MD5SUMS (md5sum -c)
+               REFERENCE.md: those tables and the sim2sim numbers of docs/sim2sim.md (each package's table)
+  PROTOCOL.md  docs/robot-first-run.md;  README.md;  install_policy.sh (with a height policy: checks the tree and
+               the build against the chosen policy);  package.json;  MD5SUMS (md5sum -c)
 Every copied file is checked against its source by md5. A rerun rebuilds the folder: built aside, then swapped in
 (only a folder this script made, by package.json, is replaced).
 """
@@ -42,26 +55,53 @@ KIND = 'g1-robot-package'
 LOCKED_WRISTS = (20, 21, 27, 28)
 KNEES = (3, 9)
 KNEE_FLOOR = 0.061
+# The height export's terms (task_config height_command / upper_body_slot), after last_action; only g1_ctrl with
+# HEIGHT_PATCH knows them. HEIGHT_PARAMS: deploy.yaml params of height_command (humanoid_sim.export_g1), the patch's
+# c = nominal + (nominal - lowest) min(0, ry), at least walking_lowest while the command's norm is walking_norm or
+# more (docs/robot-first-run.md, «Экспериментальный пакет №9 (присед)»). The patch gives upper_body_command
+# params.size zeros, 18 without it (the export writes params {}), so the term must be 18 long.
+HEIGHT_PATCH = 'g1_ctrl-height.patch'
+HEIGHT_TERMS = ('height_command', 'upper_body_command')
+HEIGHT_PARAMS = dict(nominal=0.78, lowest=0.64, walking_lowest=0.7, walking_norm=0.1)
+UPPER_BODY_SIZE = 18
+# task_config arm_blind (humanoid_sim.export_g1): joint_pos_rel, joint_vel_rel and last_action of the arm joints
+# (15-28, the policy's joint order = joint_ids_map), every history frame, are constants after the normalization in
+# policy.onnx; the ONNX property arm_blind says so. ARM_RANDOM: the ranges the arm inputs are drawn from in the check
+# (rad, rad/s, action), ARM_BLIND_TOL: the largest action change allowed (the export: ~1e-5, normalization scale 1e6).
+ARM_JOINTS = tuple(range(15, 29))
+ARM_RANDOM = dict(joint_pos_rel=1.2, joint_vel_rel=5.0, last_action=10.0)
+ARM_BLIND_TOL = 1e-4
+# docs/robot-first-run.md, step 2 (Velocity in the air, command 0): leg speed p95 and mean |Δa| above these are a stop
+AIR_LEG_P95 = 2.0
+AIR_DA = 0.03
 
-# Lead's decision, 23.10 after the bridge (docs/lab-knowledge.md, iteration 27, «Решение руководителя»; docs/sim2sim.md
-# «Этап 7221 (итерация 27)»): candidate 8 for the hoist and the floor, candidate 7 the spare. reference: the stage's
-# probe data in scripts/robot/reference (<probe>_<reference>.json); sim2sim: its section of docs/sim2sim.md
-# (SIM2SIM_TABLE's numbers).
-CANDIDATES = [
-    dict(label='n8', title='№8', role='основной', export='exp-28691193718e4d0e-7221510144', reference='7221',
-         sim2sim='## Этап 7221 (итерация 27)',
-         about='итерация 27: разброс трения суставов моторов U(0; 1,25) в обучении, стопы сталкиваются капсулами '
-               'Unitree; ветка №7 (итерация 24, от 6777,7) через итерации 25–26'),
-    dict(label='n7', title='№7', role='запасной', export='exp-c362df8e578148d0-6368231424', reference='6368',
-         sim2sim='## Этап 6368 (итерация 24)',
-         about='итерация 24: стопы сталкиваются капсулами Unitree с их трением; ветка от №6 через итерации 22–23'),
-]
-SIM2SIM_SECTIONS = tuple(c['sim2sim'] for c in CANDIDATES)
+# reference: the stage's probe data in scripts/robot/reference (<probe>_<reference>.json); sim2sim: its section of
+# docs/sim2sim.md; obs: its ONNX input; height: its export has HEIGHT_TERMS; protocol: its section of
+# docs/robot-first-run.md (height candidates); arm_blind: its export has task_config arm_blind.
+N10 = dict(label='n10', title='№10', export='exp-fa2450e3a6af4bf4-8784248832', reference='8784', obs=585, height=True,
+           arm_blind=True, sim2sim='## Этап 8784 (итерация 31, слепые руки, присед)',
+           protocol='Экспериментальный пакет №10 (слепые руки, присед)',
+           about='итерация 31: слепые руки — входы рук сведены нормировкой к постоянным (`arm_blind`), политика не '
+                 'видит своих рук; ветка от этапа 8333 ветки 30 (позы рук до ±1 рад в обучении), выросшей из ветки '
+                 '№9; присед, как у №9 (термы `height_command` и `upper_body_command`, нужен `g1_ctrl-height.patch`)')
+N9 = dict(label='n9', title='№9', export='exp-04f74e3838184b82-7741440000', reference='7741', obs=585, height=True,
+          sim2sim='## Этап 7741 (итерация 29, присед)', protocol='Экспериментальный пакет №9 (присед)',
+          about='итерация 29: команда высоты таза — присед правым стиком вниз (термы `height_command` и '
+                '`upper_body_command`, нужен `g1_ctrl-height.patch`), `max_std` 0,3; ветка от корня 28, выросшего '
+                'из №8')
+N8 = dict(label='n8', title='№8', export='exp-28691193718e4d0e-7221510144', reference='7221', obs=490, height=False,
+          sim2sim='## Этап 7221 (итерация 27)',
+          about='итерация 27: разброс трения суставов моторов U(0; 1,25) в обучении, стопы сталкиваются капсулами '
+                'Unitree; ветка №7 (итерация 24, от 6777,7) через итерации 25–26')
+N7 = dict(label='n7', title='№7', export='exp-c362df8e578148d0-6368231424', reference='6368', obs=490, height=False,
+          sim2sim='## Этап 6368 (итерация 24)',
+          about='итерация 24: стопы сталкиваются капсулами Unitree с их трением; ветка от №6 через итерации 22–23')
 REFERENCE_PROBES = ('hoist', 'fixstand_air', 'enc_bias')
 # docs/robot-first-run.md, item 9: on the floor only exports with `export_g1 --command-ranges -0.5 1 0.5 1`
 COMMAND_RANGES = dict(lin_vel_x=(-0.5, 1.0), lin_vel_y=(-0.5, 0.5), ang_vel_z=(-1.0, 1.0))
-# docs/sim2sim.md, the two sections above (unitree_mujoco + g1_ctrl in WSL2; 31 and 22 runs): (what, №8, №7).
-# «сеанс №8»: №7's numbers from its 14 runs in №8's session (in №8's section), for the rows its own section lacks.
+# Package n8: docs/sim2sim.md, the sections of №8 and №7 (unitree_mujoco + g1_ctrl in WSL2; 31 and 22 runs): (what,
+# №8, №7). «сеанс №8»: №7's numbers from its 14 runs in №8's session (in №8's section), for the rows its own section
+# lacks.
 SIM2SIM_TABLE = [
     ('Прогонов; падений', '31; 0', '22; 0 (и 14; 0 в сеансе №8)'),
     ('Задержка: состояние → первый шаг физики с новой целью, медиана / 95% / макс',
@@ -125,11 +165,188 @@ SIM2SIM_TABLE = [
     ('Запястья; входы в Velocity с нулевой целью', 'q20 = q27 = 0 («ни одного»); 0', 'q20 = q27 = 0 («ни одного»); 0'),
     ('Патч «падение → Passive» в этих прогонах', '0 срабатываний в 31', '0 срабатываний в 22'),
 ]
+# Package n9: docs/sim2sim.md «Этап 7741 (итерация 29, присед)» (24 runs on the g1_ctrl build with the height patch):
+# (what, №9, №8). №8's column: that section's table «7741 против 7701 и №8» and, for the rows it lacks, «Этап 7221
+# (итерация 27)» (SIM2SIM_TABLE above); «сеанс 7701»: №8's 4 runs in 7701's session («Этап 7701»), 3 of them on the
+# build with the height patch. The crouch: `--scenario crouch` (stand 5 s, 0.70 8 s, 0.64 8 s, up to 0.78 4 s, walk
+# 0.5 and 1 m/s at 0.70 10 s each, stop) and 30 s stands at 0.64 / 0.74; c from ry by the patch's rule (analyze.py).
+SIM2SIM_TABLE_N9 = [
+    ('Прогонов; падений', '24; 0', '31; 0 (и 4; 0 в сеансе 7701)'),
+    ('Сборка `g1_ctrl` (md5 в WSL)', 'четыре патча, с патчем высоты: `11b68aa1…`',
+     'три патча: `ef9039b0…` (в сеансе 7701 и на сборке с патчем высоты — те же числа)'),
+    ('Задержка: состояние → первый шаг физики с новой целью, медиана / 95% / макс',
+     '6 (в двух прогонах 4) / 10 (8–12) / 12–16 мс (в одном прогоне 22)',
+     '6 (в пяти прогонах 4) / 10 (в трёх 8, в одном 12) / 12–18 мс'),
+    ('lowstate пришёл → lowcmd с ответом (часы ВМ): медиана; 95%', '2,18–3,09 мс; 6,02–8,47 мс',
+     '2,31–3,28 мс; 5,55–8,61 мс'),
+    ('Прямо 0,5 м/с: скорость; увод после 2 с; курс за 10 с', '0,45 м/с; +0,007 / +0,005 рад/с; +2,2 / +2,0°',
+     '0,46–0,47 м/с; +0,032 / +0,034 / +0,037 рад/с; +17,2…+20,2°'),
+    ('За 10 с ходьбы 0,5 м/с: вперёд; вбок', '4,38 м; −0,06 / 0,00 м', '4,41–4,43 м; +0,64…+0,79 м'),
+    ('Стоп-старт (0,5 м/с 3 с, стоп 3 с) × 3: скорость; увод на ходу; стоп', '0,44–0,46 м/с; +0,007…+0,010 рад/с; 0,13 м',
+     '0,46–0,47 м/с; +0,035…+0,044 рад/с; 0,24–0,25 м'),
+    ('Прямо 1 м/с: скорость; увод; курс за 10 с', '0,97 м/с; +0,008 / +0,004 рад/с; +0,9° / 0,0°',
+     '0,99–1,00 м/с; +0,022 / +0,022 рад/с; +10,2° / +11,0°'),
+    ('Шаг вбок ±0,3 м/с: скорость; увод при шаге влево; вправо', '0,25–0,26 м/с; −0,004 / −0,006; +0,002 / 0,000',
+     '0,27–0,28 м/с; −0,007 / −0,008 / −0,005; +0,013 / +0,017 / +0,012'),
+    ('Шаг вбок ±0,5 м/с (предел стика deploy.yaml): скорость влево / вправо; увод при шаге влево; вправо',
+     '0,44–0,45 / 0,45 м/с; +0,007 / +0,010; +0,019 / +0,019 (курс +8,6…+8,8° за 10 с; в `sidestop` +0,015)',
+     '0,45 / 0,44 м/с; −0,002 / 0,000 / +0,004; +0,002 / +0,002 / +0,011'),
+    ('Стоп после шага вбок ±0,3 / ±0,5: сдвиг за 3 с; после 1-й с', '0,03–0,07 / 0,07–0,12 м; 0,7–2,2 см, рывков '
+     '(отхода ≥ 0,1 м) 0 из 12', '0,07–0,10 / 0,11–0,13 м; шага 0 из 17'),
+    ('Стоп после одного шага вбок (`sidestop`): отход за 5 с', 'влево / вправо 0,3: 1,5 / 1,3 см; влево / вправо 0,5: '
+     '2,5 / 1,0 см', 'влево 0,3 (5 прогонов): 4,6–6,4 см'),
+    ('Торможение за 3 с от стопа с 0,5 / 1 м/с', '0,13–0,16 / 0,30–0,31 м', '0,23–0,26 / 0,45–0,52 м'),
+    ('После стопа: сдвиг после 1-й с, с 0,5 / 1 м/с', '0,9–1,7 / 6,2–6,3 см', '9,0–9,8 / 7,1–7,7 см (таз уходит '
+     'вперёд над стопами; в 1 из 30 стопов два шага назад)'),
+    ('Стоя после ленты, рысканье по секундам 1–5, рад/с (медиана)', '−0,011 −0,004 −0,004 −0,004 −0,003',
+     '−0,001 −0,011 −0,010 −0,010 −0,010'),
+    ('Стояние 30 с: поворот; смещение', '−3,5° / −4,0° / −4,6° (3 прогона); 3–6 см, после 2-й с 0',
+     '−8,0° / −8,1° / −7,3° (3 прогона); 2 см; без шага'),
+    ('Колено стоя, левое / правое; цель на границе clip', '+18,7…+19,4° / +18,1…+19,8°; стоя ни разу, на ходу 0–1%',
+     '+3,5…+5,5° / +1,5…+3,5°; левое 0–60%, правое 0–8%'),
+    ('Колено на ходу 0,5 / 1 м/с', '+44…+46° / +48…+49°', '+30,5…+30,8° / +38,2…+39,2°'),
+    ('Таз стоя / на ходу не ниже: 0,5 / 1 м/с', '0,780–0,782 / 0,750 / 0,730 м', '0,789 / 0,767 / 0,744 м'),
+    ('Толчки стоя (сила на таз 0,1 с), падений: Δv 1 / 1,25 м/с', '0 из 4 / 0 из 8',
+     '0 из 8 / 0 из 20 (и Δv 0,5 / 1,5 — 0 из 8 / 0 из 8)'),
+    ('Толчки стоя Δv 1,25: скорость таза; таз не ниже; наклон до; успокоение', '1,68–2,00 м/с; 0,693 м; 7°; 0,46–0,74 с',
+     '1,56–2,13 м/с; 0,717 м; 10°; 0,44–0,76 с'),
+    ('Толчки на ходу 0,5 м/с, падений: Δv 0,5 / 1 м/с', 'в связке не мерили', '0 из 4 / 0 из 4'),
+    ('Поворот ±0,5 рад/с: на месте; на ходу 0,5 м/с', 'в связке не мерили', '+0,449 / −0,514; +0,418 / −0,436 рад/с'),
+    ('Стопы при боковых толчках стоя Δv 1–1,5 (поза из логов в нашей модели с капсулами Unitree): капсулы '
+     'перекрылись бы; ноги накрест', 'не мерили', '3 из 18, по 1 такту; 0 из 18 (ширина не меньше +0,9 см)'),
+    ('Цели вне clip по всем 29 суставам (сообщения lowcmd в Velocity)', '0 из 554 732; цель колена ни разу ниже 0,061',
+     '0 из 719 902 (и 0 из 76 357 в сеансе 7701)'),
+    ('Вход в Velocity: первое сообщение уже с целью политики; скачок цели', 'в 4 из 24 входов; 0,19–0,31 рад',
+     'бывало; 0,24–0,35 рад'),
+    ('Запястья; патч «падение → Passive»', '«ни одного»; 0 срабатываний в 24', 'q20 = q27 = 0 («ни одного»); 0 '
+     'срабатываний в 31'),
+    ('Присед стоя на 0,70 / 0,64 (по 8 с): таз за последние 2 с', '0,690 / 0,662 м (наша физика 0,689 / 0,664)',
+     '— (команды высоты нет)'),
+    ('Подъём к 0,78 за 4 с: таз', '0,776 м', '—'),
+    ('Ходьба 0,5 м/с на 0,70: скорость; таз; увод; курс за 10 с', '0,42–0,43 м/с; 0,696 м; −0,020 / −0,018 рад/с (стик '
+     'высоты до упора: −0,022); −9,4…−13,2°', '—'),
+    ('Ходьба 1 м/с на 0,70: скорость; таз; увод; курс за 10 с', '0,90 м/с; 0,697–0,698 м; −0,007 / −0,006 рад/с; '
+     '−3,1 / −3,5°', '—'),
+    ('Ходьба в приседе: таз не ниже; колени; цель колена на границе clip', '0,688–0,692 м; +68,0…+69,6°; ни разу', '—'),
+    ('Стик высоты до упора на ходу (ry −1, c по стику 0,64)', 'c = 0,700 (предел патча на ходу)', '—'),
+    ('Стоп после хода 1 м/с на 0,70 (оба стика отпущены вместе)', '0,37–0,38 м за 3 с, таз обратно к 0,783', '—'),
+    ('Стоя 30 с на 0,64: таз; курс', '0,660 м; −17,5° (ровно −0,009 рад/с; копия связки −14,8°)', '—'),
+    ('Стоя 30 с на 0,74: таз; курс', 'сначала 0,716–0,718, через ~14 с сам к 0,745; +3,2° (копия +2,2°)', '—'),
+    ('Терм высоты в `g1_ctrl` = `analyze.py`: шаги, где воспроизведённая цель совпала с `lowcmd`',
+     'в приседе 86–99% с c по стику, 0–1 шаг с c = 0,78', '—'),
+]
+# Package n10: docs/sim2sim.md «Этап 8784 (итерация 31, слепые руки, присед)» (24 runs on the g1_ctrl build with the
+# height patch, the set of 7741's session): (what, №10, №8). №8's column as in SIM2SIM_TABLE_N9 (that section's table
+# «8784 против 7741 и №8» and «Этап 7221 (итерация 27)»). The last two rows are not the bridge: scripts/lab/probes/
+# arm_probe.py and the hoist probe (scripts/robot/reference/hoist.py, per second in that section).
+SIM2SIM_TABLE_N10 = [
+    ('Прогонов; падений', '24; 0', '31; 0 (и 4; 0 в сеансе 7701)'),
+    ('Сборка `g1_ctrl` (md5 в WSL)', 'четыре патча, с патчем высоты: `11b68aa1…`',
+     'три патча: `ef9039b0…` (в сеансе 7701 и на сборке с патчем высоты — те же числа)'),
+    ('Задержка: состояние → первый шаг физики с новой целью, медиана / 95% / макс',
+     '6 (в трёх прогонах 4, в трёх стояниях 30 с 10–12) / 10 (в одном 8, в четырёх стояниях 16–18) / 12–20 мс (в '
+     'стояниях 22–26)', '6 (в пяти прогонах 4) / 10 (в трёх 8, в одном 12) / 12–18 мс'),
+    ('lowstate пришёл → lowcmd с ответом (часы ВМ): медиана; 95%',
+     '2,28–3,32 мс (в трёх стояниях 30 с 6,85–8,10); 5,46–7,78 мс (в четырёх стояниях 13,10–14,64)',
+     '2,31–3,28 мс; 5,55–8,61 мс'),
+    ('Прямо 0,5 м/с: скорость; увод после 2 с; курс за 10 с', '0,48 м/с; −0,002 / −0,002 рад/с; −1,6 / −2,4°',
+     '0,46–0,47 м/с; +0,032 / +0,034 / +0,037 рад/с; +17,2…+20,2°'),
+    ('За 10 с ходьбы 0,5 м/с: вперёд; вбок', '4,67–4,68 м; −0,22 / −0,26 м', '4,41–4,43 м; +0,64…+0,79 м'),
+    ('Стоп-старт (0,5 м/с 3 с, стоп 3 с) × 3: скорость; увод на ходу; стоп', '0,48 м/с; −0,004…+0,002 рад/с; 0,23 м',
+     '0,46–0,47 м/с; +0,035…+0,044 рад/с; 0,24–0,25 м'),
+    ('Прямо 1 м/с: скорость; увод; курс за 10 с', '1,04 м/с; −0,019 / −0,024 рад/с; −11,0° / −14,2°',
+     '0,99–1,00 м/с; +0,022 / +0,022 рад/с; +10,2° / +11,0°'),
+    ('Шаг вбок ±0,3 м/с: скорость; увод при шаге влево; вправо',
+     '0,26 / 0,28 м/с; −0,004 / −0,003; +0,017 / +0,013 (курс +7,1…+10,0° за 10 с; в `sidestop` +0,009)',
+     '0,27–0,28 м/с; −0,007 / −0,008 / −0,005; +0,013 / +0,017 / +0,012'),
+    ('Шаг вбок ±0,5 м/с (предел стика deploy.yaml): скорость влево / вправо; увод при шаге влево; вправо',
+     '0,43 / 0,46 м/с; −0,002 / −0,001 (в `sidestop` +0,003); +0,002 / 0,000 (в `sidestop` −0,001)',
+     '0,45 / 0,44 м/с; −0,002 / 0,000 / +0,004; +0,002 / +0,002 / +0,011'),
+    ('Стоп после шага вбок ±0,3 / ±0,5: сдвиг за 3 с; после 1-й с', '0,05–0,09 / 0,10–0,13 м; 1,1–2,2 см, рывков '
+     '(отхода ≥ 0,1 м) 0 из 12', '0,07–0,10 / 0,11–0,13 м; шага 0 из 17'),
+    ('Стоп после одного шага вбок (`sidestop`): отход за 5 с', 'влево / вправо 0,3: 1,8 / 1,7 см; влево / вправо 0,5: '
+     '2,2 / 1,7 см', 'влево 0,3 (5 прогонов): 4,6–6,4 см'),
+    ('Торможение за 3 с от стопа с 0,5 / 1 м/с', '0,19 (в стоп-старте 0,23) / 0,50–0,51 м', '0,23–0,26 / 0,45–0,52 м'),
+    ('После стопа: сдвиг после 1-й с, с 0,5 / 1 м/с', '2,2–2,3 (в стоп-старте 4,5–4,8) / 6,3–7,0 см',
+     '9,0–9,8 / 7,1–7,7 см (таз уходит вперёд над стопами; в 1 из 30 стопов два шага назад)'),
+    ('Стоя после ленты, рысканье по секундам 1–5, рад/с (медиана)', '−0,003 −0,002 −0,001 −0,001 0,000',
+     '−0,001 −0,011 −0,010 −0,010 −0,010'),
+    ('Стояние 30 с: поворот; смещение', '+2,3° / +1,9° / +3,5° (3 прогона); 3 см, после 2-й с 1 см',
+     '−8,0° / −8,1° / −7,3° (3 прогона); 2 см; без шага'),
+    ('Колено стоя, левое / правое; цель на границе clip', '+16,6…+17,3° / +19,9…+20,9°; стоя и на ходу 0%',
+     '+3,5…+5,5° / +1,5…+3,5°; левое 0–60%, правое 0–8%'),
+    ('Колено на ходу 0,5 / 1 м/с', '+49,5…+50,2° / +51,7…+52,5°', '+30,5…+30,8° / +38,2…+39,2°'),
+    ('Таз стоя / на ходу не ниже: 0,5 / 1 м/с', '0,778–0,781 / 0,736 / 0,716 м', '0,789 / 0,767 / 0,744 м'),
+    ('Толчки стоя (сила на таз 0,1 с), падений: Δv 1 / 1,25 м/с', '0 из 4 / 0 из 8',
+     '0 из 8 / 0 из 20 (и Δv 0,5 / 1,5 — 0 из 8 / 0 из 8)'),
+    ('Толчки стоя Δv 1,25: скорость таза; таз не ниже; наклон до; успокоение', '1,65–1,95 м/с; 0,702 м; 8°; 0,46–0,84 с',
+     '1,56–2,13 м/с; 0,717 м; 10°; 0,44–0,76 с'),
+    ('Толчки на ходу 0,5 м/с, падений: Δv 0,5 / 1 м/с', 'в связке не мерили (копия связки, Δv 0,75–1,25: 0 из 144)',
+     '0 из 4 / 0 из 4'),
+    ('Поворот ±0,5 рад/с: на месте; на ходу 0,5 м/с', 'в связке не мерили', '+0,449 / −0,514; +0,418 / −0,436 рад/с'),
+    ('Стопы при боковых толчках стоя Δv 1–1,5 (поза из логов в нашей модели с капсулами Unitree): капсулы '
+     'перекрылись бы; ноги накрест', 'не мерили (копия связки с капсулами, вбок Δv 1 / 1,25: перекрытие в 0 из 16)',
+     '3 из 18, по 1 такту; 0 из 18 (ширина не меньше +0,9 см)'),
+    ('Цели вне clip по всем 29 суставам (сообщения lowcmd в Velocity)', '0 из 553 620; цель колена ни разу ниже 0,061',
+     '0 из 719 902 (и 0 из 76 357 в сеансе 7701)'),
+    ('Вход в Velocity: первое сообщение уже с целью политики; скачок цели', 'в 3 из 24 входов; 0,19–0,27 рад',
+     'бывало; 0,24–0,35 рад'),
+    ('Запястья; патч «падение → Passive»', '«ни одного»; 0 срабатываний в 24', 'q20 = q27 = 0 («ни одного»); 0 '
+     'срабатываний в 31'),
+    ('Присед стоя на 0,70 / 0,64 (по 8 с): таз за последние 2 с', '0,684–0,685 / 0,659 м (наша физика 0,684 / 0,660)',
+     '— (команды высоты нет)'),
+    ('Подъём к 0,78 за 4 с: таз', '0,776 м', '—'),
+    ('Ходьба 0,5 м/с на 0,70: скорость; таз; увод; курс за 10 с', '0,45 м/с; 0,695–0,696 м; −0,017 / −0,015 рад/с (стик '
+     'высоты до упора: −0,013); −6,2…−9,2°', '—'),
+    ('Ходьба 1 м/с на 0,70: скорость; таз; увод; курс за 10 с', '0,95 м/с; 0,684–0,685 м; +0,013 / +0,018 рад/с; '
+     '+8,5 / +11,5°', '—'),
+    ('Ходьба в приседе: таз не ниже; колени; цель колена на границе clip', '0,675–0,689 м; +69,5…+70,4°; ни разу', '—'),
+    ('Стик высоты до упора на ходу (ry −1, c по стику 0,64)', 'c = 0,700 (предел патча на ходу)', '—'),
+    ('Стоп после хода 1 м/с на 0,70 (оба стика отпущены вместе)', '0,43–0,45 м за 3 с, таз обратно к 0,782', '—'),
+    ('Стоя 30 с на 0,64: таз; курс', '0,658–0,660 м; **−22,5°** (−0,027 рад/с первые 2 с, к 30-й с −0,005; копия '
+     'связки −10,8°)', '—'),
+    ('Стоя 30 с на 0,74: таз; курс', 'сначала 0,769, к 30-й с медленно садится до 0,720; **−19,2°** (копия −15,9°)',
+     '—'),
+    ('Терм высоты в `g1_ctrl` = `analyze.py`: шаги, где воспроизведённая цель совпала с `lowcmd`',
+     'в приседе 84–99% с c по стику, 0–1 шаг с c = 0,78', '—'),
+    ('Не связка. Позы рук ±1,0 рад (`arm_probe`, наша физика)', 'стоя 6 из 6 (курс ≤ 4°, уползание ≤ 0,04 м), увод '
+     '0,004 / 0,021 рад/с на 0,5 / 1 м/с; ONNX от входов рук не зависит', 'на 1 м/с сбавляет до 0,31 м/с; уже при '
+     '0,4 рад увод 0,053 (итерация 30)'),
+    ('Не связка. В воздухе на тросе, команда 0 (проба подвеса, наша физика и `unitree_mujoco`)',
+     '**первые 3–4 с спокоен, с 4–5-й с ноги шагают в воздухе**: p95 за секунду 6–17 рад/с, касание себя до '
+     '100–300 Н (в приседе до 1380 Н); опускание, начатое не позже 2 с после входа в Velocity, — спокойно',
+     'спокоен: p95 0,4–0,6 рад/с'),
+]
+# Lead's decisions: 23.10 after the bridge (docs/lab-knowledge.md, iteration 27, «Решение руководителя»; docs/sim2sim.md
+# «Этап 7221 (итерация 27)»): candidate 8 for the hoist and the floor, candidate 7 the spare; 24.10 after the bridge
+# (docs/sim2sim.md «Этап 7741 (итерация 29, присед)», commit fe7e917): 7741 passes every criterion, candidate 9 goes
+# into an experimental package with the crouch, tried only after the first run of candidate 8 went well; candidate 8
+# stays the main one for the first floor run and is the spare there; 24.10 after the bridge (docs/sim2sim.md «Этап 8784
+# (итерация 31, слепые руки, присед)»): candidate 10 (blind arms) gets its own experimental package, candidate 8 the
+# spare, as in n9. The first candidate is the package's main one.
+PACKAGES = {
+    'n8': dict(candidates=[dict(N8, role='основной'), dict(N7, role='запасной')], table=SIM2SIM_TABLE,
+               table_note='«Сеанс №8» в столбце №7 — его 14 прогонов в одном сеансе с №8\n(из раздела №8) там, где в '
+                          'его собственном разделе такого замера нет.'),
+    'n9': dict(candidates=[dict(N9, role='экспериментальный'), dict(N8, role='запасной')], table=SIM2SIM_TABLE_N9,
+               table_note='Столбец №8 — из таблицы «7741 против 7701 и №8» раздела №9 и из раздела №8; «сеанс 7701» —\n'
+                          '4 прогона №8 в сеансе 7701 («Этап 7701 (итерация 29, присед)»), 3 из них на сборке с патчем '
+                          'высоты.\nПрисед — отрезки `--scenario crouch` и стояния 30 с в приседе; c — по правилу патча '
+                          'высоты из `ry`\n(`analyze.py`).'),
+    'n10': dict(candidates=[dict(N10, role='экспериментальный'), dict(N8, role='запасной')], table=SIM2SIM_TABLE_N10,
+                table_note='Столбец №8 — из таблицы «8784 против 7741 и №8» раздела №10 и из раздела №8; «сеанс 7701» —\n'
+                           '4 прогона №8 в сеансе 7701 («Этап 7701 (итерация 29, присед)»), 3 из них на сборке с патчем '
+                           'высоты.\nПрисед — отрезки `--scenario crouch` и стояния 30 с в приседе; c — по правилу патча '
+                           'высоты из `ry`\n(`analyze.py`). Две последние строки — не связка: проба поз рук '
+                           '(`scripts/lab/probes/arm_probe.py`)\nи проба подвеса (раздел «Подвес в симуляции» ниже).'),
+}
 HOIST_PLANS = dict(air5='в воздухе, стопы 5 см над полом', air15='в воздухе, стопы 15 см над полом',
                    half='стопы на полу, трос натянут', lower='опускание из Velocity',
-                   slack='FixStand и Velocity на полу, провис троса 5 см', floor='без троса')
+                   slack='FixStand и Velocity на полу, провис троса 5 см', floor='без троса',
+                   air5_crouch='в воздухе, стопы 5 см над полом, присед')
 HOIST_SEGMENTS = dict(stand='стоять (команда 0)', walk='идти 0,5 м/с', hang='висеть (команда 0)',
-                      pay='трос отпускают 2 см/с', stop='стоп')
+                      pay='трос отпускают 2 см/с', stop='стоп', crouch70='присед на 0,70 (команда 0)',
+                      crouch64='присед на 0,64 (команда 0)', rise='подъём к 0,78 (команда 0)')
 PHYSICS = dict(ours='наша', um='unitree_mujoco')
 
 
@@ -176,7 +393,17 @@ def patch_lines(path):
 
 
 def deploy_body(path):
-    return [line for line in path.read_text(encoding='utf-8').splitlines() if not line.lstrip().startswith('#')]
+    """deploy.yaml's lines without comments and without the blocks of HEIGHT_TERMS (keys indented by 2 under
+    observations): what every candidate of a package must share."""
+    out, skip = [], False
+    for line in path.read_text(encoding='utf-8').splitlines():
+        if line.lstrip().startswith('#'):
+            continue
+        if re.match(r'^ {0,2}\S', line):
+            skip = line.strip().rstrip(':') in HEIGHT_TERMS
+        if not skip:
+            out.append(line)
+    return out
 
 
 def check_export(candidate):
@@ -192,8 +419,28 @@ def check_export(candidate):
     terms = deploy['observations']
     obs_size = sum(len(t['scale']) * int(t.get('history_length', 1)) for t in terms.values())
     problems = []
-    if obs_size != 490:
-        problems.append(f'вход наблюдений {obs_size}, а не 490')
+    if obs_size != candidate['obs']:
+        problems.append(f"вход наблюдений {obs_size}, а не {candidate['obs']}")
+    height = None
+    if candidate['height']:
+        names = list(terms)
+        if names[-len(HEIGHT_TERMS):] != list(HEIGHT_TERMS):
+            problems.append(f'последние термы {names[-len(HEIGHT_TERMS):]}, а не {list(HEIGHT_TERMS)}')
+        else:
+            command, upper = (terms[name] for name in HEIGHT_TERMS)
+            params = {key: float(value) for key, value in (command.get('params') or {}).items()}
+            if params != HEIGHT_PARAMS:
+                problems.append(f'params height_command {params}, а патч и протокол ждут {HEIGHT_PARAMS}')
+            if len(command['scale']) != 1:
+                problems.append(f"height_command длины {len(command['scale'])}, а не 1")
+            size = int((upper.get('params') or {}).get('size', UPPER_BODY_SIZE))
+            if len(upper['scale']) != UPPER_BODY_SIZE or size != UPPER_BODY_SIZE:
+                problems.append(f"upper_body_command длины {len(upper['scale'])} (params.size {size}), а патч отдаёт "
+                                f'{UPPER_BODY_SIZE}')
+            height = dict(params=params, history=[int(terms[n].get('history_length', 1)) for n in HEIGHT_TERMS],
+                          upper_body=len(upper['scale']))
+    elif any(name in terms for name in HEIGHT_TERMS):
+        problems.append(f'термы высоты {[n for n in HEIGHT_TERMS if n in terms]} у кандидата без высоты')
     if float(deploy['step_dt']) != 0.02:
         problems.append(f"step_dt {deploy['step_dt']}")
     if not np.allclose(clip[list(KNEES), 0], KNEE_FLOOR):
@@ -204,34 +451,67 @@ def check_export(candidate):
         if r is None or float(r[0]) < lo or float(r[1]) > hi:
             problems.append(f'диапазон команды {key} {r}, а для пола нужен в [{lo:g}, {hi:g}] '
                             '(export_g1 --command-ranges -0.5 1 0.5 1)')
-    onnx = onnx_contract(folder / 'policy.onnx')
-    if onnx['input'] != ['obs', [1, 490]] or onnx['output'] != ['actions', [1, 29]]:
+    blind = bool(candidate.get('arm_blind'))
+    onnx = onnx_contract(folder / 'policy.onnx', candidate['obs'], arms=arm_columns(terms) if blind else None)
+    if onnx['input'] != ['obs', [1, candidate['obs']]] or onnx['output'] != ['actions', [1, 29]]:
         problems.append(f"ONNX {onnx['input']} -> {onnx['output']}")
     if not onnx['wrists_zero']:
         problems.append('ONNX: выходы запястий 20, 21, 27, 28 не равны 0')
     if not onnx['finite'] or onnx['max_abs'] > 10:
         problems.append(f"ONNX: выход вне ±10 (макс {onnx['max_abs']})")
+    if onnx['arm_blind'] != blind:
+        problems.append(f"ONNX: свойство arm_blind {onnx['arm_blind']}, а кандидат {'со' if blind else 'без'} слепыми "
+                        'руками')
+    if blind and not onnx['arm_change'] <= ARM_BLIND_TOL:
+        problems.append(f"ONNX: случайные входы рук меняют действие на {onnx['arm_change']:.2e} (> {ARM_BLIND_TOL:g}): "
+                        'руки не слепые')
     if problems:
         fail(f"{candidate['export']}: " + '; '.join(problems))
     comments = [line for line in (folder / 'deploy.yaml').read_text(encoding='utf-8').splitlines()
                 if line.lstrip().startswith('#')]
     return dict(folder=folder, stage=m.group(1).lstrip('0') if m else None, onnx=onnx,
                 knee_clip=clip[list(KNEES), 0].tolist(), comments=comments,
-                command_ranges={k: ranges[k] for k in COMMAND_RANGES})
+                command_ranges={k: ranges[k] for k in COMMAND_RANGES}, height_terms=height)
 
 
-def onnx_contract(path, n=64):
-    """Input / output names and shapes; on n random observations (scales 0.1-10): locked wrists exactly 0,
-    finite actions within the action limit."""
+def arm_columns(terms):
+    """deploy.yaml's observation layout (terms in order, each its history_length frames, oldest first): the ONNX input
+    columns of the arm joints (ARM_JOINTS) in each ARM_RANDOM term, every frame."""
+    columns, start = {}, 0
+    for name, term in terms.items():
+        size, history = len(term['scale']), int(term.get('history_length', 1))
+        if name in ARM_RANDOM:
+            columns[name] = [start + f * size + j for f in range(history) for j in ARM_JOINTS]
+        start += size * history
+    return columns
+
+
+def onnx_contract(path, size, n=64, arms=None, draws=5):
+    """Input / output names and shapes; on n random observations of `size` (scales 0.1-10): locked wrists exactly 0,
+    finite actions within the action limit. The ONNX property arm_blind; with `arms` (arm_columns), the largest action
+    change when the arm columns of each observation are drawn anew `draws` times (U(+-ARM_RANDOM))."""
     import onnxruntime
     session = onnxruntime.InferenceSession(str(path), providers=['CPUExecutionProvider'])
     i, o = session.get_inputs()[0], session.get_outputs()[0]
     rng = np.random.default_rng(0)
-    obs = (rng.normal(size=(n, 490)) * rng.choice([0.1, 1., 10.], size=(n, 1))).astype(np.float32)
-    out = np.concatenate([session.run(None, {i.name: x[None]})[0] for x in obs])
+    obs = (rng.normal(size=(n, size)) * rng.choice([0.1, 1., 10.], size=(n, 1))).astype(np.float32)
+    act = lambda x: session.run(None, {i.name: x[None]})[0]
+    out = np.concatenate([act(x) for x in obs])
+    meta = session.get_modelmeta().custom_metadata_map
+    arm_change = None
+    if arms:
+        arm_change = 0.
+        for x, a in zip(obs, out):
+            for _ in range(draws):
+                changed = x.copy()
+                for term, cols in arms.items():
+                    changed[cols] = rng.uniform(-ARM_RANDOM[term], ARM_RANDOM[term], len(cols))
+                arm_change = max(arm_change, float(np.abs(act(changed)[0] - a).max()))
     return dict(input=[i.name, list(i.shape)], output=[o.name, list(o.shape)], samples=n,
                 wrists_zero=bool(np.all(out[:, list(LOCKED_WRISTS)] == 0)), finite=bool(np.all(np.isfinite(out))),
-                max_abs=float(np.abs(out).max()))
+                max_abs=float(np.abs(out).max()), arm_blind=meta.get('arm_blind') == 'true',
+                arm_inputs=sum(len(c) for c in arms.values()) if arms else None, arm_draws=draws if arms else None,
+                arm_change=arm_change)
 
 
 def git_state():
@@ -312,6 +592,17 @@ def segments(data, plans, names):
     return [s for r in data if r['plan'] in plans for s in r['segs'] if s['name'] in names]
 
 
+def air_calm(segs):
+    """Step 2's stop thresholds over hoist segments: leg speed p95 and mean |Δa| within them."""
+    return max(s['qv_leg_p95'] for s in segs) <= AIR_LEG_P95 and max(s['da'] for s in segs) <= AIR_DA
+
+
+def calm_in_air(data):
+    """Hanging in Velocity at command 0 (feet 5 / 15 cm up, and the 3 s before the lowering) within step 2's
+    thresholds; iteration 31's stages start stepping in the air after 4-5 s."""
+    return air_calm(segments(data, ('air5', 'air15'), ('stand',)) + segments(data, ('lower',), ('hang',)))
+
+
 def hoist_summary(data):
     """The critic's conclusions from the hoist probe (iteration 21), with the numbers of this stage's data."""
     air = segments(data, ('air5', 'air15'), ('stand',)) + segments(data, ('lower',), ('hang',))
@@ -325,10 +616,34 @@ def hoist_summary(data):
     walks = segments(data, ('lower', 'slack'), ('walk',))  # from the anchor over the start: xy is the distance
     self_air = max(s['self_max'] for s in air)
     falls = sum(r['fell_at'] is not None for r in lower)
+    crouch = segments(data, ('air5_crouch',), ('crouch70', 'crouch64'))
+    rise = segments(data, ('air5_crouch',), ('rise',))
+    # step 2's stop thresholds: a stage that steps in the air (iteration 31) gets that said, not «спокоен»
+    limits = f'порогов шага 2 (p95 {AIR_LEG_P95:g} рад/с, |Δa| {AIR_DA:g})'
+    crouch_self = max(s['self_max'] for s in crouch) if crouch else 0
+    crouch_line = [
+        f"присед в воздухе (команда 0, c 0,70 и 0,64 по 8 с): скорость ног p95 {span(s['qv_leg_p95'] for s in crouch)} "
+        f"рад/с (при подъёме к 0,78 до {max(s['qv_leg_max'] for s in rise):.1f}), |Δa| "
+        f"{span((s['da'] for s in crouch), '{:.4f}')}, Σ|τ| ног {span((s['tau_leg_mean'] for s in crouch), '{:.0f}')} Н·м "
+        f"в среднем (пик {max(s['tau_leg_max'] for s in crouch):.0f}), целей на границе `clip` "
+        f"{span(s['at_lim'] * 29 for s in crouch)} из 29, наклон до {max(s['tilt_max'] for s in crouch):.1f}°"
+        + (' — в пределах порогов шага 2.' if air_calm(crouch) else
+           f', касание себя до {crouch_self:.0f} Н — выше {limits}: ноги шагают в воздухе.')
+    ] if crouch else []
+    if calm_in_air(data):
+        first = (f"в воздухе при команде 0 робот спокоен: скорость ног p95 {span(s['qv_leg_p95'] for s in air)} "
+                 f"рад/с (на входе в Velocity до {max(s['qv_leg_max'] for s in air):.1f}), |Δa| "
+                 f"{span((s['da'] for s in air), '{:.4f}')}, ")
+    else:
+        hang = segments(data, ('lower',), ('hang',))
+        long = segments(data, ('air5', 'air15'), ('stand',))
+        first = (f"в воздухе при команде 0 робот не спокоен: первые 3 с (опускание из Velocity, «висеть») скорость ног "
+                 f"p95 {span(s['qv_leg_p95'] for s in hang)} рад/с, а за 10 с со стопами 5 и 15 см над полом — p95 "
+                 f"{span(s['qv_leg_p95'] for s in long)}, до {max(s['qv_leg_max'] for s in long):.1f} рад/с, |Δa| "
+                 f"{span((s['da'] for s in long), '{:.4f}')}, наклон до {max(s['tilt_max'] for s in long):.1f}° — выше "
+                 f"{limits}, ноги шагают в воздухе; ")
     return [
-        f"в воздухе при команде 0 робот спокоен: скорость ног p95 {span(s['qv_leg_p95'] for s in air)} рад/с (на "
-        f"входе в Velocity до {max(s['qv_leg_max'] for s in air):.1f}), |Δa| {span((s['da'] for s in air), '{:.4f}')}, "
-        + ('касаний себя нет' if self_air == 0 else f'касание себя до {self_air:.0f} Н')
+        first + ('касаний себя нет' if self_air == 0 else f'касание себя до {self_air:.0f} Н')
         + f", целей на границе `clip` {span(s['at_lim'] * 29 for s in air)} из 29;",
         f"ходьба в воздухе: ноги до {max(s['qv_leg_max'] for s in walk_air):.0f} рад/с, нога о ногу "
         f"{span((s['self_max'] for s in walk_air), '{:.0f}')} Н — в воздухе не ходить;",
@@ -345,7 +660,7 @@ def hoist_summary(data):
         f"ходьба от неподвижной точки: в {span((math.hypot(*s['xy']) for s in walks), '{:.2f}')} м от точки под "
         f"подвесом трос натягивается до {span(s['rope_max'] for s in walks)} веса, наклон на ходу "
         f"{span((s['tilt_max'] for s in walks), '{:.0f}')}° — тележка или провис ≥ x²/(2L) + 5 см.",
-    ]
+    ] + crouch_line
 
 
 def encoder_note(data):
@@ -363,11 +678,25 @@ def load_reference(candidate, probe):
     return json.loads((HERE / 'reference' / f"{probe}_{candidate['reference']}.json").read_text(encoding='utf-8'))
 
 
-def reference_md(info, sources):
+def reference_md(info, package, sources):
     cands = info['candidates']
     name = lambda c: f"{c['title']} ({c['reference']}, {c['role']})"
     sections = ' и '.join(f"«{c['sim2sim'][3:]}» ({c['title']})" for c in cands)
-    sim_rows = '\n'.join('| ' + ' | '.join(row) + ' |' for row in SIM2SIM_TABLE)
+    sim_rows = '\n'.join('| ' + ' | '.join(row) + ' |' for row in package['table'])
+    feet = ' и '.join(c['title'] for c in cands)
+    height = [c for c in cands if c['height']]
+    height_note = ''
+    if height:
+        # the protocol's section, broken after its first word as the line it sits in; a candidate that steps in the
+        # air has no crouch in the air in its protocol
+        section = height[0]['protocol'].replace(' ', '\n', 1)
+        steps = any(not calm_in_air(load_reference(c, 'hoist')) for c in height)
+        height_note = (
+            f"\n\nУ {' и '.join(c['title'] for c in height)} (команда высоты) все опыты — при c = 0,78: стик высоты в "
+            "центре, терм `height_command` 0\n(`height` в каждом отрезке данных). Опыт «в воздухе, присед» есть только у "
+            "этапов с высотой: команда 0, c 0,78\n5 с, 0,70 8 с, 0,64 8 с, 0,78 5 с — как первая проверка приседа на "
+            f"роботе (`PROTOCOL.md`, «{section}»"
+            + (': кандидат в воздухе шагает,\nи приседа в воздухе там нет).' if steps else ', там отрезки по 12 с).'))
     hoist = []
     for c in cands:
         data = load_reference(c, 'hoist')
@@ -410,8 +739,7 @@ def reference_md(info, sources):
 `unitree_mujoco` у стоп нет капсул: стопы проходят друг сквозь друга, и столкновение стоп связка не видит (строка «Стопы
 при боковых толчках» — по позе из логов в нашей модели с капсулами Unitree).
 
-Источник — `docs/sim2sim.md`, разделы {sections}. «Сеанс №8» в столбце №7 — его 14 прогонов в одном сеансе с №8
-(из раздела №8) там, где в его собственном разделе такого замера нет.
+Источник — `docs/sim2sim.md`, разделы {sections}. {package['table_note']}
 
 | Что | {columns} |
 |---|{'---|' * len(cands)}
@@ -426,10 +754,10 @@ lowcmd с ответом» (`tools/record_check.py`). Тайминги WSL не�
 `reference/hoist.py` (проба критика, итерация 21; для каждого кандидата свой файл данных): CPU, детерминированная
 политика, удержания курса нет. Трос — только натяжение, 20 кН/м и 1 кН·с/м, к торсу, точка крепления 3 м над стартом.
 FixStand 2 с (усиления `g1_ctrl`), затем Velocity. Физика «наша» — профиль `real_robot` (кривые и трение моторов
-Unitree) с моделью стоп из обучения этапа (у №8 и №7 стопы сталкиваются капсулами Unitree), «unitree_mujoco» —
+Unitree) с моделью стоп из обучения этапа (у {feet} стопы сталкиваются капсулами Unitree), «unitree_mujoco» —
 копия физики их симулятора (`scripts/lab/probes/um_probe.py`, капсул нет). «Суставов у предела» — сколько из 29 целей
 стоят на границе `clip` (в среднем по шагам; 2 — оба колена на 0,061). Σ|τ| ног — сумма модулей моментов 12 моторов
-ног. «Трос» — натяжение в долях веса (35,1 кг).
+ног. «Трос» — натяжение в долях веса (35,1 кг).{height_note}
 
 {hoist}
 
@@ -461,6 +789,59 @@ Unitree) с моделью стоп из обучения этапа (у №8 и
 """ + '\n'.join(f'| `{name}` | `{digest}` |' for name, digest in sources) + '\n'
 
 
+def sci(x):
+    """1.04e-05 -> '1.0e-5' (ru() keeps the exponent's minus)."""
+    return re.sub(r'e([+-])0*(\d)', r'e\1\2', f'{x:.1e}').replace('e+', 'e')
+
+
+def contract_md(cands):
+    """README.md's paragraph on the policies' contract: one for all, or (with a height policy) two; then the blind-arm
+    policies' check, if any."""
+    text = contract_text(cands)
+    blind = [c for c in cands if c.get('arm_blind')]
+    if not blind:
+        return text
+    o = blind[0]['onnx']
+    change = max(c['onnx']['arm_change'] for c in blind)
+    return text + '\n\n' + ru(
+        f"У {' и '.join(c['title'] for c in blind)} слепые руки (`arm_blind`): углы, скорости и прошлые действия "
+        f"суставов рук {ARM_JOINTS[0]}–{ARM_JOINTS[-1]}\nво всех кадрах истории ({o['arm_inputs']} входов) нормировка "
+        "внутри `policy.onnx` сводит к постоянным,\nв ONNX — свойство `arm_blind`. На тех же "
+        f"{o['samples']} наблюдениях, по {o['arm_draws']} раз со случайными входами рук (углы "
+        f"±{ARM_RANDOM['joint_pos_rel']:g} рад,\nскорости ±{ARM_RANDOM['joint_vel_rel']:g} рад/с, прошлые действия "
+        f"±{ARM_RANDOM['last_action']:g}), действие менялось не больше чем на {sci(change)} (порог сборки "
+        f"{sci(ARM_BLIND_TOL)}).\nВ `g1_ctrl` для этого ставить нечего.")
+
+
+def contract_text(cands):
+    """The contract paragraph itself: deploy.yaml and the ONNX input of each kind of candidate."""
+    samples = cands[0]['onnx']['samples']
+    tail = ('нижняя граница `clip` колен (SDK 3, 9) — 0,061. md5 сверены с файлами выгрузки в '
+            '`runs/humanoid_lab/export/`.')
+    height = [c for c in cands if c['height']]
+    if not height:
+        return ('Один разъём у всех: `deploy.yaml` совпадают построчно, кроме комментариев (шапки ниже); ONNX `obs` '
+                '[1, 490] →\n`actions` [1, 29]; на ' + f'{samples} случайных наблюдениях выходы запястий 20, 21, 27, 28 '
+                'ровно 0, действия\nв ±10; ' + tail)
+    plain = [c for c in cands if not c['height']]
+    titles = lambda cs: ' и '.join(c['title'] for c in cs)
+    terms = height[0]['height_terms']
+    p = HEIGHT_PARAMS
+    params = ', '.join(f'{key} {value:g}' for key, value in p.items())
+    history = ' / '.join(str(n) for n in terms['history'])
+    return ru(
+        f"Два разъёма. У {titles(height)} ONNX `obs` [1, {height[0]['obs']}] → `actions` [1, 29]: в `deploy.yaml` после "
+        f"`last_action` ещё\nтермы `height_command` и `upper_body_command`, `history_length` {history}. `height_command` "
+        f"— c − {p['nominal']:g} по правому\nстику (`params`: {params}): c = {p['nominal']:g} + "
+        f"{p['nominal'] - p['lowest']:.2f}·min(0, ry),\nпри норме команды хода от {p['walking_norm']:g} не ниже "
+        f"{p['walking_lowest']:.2f}; `upper_body_command` — {terms['upper_body']} нулей. Их знает только `g1_ctrl` "
+        f"с\n`patches/{HEIGHT_PATCH}`: штатный такую выгрузку не примет. "
+        + (f"У {titles(plain)} — [1, {plain[0]['obs']}], этих термов нет,\nон идёт на сборке без патча высоты (как в "
+           "пакете №8). " if plain else '')
+        + "В остальном `deploy.yaml` совпадают построчно, кроме\nкомментариев (шапки ниже). У всех на "
+        f"{samples} случайных наблюдениях выходы запястий 20, 21, 27, 28 ровно 0, действия\nв ±10; " + tail)
+
+
 def readme_md(info):
     cands = info['candidates']
     main, spare = cands[0], cands[1:]
@@ -472,11 +853,35 @@ def readme_md(info):
     ranges = ru(', '.join(f"`{key}` {r[0]:g}…{r[1]:g}" for key, r in main['command_ranges'].items()))
     title = f"кандидат {main['title']} ({main['role']})" + ''.join(f" и {c['title']} ({c['role']})" for c in spare)
     spare_labels = ' или '.join(c['label'] for c in spare)
+    height = [c for c in cands if c['height']]
+    plain = [c for c in cands if not c['height']]
     patches = '\n'.join(
         f"{k}. `patches/{p['name']}`"
         + ''.join(f"\n   - в выводе `g1_ctrl` {'при старте или входе в Velocity' if x['kind'] == 'info' else 'при срабатывании'}: "
                   f"`{x['text']}`" for x in p['log_lines'])
+        + ("\n   - своей строки в выводе `g1_ctrl` нет: что он в сборке, видно по тому, что `g1_ctrl` принял выгрузку "
+           "с\n     высотой (без него при старте — `Observation term 'height_command' is not registered`)"
+           if p['name'] == HEIGHT_PATCH else '')
         for k, p in enumerate(info['patches'], 1))
+    protocol_note = build_note = manual_note = install_note = ''
+    build_cmds = 'bash apply_patches.sh ./unitree_rl_mjlab --build    # наложить (уже наложенные пропускает) и собрать g1_ctrl'
+    if height:
+        h, n = ', '.join(c['label'] for c in height), ', '.join(c['label'] for c in plain)
+        protocol_note = (f" Для {' и '.join(c['title'] for c in height)} — раздел «{height[0]['protocol']}»: "
+                         "пробовать только после\nуспешного первого запуска №8.")
+        build_cmds = (f"bash apply_patches.sh ./unitree_rl_mjlab --build               # все патчи — сборка для {h}\n"
+                      + (f"bash apply_patches.sh ./unitree_rl_mjlab --no-height --build   # без {HEIGHT_PATCH} "
+                         f"(наложенный снимает) — для {n}" if plain else ''))
+        build_note = (
+            f"\n\nСборка одна на дерево: переходя с {h} на {n} и обратно, пересобрать нужным вызовом выше; "
+            "`install_policy.sh`\nпроверяет, что дерево и сборка — под выбранную политику. В WSL "
+            "(`scripts/sim2sim/setup.sh g1ctrl`) сборка с патчем\nвысоты дала md5 `11b68aa1…`, без него "
+            "(`SIM2SIM_HEIGHT=off`) — `ef9039b0…`, байт в байт сборка пакета №8; на\nдругой машине md5 будет свой.")
+        manual_note = f'\nДля {n} — без `{HEIGHT_PATCH}`.' if plain else ''
+        install_note = (
+            f"\n\n{h} ставится только на сборку с `{HEIGHT_PATCH}`" + (f", {n} — только на сборку без него" if plain else '')
+            + ": скрипт сверяет это с\nдеревом (`git apply --reverse --check`) и проверяет, что `g1_ctrl` собран после "
+            "последней правки\n`observations.h`; иначе пишет, чем пересобрать, и ничего не ставит.")
     extra = ''
     if info['patches_not_in_setup']:
         extra = ('\nНе в `scripts/sim2sim/setup.sh` (в связке, возможно, не проверены; порядок — по имени, после '
@@ -490,7 +895,7 @@ def readme_md(info):
 
 Собран {info['created']} скриптом `scripts/robot/package.py` (лаборатория, коммит `{commit}`). Перед сеансом прочитать
 `PROTOCOL.md` (копия `docs/robot-first-run.md`): там шаги, что смотреть и когда останавливаться. Эталоны —
-`REFERENCE.md`.{dirty}
+`REFERENCE.md`.{protocol_note}{dirty}
 
 ## Состав
 
@@ -509,9 +914,7 @@ def readme_md(info):
 
 ## Политики
 
-Один разъём у всех: `deploy.yaml` совпадают построчно, кроме комментариев (шапки ниже); ONNX `obs` [1, 490] →
-`actions` [1, 29]; на {main['onnx']['samples']} случайных наблюдениях выходы запястий 20, 21, 27, 28 ровно 0, действия
-в ±10; нижняя граница `clip` колен (SDK 3, 9) — 0,061. md5 сверены с файлами выгрузки в `runs/humanoid_lab/export/`.
+{contract_md(cands)}
 
 Диапазоны команд: {ranges}. Для пола — не шире `export_g1 --command-ranges -0.5 1 0.5 1` (протокол, п. 9
 «Безопасности»): сборка это проверяет.
@@ -533,12 +936,12 @@ def readme_md(info):
 
 ```bash
 git clone https://github.com/unitreerobotics/unitree_rl_mjlab.git && git -C unitree_rl_mjlab checkout {info['unitree_rl_mjlab']}
-bash apply_patches.sh ./unitree_rl_mjlab --build    # наложить (уже наложенные пропускает) и собрать g1_ctrl
-```
+{build_cmds}
+```{build_note}
 
 Вручную — то же самое: в корне `unitree_rl_mjlab` для каждого патча по порядку `git apply --check <патч>`, затем
 `git apply <патч>`; потом `cd deploy/robots/g1 && mkdir -p build && cd build && cmake .. && make -j`. Если патч «не
-накладывается», в дереве уже есть его прежняя версия или другой коммит: взять чистый клон на коммите выше.
+накладывается», в дереве уже есть его прежняя версия или другой коммит: взять чистый клон на коммите выше.{manual_note}
 
 ## Политика на место
 
@@ -548,7 +951,7 @@ bash install_policy.sh ./unitree_rl_mjlab {main['label']}    # или {spare_lab
 
 Скрипт кладёт `policy.onnx` в `deploy/robots/g1/config/policy/velocity/v9_lab/exported/`, `deploy.yaml` — в
 `…/v9_lab/params/`, сверяет md5 и проверяет, что `g1_ctrl` возьмёт именно `v9_lab` (он берёт последнюю по имени
-папку с `exported` в `config/policy/velocity`). В выводе `g1_ctrl` при старте: `Policy directory: …/velocity/v9_lab`.
+папку с `exported` в `config/policy/velocity`). В выводе `g1_ctrl` при старте: `Policy directory: …/velocity/v9_lab`.{install_note}
 
 ## Запись и разбор
 
@@ -590,6 +993,91 @@ if [ "$BUILD" = --build ]; then
 fi
 """
 
+# A package with a height policy: every patch by default (the build for it), --no-height without the height patch
+# (taken off a tree that has it) for the others, as robot package 8's build.
+APPLY_HEIGHT_SH = """#!/bin/bash
+# Патчи лаборатории к g1_ctrl (unitree_rl_mjlab deploy) в порядке scripts/sim2sim/setup.sh.
+# Запуск: bash apply_patches.sh <папка unitree_rl_mjlab> [--no-height] [--build]
+# Уже наложенный патч пропускается; не накладывающийся останавливает скрипт (git apply --check до наложения,
+# так что наполовину ничего не накладывается). --build: cmake и make в deploy/robots/g1 (g1_ctrl).
+# Без ключа — все патчи: сборка для политики с высотой ({height_labels}). --no-height: без {height_patch}
+# (наложенный снимается) — сборка для {plain_labels}, как в пакете №8.
+set -eu
+HERE="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+REPO="${{1:?запуск: bash apply_patches.sh <папка unitree_rl_mjlab> [--no-height] [--build]}}"
+shift
+BUILD=
+HEIGHT=on
+for a in "$@"; do
+  case "$a" in
+    --build) BUILD=--build ;;
+    --no-height) HEIGHT=off ;;
+    *) echo "неизвестный ключ $a (есть --no-height и --build)"; exit 1 ;;
+  esac
+done
+EXPECTED={commit}
+PATCHES=({patches})
+HEIGHT_PATCH={height_patch}
+g() {{ git -c 'safe.directory=*' -C "$REPO" "$@"; }}
+head=$(g rev-parse HEAD)
+[ "$head" = "$EXPECTED" ] || echo "ВНИМАНИЕ: unitree_rl_mjlab на $head, патчи сделаны на $EXPECTED"
+for p in "${{PATCHES[@]}}"; do
+  f="$HERE/patches/$p"
+  if [ "$p" = "$HEIGHT_PATCH" ] && [ "$HEIGHT" = off ]; then
+    if g apply --reverse --check "$f" 2>/dev/null; then
+      g apply --reverse "$f"
+      echo "$p: снят (--no-height)"
+    else
+      echo "$p: не наложен (--no-height)"
+    fi
+  elif g apply --reverse --check "$f" 2>/dev/null; then
+    echo "$p: уже наложен"
+  elif g apply --check "$f"; then
+    g apply "$f"
+    echo "$p: наложен"
+  else
+    echo "$p: не накладывается (в дереве прежняя версия патча или другой коммит, см. README.md)"
+    exit 1
+  fi
+done
+if [ "$BUILD" = --build ]; then
+  cd "$REPO/deploy/robots/g1" && mkdir -p build && cd build && cmake .. && make -j"$(nproc)" && ls -la g1_ctrl
+fi
+"""
+
+# install_policy.sh of a package with a height policy, before anything is copied: the tree has the height patch for
+# a height policy and not for the others, and g1_ctrl was built after the last change of observations.h (the file the
+# height patch edits; a stale build of the other variant would still run).
+INSTALL_HEIGHT_CHECK = """# {height_patch}: {height_labels} — только на сборке с ним, {plain_labels} — на сборке без него (как пакет №8).
+case "$SLOT" in
+  {height_slots}) NEED=on; FLAG= ;;
+  *) NEED=off; FLAG=' --no-height' ;;
+esac
+if git -c 'safe.directory=*' -C "$REPO" apply --reverse --check "$HERE/patches/{height_patch}" 2>/dev/null; then
+  TREE=on
+else
+  TREE=off
+fi
+if [ "$TREE" != "$NEED" ]; then
+  if [ "$NEED" = on ]; then
+    echo "$SLOT: в $REPO не наложен {height_patch}, без него g1_ctrl эту политику не примет"
+  else
+    echo "$SLOT: в $REPO наложен {height_patch}, а $SLOT ставится на сборку без него (как в пакете №8)"
+  fi
+  echo "собрать под $SLOT: bash apply_patches.sh $REPO$FLAG --build"
+  exit 1
+fi
+BIN="$REPO/deploy/robots/g1/build/g1_ctrl"
+OBS="$REPO/deploy/include/isaaclab/envs/mdp/observations/observations.h"
+if [ ! -e "$BIN" ]; then
+  echo "ВНИМАНИЕ: g1_ctrl ещё не собран ($BIN): bash apply_patches.sh $REPO$FLAG --build"
+elif [ "$OBS" -nt "$BIN" ]; then
+  echo "$BIN собран до последней правки observations.h (патч высоты наложили или сняли): пересобрать —"
+  echo "bash apply_patches.sh $REPO$FLAG --build"
+  exit 1
+fi
+"""
+
 INSTALL_SH = """#!/bin/bash
 # Кладёт политику пакета туда, откуда её берёт g1_ctrl: <unitree_rl_mjlab>/deploy/robots/g1/config/policy/velocity/v9_lab
 # Запуск: bash install_policy.sh <папка unitree_rl_mjlab> {labels}
@@ -600,7 +1088,7 @@ case "${{2:-}}" in
 {cases}
   *) echo "какую политику: {labels}"; exit 1 ;;
 esac
-SRC="$HERE/policy/$SLOT"
+{height_check}SRC="$HERE/policy/$SLOT"
 VEL="$REPO/deploy/robots/g1/config/policy/velocity"
 DST="$VEL/v9_lab"
 [ -d "$VEL" ] || {{ echo "нет $VEL: это не unitree_rl_mjlab?"; exit 1; }}
@@ -625,33 +1113,42 @@ fi
 """
 
 
-def build(name):
-    info = dict(kind=KIND, name=name, created=time.strftime('%Y-%m-%d %H:%M:%S'), git=git_state(),
+def build(name, key):
+    package = PACKAGES[key]
+    candidates = package['candidates']
+    height = any(c['height'] for c in candidates)
+    info = dict(kind=KIND, name=name, package=key, created=time.strftime('%Y-%m-%d %H:%M:%S'), git=git_state(),
                 unitree_rl_mjlab=setup_value('RL_MJLAB_SHA'), unitree_sdk2=setup_value('SDK2_SHA'))
     if not PROTOCOL.exists():
         fail(f'нет {PROTOCOL}')
     text = SIM2SIM_DOC.read_text(encoding='utf-8')
-    missing = [s for s in SIM2SIM_SECTIONS if s not in text]
+    missing = [c['sim2sim'] for c in candidates if c['sim2sim'] not in text]
     if missing:
         print(f'ВНИМАНИЕ: в docs/sim2sim.md нет разделов {missing}: числа sim2sim в REFERENCE.md сверить вручную')
     # the probes, then each candidate's data (scripts/robot/reference/<probe>_<stage>.json)
     reference = [f'{p}.py' for p in REFERENCE_PROBES]
-    reference += [f"{p}_{c['reference']}.json" for c in CANDIDATES for p in REFERENCE_PROBES]
+    reference += [f"{p}_{c['reference']}.json" for c in candidates for p in REFERENCE_PROBES]
     missing = [f for f in reference if not (HERE / 'reference' / f).exists()]
     if missing:
         fail(f"нет данных проб в {HERE / 'reference'}: {', '.join(missing)} (scripts/robot/reference/<проба>.py "
              '<этап> <проба>_<этап>.json)')
-    # policies: one contract
-    checked = [check_export(c) for c in CANDIDATES]
+    # policies: each one's contract, then one deploy.yaml for all but for comments and the height terms
+    checked = [check_export(c) for c in candidates]
     bodies = [deploy_body(x['folder'] / 'deploy.yaml') for x in checked]
     if any(b != bodies[0] for b in bodies[1:]):
-        fail('deploy.yaml кандидатов различаются не только комментариями: разъём разный')
-    if any(x['onnx']['input'] != checked[0]['onnx']['input'] for x in checked):
-        fail('вход ONNX кандидатов различается')
-    # patches
+        fail('deploy.yaml кандидатов различаются не только комментариями и термами высоты: разъём разный')
+    no_feet = [c['title'] for c, x in zip(candidates, checked) if not any('foot_collision' in s for s in x['comments'])]
+    if no_feet:
+        fail(f"у {', '.join(no_feet)} в шапке deploy.yaml нет foot_collision, а REFERENCE.md пишет, что стопы "
+             'сталкиваются капсулами Unitree')
+    # patches: the height patch only in a package with a height policy
     found = {p.name: p for p in sorted(SIM2SIM.joinpath('patches').glob('g1_ctrl-*.patch'))}
     if not found:
         fail('в scripts/sim2sim/patches нет g1_ctrl-*.patch')
+    if height and HEIGHT_PATCH not in found:
+        fail(f'в scripts/sim2sim/patches нет {HEIGHT_PATCH}, а без него g1_ctrl политику с высотой не примет')
+    if not height:
+        found.pop(HEIGHT_PATCH, None)
     order, not_in_setup = patch_order(list(found))
     info['patches_not_in_setup'] = not_in_setup
 
@@ -666,12 +1163,13 @@ def build(name):
             shutil.rmtree(leftover)
     copied = {}
     info['candidates'] = []
-    for c, x in zip(CANDIDATES, checked):
+    for c, x in zip(candidates, checked):
         slot = f"{c['label']}-{x['stage'] or c['export']}"
         for f in ('policy.onnx', 'deploy.yaml'):
             copy(x['folder'] / f, pending / 'policy' / slot / f, copied)
         info['candidates'].append(dict(c, slot=slot, stage=x['stage'], onnx=x['onnx'], knee_clip=x['knee_clip'],
                                        comments=x['comments'], command_ranges=x['command_ranges'],
+                                       height_terms=x['height_terms'],
                                        md5={f: md5(x['folder'] / f) for f in ('policy.onnx', 'deploy.yaml')}))
     info['patches'] = []
     for n in order:
@@ -686,12 +1184,22 @@ def build(name):
     copy(PROTOCOL, pending / 'PROTOCOL.md', copied)
     sources = [(str(p.relative_to(SIM)).replace('\\', '/'), md5(p)) for p in
                [SIM2SIM_DOC] + [HERE / 'reference' / f for f in reference]]
-    write(pending / 'REFERENCE.md', reference_md(info, sources))
+    write(pending / 'REFERENCE.md', reference_md(info, package, sources))
     write(pending / 'README.md', readme_md(info))
-    write(pending / 'apply_patches.sh', APPLY_SH.format(commit=info['unitree_rl_mjlab'], patches=' '.join(order)))
     labels = '|'.join(c['label'] for c in info['candidates'])
     cases = '\n'.join(f"  {c['label']}) SLOT={c['slot']} ;;" for c in info['candidates'])
-    write(pending / 'install_policy.sh', INSTALL_SH.format(labels=labels, cases=cases))
+    height_check = ''
+    if height:
+        names = dict(height_patch=HEIGHT_PATCH,
+                     height_labels=', '.join(c['label'] for c in info['candidates'] if c['height']),
+                     plain_labels=', '.join(c['label'] for c in info['candidates'] if not c['height']) or '—')
+        write(pending / 'apply_patches.sh', APPLY_HEIGHT_SH.format(commit=info['unitree_rl_mjlab'],
+                                                                   patches=' '.join(order), **names))
+        height_check = INSTALL_HEIGHT_CHECK.format(
+            height_slots='|'.join(c['slot'] for c in info['candidates'] if c['height']), **names)
+    else:
+        write(pending / 'apply_patches.sh', APPLY_SH.format(commit=info['unitree_rl_mjlab'], patches=' '.join(order)))
+    write(pending / 'install_policy.sh', INSTALL_SH.format(labels=labels, cases=cases, height_check=height_check))
     info['sources'] = {str(t.relative_to(pending)).replace('\\', '/'): dict(source=str(s.relative_to(SIM)).replace(
         '\\', '/'), md5=md5(s)) for t, s in copied.items()}
     write(pending / 'package.json', json.dumps(info, ensure_ascii=False, indent=1, default=str) + '\n')
@@ -721,12 +1229,16 @@ def build(name):
 
 def main():
     parser = argparse.ArgumentParser(description='Пакет для первого запуска G1 на подвесе')
-    parser.add_argument('--name', default=f"g1-{CANDIDATES[0]['label']}-{CANDIDATES[0]['export']}",
-                        help='имя папки в runs/humanoid_lab/robot')
+    parser.add_argument('--candidate', required=True, choices=list(PACKAGES),
+                        help='n8 — первый пол (№8 и запасной №7); n9 — экспериментальный с приседом (№9 и запасной №8); '
+                             'n10 — экспериментальный со слепыми руками и приседом (№10 и запасной №8)')
+    parser.add_argument('--name', help='имя папки в runs/humanoid_lab/robot (по умолчанию g1-<кандидат>-<выгрузка>)')
     args = parser.parse_args()
-    if not re.fullmatch(r'[A-Za-z0-9._-]+', args.name) or args.name.startswith('.'):
-        fail(f'имя папки: латиница, цифры, . _ -, не с точки ({args.name!r})')
-    final, info, copied, sums = build(args.name)
+    main_candidate = PACKAGES[args.candidate]['candidates'][0]
+    name = args.name or f"g1-{main_candidate['label']}-{main_candidate['export']}"
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', name) or name.startswith('.'):
+        fail(f'имя папки: латиница, цифры, . _ -, не с точки ({name!r})')
+    final, info, copied, sums = build(name, args.candidate)
     print(f'пакет: {final}')
     print('политики (md5 выгрузки = md5 в пакете):')
     for c in info['candidates']:

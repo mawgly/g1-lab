@@ -33,7 +33,8 @@ class TensorG1Env:
                  phase_stop=False, sole_contact=False, random_phase=False, action_delay=0., arm_perturb=0.,
                  lock_wrists=False, knee_floor=None, force_push=0., feet_flat_stance=False, foot_collision=False,
                  side_heading_hold=True, motor_friction=0., height_command=False, upper_body_slot=False,
-                 arm_perturb_radians=task.ARM_PERTURB_RADIANS, arm_perturb_contact_mask=False):
+                 arm_perturb_radians=task.ARM_PERTURB_RADIANS, arm_perturb_contact_mask=False, arm_blind=False,
+                 hand_collision=False):
         if type(n_envs) is not int or n_envs < 1 or type(max_episode_steps) is not int or max_episode_steps < 1:
             raise ValueError('n_envs and max_episode_steps must be positive integers')
         if not torch.cuda.is_available():
@@ -56,9 +57,11 @@ class TensorG1Env:
                                              foot_collision=foot_collision, side_heading_hold=side_heading_hold,
                                              motor_friction=motor_friction, height_command=height_command,
                                              upper_body_slot=upper_body_slot, arm_perturb_radians=arm_perturb_radians,
-                                             arm_perturb_contact_mask=arm_perturb_contact_mask)
+                                             arm_perturb_contact_mask=arm_perturb_contact_mask, arm_blind=arm_blind,
+                                             hand_collision=hand_collision)
         # Warp gets the reference's model (put_model below), so foot_collision's capsules, their contact filter and
-        # the sole spheres are the CPU task's; a foot-foot contact is a robot-robot one for self_contact.
+        # the sole spheres are the CPU task's; a foot-foot contact is a robot-robot one for self_contact. So are
+        # hand_collision's capsules (a hand on the body is a robot-robot contact too).
         # Curriculum: 0 = no noise, randomisation or pushes; 1 = Unitree's full training setup.
         self.realism = float(training_realism)
         self.heading_hold = bool(heading_hold)
@@ -170,7 +173,8 @@ class TensorG1Env:
         self._crouch_sum = torch.zeros((),device=self.device)
         self._height_excess_sum = torch.zeros((),device=self.device)
         self._crouch_count = 0
-        # Fixed normalization of the extra terms (the CPU task's), for TensorNormalize.
+        # Fixed normalization of the extra terms and of arm_blind's arm columns (the CPU task's), for TensorNormalize.
+        # arm_blind changes nothing else here: the observation is the same, the blindness is the normalization's.
         self.fixed_normalization = ref.fixed_normalization
         self._worlds = torch.arange(n_envs,device=self.device)
         self.returns = torch.zeros(n_envs,device=self.device)

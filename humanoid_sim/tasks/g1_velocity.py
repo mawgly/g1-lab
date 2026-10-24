@@ -52,6 +52,22 @@ FOOT_CAPSULES = {
         (.1, .026, -.025, .05, .026, -.025)),
 }
 FOOT_COLLISION_BIT = 2
+# hand_collision (task_config; iteration 33, getting up): our hands do not touch anything, the rubber_hand mesh has no
+# collision (contype 0), so a robot leaning on its hands would rest on the wrist edge 13 cm short of the palm (critic,
+# lab-critic/it33/hand_geom.py). With the setting load_model adds Unitree's hand capsule to each wrist_yaw_link exactly as
+# unitree_rl_mjlab g1.xml has it (`left/right_hand_collision`, class collision: radius 0.035, fromto in the wrist_yaw
+# frame, which is the same in both models, the right one mirrored in y), colliding with the floor and the robot as every
+# Unitree collision geom (contype = conaffinity = 1). Their contact is Unitree's (g1_constants.py FULL_COLLISION for
+# `.*_collision`): condim 1, priority 0 (CollisionCfg's default; only the foot capsules get 1), MuJoCo's default
+# friction (g1.xml sets none); against our floor (condim 3, friction 1) and our collision meshes (condim 3) MuJoCo then
+# takes the larger condim, 3, and friction 1. Unitree's head_collision sphere is not added: our head_link mesh already
+# collides. Group 3 (hidden in MuJoCo's renderer and in the browser, webapp.shown_geoms), no mass (the wrist_yaw links
+# have explicit inertia). The capsules are robot and arm geoms, so self_contact charges a hand pressing on the body.
+# Part of the checkpoint identity (config.HAND_COLLISION_SUFFIX on the model revision); the 29-DoF G1 only (the
+# legs-only one welds its arms to the torso).
+HAND_CAPSULE_RADIUS = .035
+HAND_CAPSULE_CONTACT = dict(condim=1, priority=0)
+HAND_CAPSULES = {'left_wrist_yaw_link': (.07, 0., 0., .15, -.02, 0.), 'right_wrist_yaw_link': (.07, 0., 0., .15, .02, 0.)}
 
 # Real-robot motors (docs/g1-real-robot-plan.md). Joint -> Unitree motor as in mjlab g1_constants.py;
 # torque-speed curve (x1, x2 rad/s; y1, y2 N·m) and friction (static N·m, viscous N·m·s/rad) measured by
@@ -105,11 +121,14 @@ def _batch(value):
     return torch.from_numpy(np.asarray(value, dtype=np.float64))[None]
 
 
-def load_model(legs_only=False, foot_collision=False):
+def load_model(legs_only=False, foot_collision=False, hand_collision=False):
     """The G1 scene and the indices of its actuators in the 29-DoF controller.json order; foot_collision adds Unitree's
-    foot capsules (FOOT_CAPSULES), which collide only foot with foot. Without either, the files as they are."""
+    foot capsules (FOOT_CAPSULES), which collide only foot with foot, hand_collision Unitree's hand capsules
+    (HAND_CAPSULES; 29-DoF only), which collide with the floor and the robot. Without any, the files as they are."""
     path = str(ASSETS / 'scene_29dof.xml')
-    if not legs_only and not foot_collision:
+    if legs_only and hand_collision:
+        raise ValueError('hand_collision needs the arms of the 29-DoF G1')
+    if not legs_only and not foot_collision and not hand_collision:
         model = mujoco.MjModel.from_xml_path(path)
         return model, list(range(model.nu))
     spec = mujoco.MjSpec.from_file(path)
@@ -135,6 +154,13 @@ def load_model(legs_only=False, foot_collision=False):
                     conaffinity=FOOT_COLLISION_BIT, condim=FOOT_CAPSULE_CONTACT['condim'],
                     friction=list(FOOT_CAPSULE_CONTACT['friction']), priority=FOOT_CAPSULE_CONTACT['priority'],
                     group=3, density=0., rgba=[.2, .2, .2, 1.])
+    if hand_collision:
+        for body, fromto in HAND_CAPSULES.items():  # Unitree's names: left_hand_collision, right_hand_collision
+            spec.body(body).add_geom(
+                name=f'{body.split("_")[0]}_hand_collision', type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+                size=[HAND_CAPSULE_RADIUS, 0., 0.], fromto=fromto, contype=1, conaffinity=1,
+                condim=HAND_CAPSULE_CONTACT['condim'], priority=HAND_CAPSULE_CONTACT['priority'], group=3, density=0.,
+                rgba=[.2, .6, .2, .2])
     return spec.compile(), kept
 
 
@@ -147,8 +173,14 @@ class G1VelocityEnv(gym.Env):
                  random_phase=False, action_delay=0., arm_perturb=0., lock_wrists=False, knee_floor=None,
                  force_push=0., feet_flat_stance=False, foot_collision=False, side_heading_hold=True,
                  motor_friction=0., height_command=False, upper_body_slot=False,
-                 arm_perturb_radians=ARM_PERTURB_RADIANS, arm_perturb_contact_mask=False):
+                 arm_perturb_radians=ARM_PERTURB_RADIANS, arm_perturb_contact_mask=False, arm_blind=False,
+                 hand_collision=False):
         self.real_robot = bool(real_robot)
+        # arm_blind: the policy's normalization holds the arm columns constant (fixed_normalization, arm_columns); the
+        # observation itself is unchanged. The deploy layout's columns, so real robot only (the 29-DoF G1).
+        self.arm_blind = bool(arm_blind)
+        if self.arm_blind and not self.real_robot:
+            raise ValueError('arm_blind requires real_robot')
         # height_command: the pelvis height command c (self.height), an observation term after last_action; drawn at
         # training resets and command changes (task.height_draw), BASE_HEIGHT at a reset with a command, set by
         # set_height or options['height'] (set_command keeps it); the reward's height, fall and stand pose follow it.
@@ -171,6 +203,8 @@ class G1VelocityEnv(gym.Env):
         self.side_heading_hold = bool(side_heading_hold)
         # The feet collide with each other through Unitree's foot capsules (load_model), as the CUDA task's model.
         self.foot_collision = bool(foot_collision)
+        # The hands collide with the floor and the robot through Unitree's hand capsules (load_model; 29-DoF only).
+        self.hand_collision = bool(hand_collision)
         # The feet_flat reward term counts only the feet in contact (task.reward_components), as the CUDA task does.
         self.feet_flat_stance = bool(feet_flat_stance)
         # Largest Δv (m/s) of the force pushes on the pelvis; resets without a set command push every 2-4 s
@@ -229,7 +263,7 @@ class G1VelocityEnv(gym.Env):
         if render_mode not in (None, 'rgb_array'):
             raise ValueError('Unsupported render mode')
         self.render_mode = render_mode
-        self.model, kept = load_model(self.legs_only, self.foot_collision)
+        self.model, kept = load_model(self.legs_only, self.foot_collision, self.hand_collision)
         self.model.opt.timestep = .002
         self.model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         self.model.opt.solver = mujoco.mjtSolver.mjSOL_NEWTON
@@ -300,6 +334,9 @@ class G1VelocityEnv(gym.Env):
         self.foot_capsules = np.array([[self.model.geom(f'{name.split("_")[0]}_foot{k}_collision').id
                                         for k in range(1, len(FOOT_CAPSULES[name]) + 1)] if self.foot_collision else []
                                        for name in task.FEET], dtype=np.int64)
+        # hand_collision: the hand capsules, left then right ((2,) geom indices; (0,) without it).
+        self.hand_capsules = np.array([self.model.geom(f'{name.split("_")[0]}_hand_collision').id
+                                       for name in HAND_CAPSULES] if self.hand_collision else [], dtype=np.int64)
         # self_contact reward: per geom, whether it is on the robot (pelvis subtree; the floor is on the world body).
         # foot_collision's capsules are on the ankle_roll links, so a foot-foot contact counts.
         self.robot_geoms = self.model.body_rootid[self.model.geom_bodyid] == self.model.body_rootid[self.pelvis]
@@ -391,17 +428,35 @@ class G1VelocityEnv(gym.Env):
     @property
     def fixed_normalization(self):
         """(positions, mean, variance) of the observation columns whose normalization is set, not estimated: every
-        frame's entries of the extra terms (task.TERM_NORMALIZATION); None without them. warm_start.insert_terms writes
-        these into a stage's statistics, TensorNormalize keeps them frozen."""
-        if not self.extra_terms:
-            return None
+        frame's entries of the extra terms (task.TERM_NORMALIZATION), then with arm_blind the arm columns (arm_columns)
+        at variance task.ARM_BLIND_SCALE² with mean NaN: the statistics' own, kept as they are (−z·ARM_BLIND_SCALE
+        from warm_start.blind_arms; 0 in a fresh normalizer). None without either. warm_start.insert_terms writes the
+        set values into a stage's statistics, TensorNormalize and the CPU training path (train.FrozenMoments) keep all
+        of them frozen."""
         positions, mean, variance = [], [], []
         for name, _ in self.extra_terms:
             columns = task.term_positions(self.model.nu, self.history, self.extra_terms, name)
             positions += columns
             mean += [task.TERM_NORMALIZATION[name][0]] * len(columns)
             variance += [task.TERM_NORMALIZATION[name][1]] * len(columns)
+        if self.arm_blind:
+            columns = self.arm_columns
+            positions += columns
+            mean += [np.nan] * len(columns)
+            variance += [task.ARM_BLIND_SCALE ** 2] * len(columns)
+        if not positions:
+            return None
         return np.array(positions, dtype=np.int64), np.array(mean), np.array(variance)
+
+    @property
+    def arm_columns(self):
+        """Positions in the observation of the arm joints' (arm_joints) joint_pos_rel, joint_vel_rel and last_action
+        entries, every history frame (task.joint_positions, ARM_BLIND_TERMS order): the columns task_config arm_blind
+        holds constant; the deploy layout's, so real robot only."""
+        if not self.real_robot:
+            raise ValueError('arm columns are those of the real-robot (deploy) observation layout')
+        return task.joint_positions(self.model.nu, self.history, self.extra_sizes, task.ARM_BLIND_TERMS,
+                                    self.arm_joints)
 
     def set_force_push(self, velocity, seconds=.1):
         """Push the pelvis from the next control step on (tests, probes), as the sim2sim push patch does: the

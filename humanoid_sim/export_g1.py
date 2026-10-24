@@ -12,7 +12,9 @@ height_command / upper_body_slot add the terms height_command and upper_body_com
 history 5, for g1_ctrl with scripts/sim2sim/patches/g1_ctrl-height.patch); with task_config
 lock_wrists, then zeros on the wrist pitch and yaw outputs (g1_tensor_math.lock_joints, as the environment), so
 g1_ctrl holds those joints at default_joint_pos. g1_ctrl feeds that output back as last_action, exactly as the
-environment's previous_action, and every observation term in deploy.yaml has scale 1 and clip null.
+environment's previous_action, and every observation term in deploy.yaml has scale 1 and clip null. task_config
+arm_blind is only in the normalization's numbers (the arm columns map onto the stage's constants), so the graph's ops
+and deploy.yaml stay the plain ones; the ONNX properties and a deploy.yaml comment note it.
 
 --stand-trim (iteration 16): standing, a policy may turn on the spot from its own left-right lopsidedness (candidate
 3, exp-6986f1d9544b4d00 @ 5481431040: +7…+8° in 5 s in the Unitree bridge). The graph then ends with
@@ -397,6 +399,10 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
             properties['symmetric'] = 'true'
         if config.get('foot_collision'):  # training physics only: the graph and deploy.yaml are the same
             properties.update(foot_collision='true', model_revision=identity['model_revision'])
+        if config.get('hand_collision'):  # likewise
+            properties.update(hand_collision='true', model_revision=identity['model_revision'])
+        if config.get('arm_blind'):  # in the normalization's numbers only: the graph and deploy.yaml are the same
+            properties['arm_blind'] = 'true'
         for name, _ in raw.extra_terms:  # observation terms g1_ctrl knows only with g1_ctrl-height.patch
             properties[name] = 'true'
         write_onnx(module, onnx_path, actor_inputs, actions, properties)
@@ -408,6 +414,13 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
         if config.get('foot_collision'):
             header += ('\nfoot_collision: trained with the feet colliding with each other (Unitree\'s foot capsules); '
                        'nothing to set in g1_ctrl')
+        if config.get('hand_collision'):
+            header += ('\nhand_collision: trained with the hands colliding with the floor and the body (Unitree\'s hand '
+                       'capsules); nothing to set in g1_ctrl')
+        if config.get('arm_blind'):
+            header += ('\narm_blind: the arm joints\' joint_pos_rel, joint_vel_rel and last_action (every frame) are '
+                       'normalized to constants inside policy.onnx\n(the policy does not see its arms); nothing to set '
+                       'in g1_ctrl')
         if raw.extra_terms:
             header += ('\n' + ', '.join(name for name, _ in raw.extra_terms) + ': observation terms of '
                        'scripts/sim2sim/patches/g1_ctrl-height.patch (stock g1_ctrl refuses them); height_command '

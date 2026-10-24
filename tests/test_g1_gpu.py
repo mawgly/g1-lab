@@ -1226,6 +1226,53 @@ def test_g1_cpu_gpu_foot_collision(monkeypatch):
 
 
 @pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_hand_collision():
+    """hand_collision on the CUDA task: Warp gets the CPU task's model (Unitree's hand capsules: contype and conaffinity
+    1, condim 1, priority 0, MuJoCo's default friction) and, with the robot lowered until its left hand capsule is 5 mm
+    into the floor (test_g1_hand_collision; a forward pass only, the legs are deep in the floor there), both backends
+    find the hand-floor contact. Without the setting nothing of the hands touches the floor there."""
+    import mujoco
+    import warp as wp
+    from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
+    from test_g1_hand_collision import capsule_bottom
+    profile = dict(real_robot=True, action_limit=10., gait={'period': .6, 'stance_fraction': .55}, foot_collision=True,
+                   reward_weights={'self_contact': 4.})  # weighted: the CUDA task decodes its contacts
+    drop = None
+    for flag in (True, False):
+        cpu = G1VelocityEnv(hand_collision=flag, **profile)
+        gpu = TensorG1Env(1, seed=4, resample_commands=False, push_velocity=0, observation_noise=False,
+                          randomize=False, hand_collision=flag, **profile)
+        try:
+            assert gpu.model.ngeom == cpu.model.ngeom == 74 + 14 + (2 if flag else 0)
+            for name in ('geom_type', 'geom_contype', 'geom_conaffinity', 'geom_condim', 'geom_priority'):
+                np.testing.assert_array_equal(wp.to_torch(getattr(gpu.model, name)).cpu().numpy(),
+                                              getattr(cpu.model, name), err_msg=name)
+            np.testing.assert_allclose(wp.to_torch(gpu.model.geom_friction).cpu().numpy()[0], cpu.model.geom_friction,
+                                       rtol=1e-6)
+            cpu.reset(seed=4, options={'command': [0., 0., 0.]})
+            if drop is None:
+                drop = capsule_bottom(cpu, cpu.hand_capsules[0]) + .005
+            cpu.data.qpos[2] -= drop
+            mujoco.mj_forward(cpu.model, cpu.data)
+            gpu.reset()
+            gpu.qpos.copy_(torch.tensor(cpu.data.qpos[None], device=gpu.device, dtype=torch.float32))
+            gpu.qvel.zero_()
+            gpu.command.zero_()
+            with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(gpu.device))):
+                wp.capture_launch(gpu.forward_graph)
+            floor, hands = cpu.model.geom('floor').id, set(cpu.hand_capsules.tolist())
+            count = int(gpu.nacon.item())
+            pairs = {tuple(sorted(int(g) for g in pair)) for pair in gpu.contact_geom[:count].long().cpu().numpy()}
+            cpu_pairs = {tuple(sorted(int(g) for g in pair)) for pair in cpu.data.contact.geom[:cpu.data.ncon]}
+            on_floor = lambda found: {g for pair in found if floor in pair for g in pair} & hands
+            assert on_floor(pairs) == on_floor(cpu_pairs) == hands  # both hands (the right one is 2 mm lower)
+            gpu.check_health()  # no contact or constraint buffer overflow
+        finally:
+            cpu.close()
+            gpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
 def test_g1_gpu_foot_collision_fits_the_default_contact_buffers():
     """256 worlds in training (resets without a command, force pushes, arm perturbation) under bang-bang leg actions
     that throw the feet about and cross them: the default nconmax / njmax (128 / 512 per world) never overflow with
@@ -2026,3 +2073,66 @@ def test_g1_gpu_height_draws_per_world_redraws_at_command_changes_freezes_its_co
             off.set_height(.7)
     finally:
         plain.close(), off.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_arm_blind_freezes_the_arm_columns_and_normalizes_as_the_cpu_path():
+    """arm_blind (iteration 31) on the height layout, 512 worlds with arm perturbations of 1.0 rad half the time and
+    sensor noise: the CUDA task's fixed_normalization is the CPU task's (95 term columns, then the 210 arm columns with
+    NaN means); its reset and first step are those of the task without arm_blind, bit for bit (the blindness is the
+    normalization's; the CPU test checks 200 steps). TensorNormalize on CUDA, imported from blind statistics (mean
+    −z·1e6, var 1e12 on the arm columns), keeps them through 30 updates and gives z there within 3e-5 in every world
+    and step; the same statistics on the CPU (train.FrozenMoments, VecNormalize's formula) normalize those
+    observations as TensorNormalize does."""
+    from stable_baselines3.common.running_mean_std import RunningMeanStd
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
+    from humanoid_sim.tensor_ppo import TensorNormalize
+    from humanoid_sim.train import FrozenMoments
+    profile = dict(push_velocity=0, observation_noise=True, randomize=False, arm_perturb=.5, arm_perturb_radians=1.)
+    n = 512
+    blind = TensorG1Env(n, seed=6, arm_blind=True, **profile, **HEIGHT_PROFILE)
+    seen = TensorG1Env(n, seed=6, **profile, **HEIGHT_PROFILE)
+    cpu = G1VelocityEnv(**HEIGHT_PROFILE, arm_blind=True, arm_perturb=.5, arm_perturb_radians=1.)
+    try:
+        positions, mean, variance = blind.fixed_normalization
+        expected = cpu.fixed_normalization
+        np.testing.assert_array_equal(positions, expected[0])
+        np.testing.assert_array_equal(mean, expected[1])  # NaN where NaN
+        np.testing.assert_array_equal(variance, expected[2])
+        columns = np.asarray(cpu.arm_columns)
+        assert len(columns) == 210 and np.array_equal(positions[-210:], columns) and np.isnan(mean[-210:]).all()
+        rng = np.random.default_rng(0)
+        stats = RunningMeanStd(shape=(589,))
+        stats.mean, stats.var, stats.count = rng.normal(0, .3, 589), rng.uniform(.05, 4, 589), 8e9
+        z = rng.uniform(-1.5, 1.5, 210)
+        stats.mean[columns], stats.var[columns] = -z * task.ARM_BLIND_SCALE, task.ARM_BLIND_SCALE ** 2
+        norm = TensorNormalize((589,), n, blind.device, fixed=blind.fixed_normalization)
+        norm.import_normalizer(type('Stats', (), dict(obs_rms=stats, ret_rms=RunningMeanStd(shape=()), gamma=.99))())
+        frozen = FrozenMoments(stats, blind.fixed_normalization)
+        arms = torch.as_tensor(columns, device=blind.device)
+        reference = torch.as_tensor(z, dtype=torch.float32, device=blind.device)
+        obs, other = blind.reset(), seen.reset()
+        assert torch.equal(obs, other)
+        action = torch.zeros((n, 29), device=blind.device)
+        (_, reward, *_), (_, other_reward, *_) = blind.step(action), seen.step(action)
+        # Two CUDA envs step in parallel contact solves whose atomics are not bitwise reproducible across instances,
+        # so the physics after one step agrees to float noise, not bit for bit (the CPU test checks bit for bit).
+        torch.testing.assert_close(blind.qpos, seen.qpos, rtol=0, atol=1e-5)
+        torch.testing.assert_close(reward, other_reward, rtol=0, atol=1e-4)
+        assert torch.equal(blind.generator.get_state(), seen.generator.get_state())
+        for _ in range(30):
+            normalized = norm.observation(obs)
+            frozen.update(obs.double().cpu().numpy())
+            assert float((normalized[:, arms] - reference).abs().max()) < 3e-5
+            on_cpu = np.clip((obs.double().cpu().numpy() - frozen.mean) / np.sqrt(frozen.var + 1e-8), -10, 10)
+            np.testing.assert_allclose(normalized.cpu().numpy(), on_cpu.astype(np.float32), rtol=1e-6, atol=1e-6)
+            obs, *_ = blind.step(action)
+            blind.check_health()
+        assert blind.rollout_metrics()['rollout/arm_perturb'] > .1
+        assert float(obs[:, arms].std(dim=0).max()) > .1  # the raw arm inputs did move
+        torch.testing.assert_close(norm.obs.mean[arms].cpu(), torch.from_numpy(-z * task.ARM_BLIND_SCALE), rtol=0, atol=0)
+        assert bool((norm.obs.var[arms] == task.ARM_BLIND_SCALE ** 2).all())
+        np.testing.assert_array_equal(frozen.mean[columns], -z * task.ARM_BLIND_SCALE)
+    finally:
+        blind.close(), seen.close(), cpu.close()

@@ -9,9 +9,11 @@ newest frame's second moment, so their first updates are of the usual size. A di
 so the result is a new root, not a branch (validate_resume rejects the old stage there).
 
 carry_over moves a stage to a contract with the same layout; insert_terms to one with observation terms added
-(task_config height_command, upper_body_slot): new columns with zero weights and fixed normalization.
+(task_config height_command, upper_body_slot): new columns with zero weights and fixed normalization; blind_arms to
+task_config arm_blind: the arm columns' normalization fixed at the stage's own mean normalized arm inputs.
 
-    python -m humanoid_sim.warm_start <source stage dir> <new experiment dir> [--same-layout | --insert-terms]
+    python -m humanoid_sim.warm_start <source stage dir> <new experiment dir> [--same-layout | --insert-terms |
+        --blind-arms]
 """
 import argparse
 import pickle
@@ -22,11 +24,11 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from .checkpoint_schema import validate_resume
-from .core import read_json, save_stage, write_json
+from .checkpoint_schema import checkpoint_identity, validate_resume
+from .core import load_stage, read_json, save_stage, stage_task_config, write_json
 from .tasks import g1_tensor_math as task
 from .tasks.catalog import make_task
-from .tasks.config import FOOT_COLLISION_SUFFIX
+from .tasks.config import ARM_BLIND_SUFFIX, FOOT_COLLISION_SUFFIX, HAND_COLLISION_SUFFIX
 from .tasks.identity import task_identity
 
 PARAMETERS = ('learning_rate', 'n_steps', 'batch_size', 'n_epochs', 'gamma', 'gae_lambda', 'ent_coef', 'clip_range',
@@ -107,23 +109,50 @@ def widen_history(source, run_dir):
 
 CARRIED_SCHEMAS = ('observation_schema', 'action_schema')
 # Model revision suffixes carry_over may also cross, added or removed: physics that only adds contacts between the same
-# bodies (task_config foot_collision: the feet collide with each other), so the joints and the layout stay.
-CARRIED_MODEL_SUFFIXES = (FOOT_COLLISION_SUFFIX,)
+# bodies (task_config foot_collision: the feet collide with each other; hand_collision: the hands collide with the floor
+# and the body), so the joints and the layout stay.
+CARRIED_MODEL_SUFFIXES = (FOOT_COLLISION_SUFFIX, HAND_COLLISION_SUFFIX)
+
+
+def model_suffixes(revision):
+    """(the rest, suffixes) of a model revision: the CARRIED_MODEL_SUFFIXES at its end, peeled off one by one in
+    whatever order they were appended, as a list (a repeated one twice)."""
+    suffixes = []
+    while True:
+        suffix = next((s for s in CARRIED_MODEL_SUFFIXES if revision.endswith(s)), None)
+        if suffix is None:
+            return revision, suffixes
+        revision, suffixes = revision[:-len(suffix)], [suffix, *suffixes]
 
 
 def carried_fields(saved, wanted):
     """The identity fields carry_over may change between `saved` and `wanted`: the observation and action schemas, and
-    the model revision when the two differ by exactly one of CARRIED_MODEL_SUFFIXES at its end."""
+    the model revision when the two have the same rest (model_suffixes) and their CARRIED_MODEL_SUFFIXES differ by
+    exactly one, added or removed (foot_collision and hand_collision each on their own)."""
     old, new = saved.get('model_revision'), wanted.get('model_revision')
-    crossed = isinstance(old, str) and isinstance(new, str) and any(
-        old + suffix == new or new + suffix == old for suffix in CARRIED_MODEL_SUFFIXES)
+    crossed = False
+    if isinstance(old, str) and isinstance(new, str):
+        (old_rest, old_suffixes), (new_rest, new_suffixes) = model_suffixes(old), model_suffixes(new)
+        if old_rest == new_rest and all(len(set(s)) == len(s) for s in (old_suffixes, new_suffixes)):
+            crossed = len(set(old_suffixes) ^ set(new_suffixes)) == 1
     return CARRIED_SCHEMAS + (('model_revision',) if crossed else ())
+
+
+def check_same_arm_blind(saved, wanted):
+    """Raises if `saved` and `wanted` differ in task_config arm_blind (ARM_BLIND_SUFFIX in the observation schema):
+    carried as they are, the arm columns would keep the old statistics, so only blind_arms switches it on."""
+    blind = [ARM_BLIND_SUFFIX in str(identity.get('observation_schema')) for identity in (saved, wanted)]
+    if blind[0] != blind[1]:
+        raise ValueError('Слепые руки (arm_blind) включает только blind_arms (scripts/lab/blind_branch.py): ей нужна '
+                         'нормировка рук этапа-родителя')
 
 
 def check_carry_over(saved, wanted):
     """Raises unless a stage of identity `saved` may move to the contract `wanted` by carry_over: at least one of the
     observation and action schemas differs, or the model revision gains or loses a suffix of CARRIED_MODEL_SUFFIXES,
-    and every other field validate_resume compares is the same."""
+    and every other field validate_resume compares is the same; task_config arm_blind may not change
+    (check_same_arm_blind)."""
+    check_same_arm_blind(saved, wanted)
     fields = carried_fields(saved, wanted)
     if all(saved.get(field) == wanted[field] for field in fields):
         validate_resume(saved, wanted)  # a difference carry_over may not cross is refused by its name
@@ -135,7 +164,8 @@ def carry_over(source, run_dir):
     """The source stage as the first stage of run_dir when the new contract keeps the same input and output layout
     and changes only what some inputs or outputs mean (task_config phase_stop: the gait phase reads 0 while standing;
     lock_wrists: four action entries no longer reach the motors; knee_floor: knee actions below the floor no longer
-    move the knee target) or adds contacts to the physics (foot_collision: the feet collide with each other). Only the
+    move the knee target) or adds contacts to the physics (foot_collision: the feet collide with each other;
+    hand_collision: the hands with the floor and the body). Only the
     observation and action schemas and a model revision suffix of CARRIED_MODEL_SUFFIXES may differ; robot, the rest
     of the model revision, normalization and control step must match, the observation must keep its size and
     the action space (size and box) must be the same. Weights, normalization and optimizer state are kept as they
@@ -189,7 +219,9 @@ def observation_keys(raw):
 
 def check_insert_terms(saved, wanted):
     """Raises unless a stage of identity `saved` may move to the contract `wanted` by insert_terms: the observation
-    schema differs and every other field validate_resume compares is the same."""
+    schema differs and every other field validate_resume compares is the same; task_config arm_blind may not change
+    (check_same_arm_blind)."""
+    check_same_arm_blind(saved, wanted)
     if saved.get('observation_schema') == wanted['observation_schema']:
         validate_resume(saved, wanted)
         raise ValueError('Вставлять нечего: разъём наблюдения тот же')
@@ -255,7 +287,7 @@ def insert_terms(source, run_dir):
         for name, values in (('mean', mean), ('var', variance)):
             wide = np.zeros(len(mapping))
             wide[known.numpy()] = getattr(norm.obs_rms, name)[mapping[known].numpy()]
-            wide[positions] = values
+            wide[positions] = np.where(np.isnan(values), wide[positions], values)  # NaN: the column's own (arm_blind)
             setattr(norm.obs_rms, name, wide)
         norm.observation_space = base.observation_space
         norm.set_venv(base)
@@ -295,6 +327,98 @@ def insert_terms(source, run_dir):
         base.close()
 
 
+# blind_arms' reference runs (the critic's mixref, lab-critic/it30 blind_const.py): (command, first and last control
+# step averaged) of deterministic runs of the source stage in its own CPU environment, heading hold off, gait phase 0,
+# reset seed BLIND_SEED (the first of core.evaluate_stage's); standing 1-2 s, walking 0.5 and 1 m/s 2-4 s.
+BLIND_RUNS = (((0., 0., 0.), 50, 100), ((.5, 0., 0.), 100, 200), ((1., 0., 0.), 100, 200))
+BLIND_SEED = 60000
+
+
+def blind_reference(stage, runs=BLIND_RUNS, seed=BLIND_SEED):
+    """z, (arm columns,): the mean normalized arm inputs (G1VelocityEnv.arm_columns, normalized with the stage's own
+    statistics, as the policy sees them) of the stage's deterministic policy over each run's control steps
+    [first, last) in its own CPU environment (heading hold off, reset `seed` with the run's command at gait phase 0),
+    averaged over the runs; and the runs' means. Raises if the stage falls in a run."""
+    stage = Path(stage)
+    identity = checkpoint_identity(read_json(stage / 'metadata.json'))
+    model, norm = load_stage(stage)
+    env = make_task(identity['task_id'], identity['robot_id'], {**stage_task_config(stage), 'heading_hold': False})
+    means = []
+    try:
+        columns = np.asarray(env.unwrapped.arm_columns)
+        for command, first, last in runs:
+            obs, _ = env.reset(seed=seed, options={'command': list(command), 'phase_steps': 0})
+            seen = []
+            for step in range(last):
+                normalized = norm.normalize_obs(obs)
+                if step >= first:
+                    seen.append(normalized[columns])
+                obs, _, terminated, _, _ = env.step(model.predict(normalized, deterministic=True)[0])
+                if terminated:
+                    raise ValueError(f'Этап падает в опорном прогоне (команда {list(command)}, шаг {step + 1}): '
+                                     'входы рук для слепых рук не посчитать')
+            means.append(np.mean(seen, axis=0, dtype=np.float64))
+    finally:
+        env.close()
+        norm.close()
+    return np.mean(means, axis=0), means
+
+
+def check_blind_arms(saved, robot_id, task_id, task_config):
+    """Raises unless a stage of identity `saved` may move by blind_arms to the task `task_config`: arm_blind on there
+    and every field validate_resume compares the same as the task without it (so the stage itself is not blind)."""
+    if task_config.get('arm_blind') is not True:
+        raise ValueError('Для слепых рук в задаче новой ветки нужен arm_blind: true')
+    validate_resume(saved, task_identity(robot_id, task_id, {**task_config, 'arm_blind': False}))
+
+
+def blind_arms(source, run_dir, reference=None):
+    """The source stage as the first stage of run_dir under task_config arm_blind (the run's task: the source's with
+    arm_blind true, check_blind_arms). Weights, optimizer state, steps and every other column's statistics are kept as
+    they are; the arm columns (G1VelocityEnv.arm_columns: 210 at history 5) get variance ARM_BLIND_SCALE² and mean
+    −z·ARM_BLIND_SCALE, z = reference or blind_reference(source), so the network sees z there whatever the arms do and
+    acts as the source would with its normalized arm inputs held at z. TensorNormalize and train.FrozenMoments keep
+    them frozen (fixed_normalization). warm_start.json records z and its runs."""
+    source, run_dir = Path(source), Path(run_dir)
+    config = read_json(run_dir / 'run_config.json')
+    robot_id, task_id, task_config = config['robot_id'], config['task_id'], config['task_config']
+    saved = read_json(source / 'metadata.json')
+    check_blind_arms(saved, robot_id, task_id, task_config)
+    z = blind_reference(source)[0] if reference is None else np.asarray(reference, dtype=np.float64)
+    base = DummyVecEnv([lambda: make_task(task_id, robot_id, task_config)])
+    try:
+        raw = base.envs[0].unwrapped
+        columns = np.asarray(raw.arm_columns)
+        if z.shape != columns.shape or not np.isfinite(z).all():
+            raise ValueError('Опорные входы рук не совпадают со столбцами рук')
+        with open(source / 'normalize.pkl', 'rb') as file:
+            norm = pickle.load(file)
+        if norm.obs_rms.mean.shape != base.observation_space.shape:
+            raise ValueError('Раскладка входа изменилась: слепые руки её не меняют')
+        if getattr(norm, 'action_space', None) != base.action_space:
+            raise ValueError('Раскладка или предел действия изменились: веса так не переносятся')
+        mean, var = norm.obs_rms.mean.astype(np.float64), norm.obs_rms.var.astype(np.float64)
+        mean[columns], var[columns] = -z * task.ARM_BLIND_SCALE, task.ARM_BLIND_SCALE ** 2
+        norm.obs_rms.mean, norm.obs_rms.var = mean, var
+        norm.observation_space = base.observation_space
+        norm.set_venv(base)
+        model = PPO.load(source / 'policy.zip', env=norm, device='cpu')
+        stage = save_stage(run_dir, model, norm)
+        write_json(stage / 'warm_start.json', {
+            'source': str(source.resolve()), 'steps': model.num_timesteps,
+            'method': 'arm_blind: weights carried over unchanged; arm columns normalized to the source stage\'s mean '
+                      f'normalized arm inputs z (variance {task.ARM_BLIND_SCALE ** 2:g}, '
+                      f'mean -z*{task.ARM_BLIND_SCALE:g})',
+            'from_schema': saved.get('observation_schema'),
+            'to_schema': task_identity(robot_id, task_id, task_config)['observation_schema'],
+            'reference_runs': [[list(command), first, last] for command, first, last in BLIND_RUNS],
+            'reference_seed': BLIND_SEED, 'reference_given': reference is not None,
+            'columns': columns.tolist(), 'z': z.tolist()})
+        return stage
+    finally:
+        base.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('source', type=Path)
@@ -303,8 +427,11 @@ def main(argv=None):
     layout.add_argument('--same-layout', action='store_true', help='carry the weights over unchanged (carry_over)')
     layout.add_argument('--insert-terms', action='store_true',
                         help='new observation terms (height_command, upper_body_slot): insert_terms')
+    layout.add_argument('--blind-arms', action='store_true',
+                        help='arm_blind: the arm columns normalized to the stage\'s own constants (blind_arms)')
     args = parser.parse_args(argv)
-    method = carry_over if args.same_layout else insert_terms if args.insert_terms else widen_history
+    method = (carry_over if args.same_layout else insert_terms if args.insert_terms else blind_arms if args.blind_arms
+              else widen_history)
     print(method(args.source, args.run_dir))
 
 

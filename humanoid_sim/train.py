@@ -1,18 +1,66 @@
+import copyreg
 import os
 from importlib.metadata import version
 import time
 from pathlib import Path
 from functools import partial
 
+import numpy as np
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.logger import configure
+from stable_baselines3.common.running_mean_std import RunningMeanStd
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
 from .core import RunLock, list_stages, save_stage, evaluate_stage, write_json, read_json
 from .night import SleepGuard
+
+
+class FrozenMoments(RunningMeanStd):
+    """SB3 observation statistics whose fixed columns stay put through every update, as TensorNormalize's fixed= on the
+    full-GPU path. fixed: (positions, mean, variance), a task's fixed_normalization; a NaN mean keeps the column's mean
+    as `rms` has it (G1 arm_blind). Pickled as a plain RunningMeanStd, so a saved normalize.pkl is the ordinary one."""
+
+    def __init__(self, rms, fixed):
+        super().__init__(shape=rms.mean.shape)
+        self.mean, self.var, self.count = rms.mean.copy(), rms.var.copy(), rms.count
+        positions, mean, variance = fixed
+        self.positions = np.asarray(positions, dtype=np.int64)
+        mean = np.asarray(mean, dtype=np.float64)
+        self.fixed_mean = np.where(np.isnan(mean), self.mean[self.positions], mean)
+        self.fixed_var = np.asarray(variance, dtype=np.float64)
+        self._freeze()
+
+    def _freeze(self):
+        self.mean[self.positions] = self.fixed_mean
+        self.var[self.positions] = self.fixed_var
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        super().update_from_moments(batch_mean, batch_var, batch_count)
+        self._freeze()
+
+    def __reduce_ex__(self, protocol):
+        # copyreg's own rebuild of a plain object (__newobj__ insists on the instance's class): no reference to this
+        # module in the pickle.
+        return copyreg._reconstructor, (RunningMeanStd, object, None), {
+            'mean': self.mean.copy(), 'var': self.var.copy(), 'count': self.count}
+
+
+def freeze_normalization(env, task_id, robot_id, task_config):
+    """Keeps the task's fixed_normalization columns (G1 height_command / upper_body_slot terms, arm_blind's arm
+    columns) frozen in the CPU path's VecNormalize `env`, as full_gpu_train does with TensorNormalize; nothing for a
+    task without them. The columns are read from one environment built here (the vectorized ones may be
+    subprocesses)."""
+    from .tasks.catalog import make_task
+    probe = make_task(task_id, robot_id, task_config)
+    try:
+        fixed = getattr(probe.unwrapped, 'fixed_normalization', None)
+    finally:
+        probe.close()
+    if fixed is not None:
+        env.obs_rms = FrozenMoments(env.obs_rms, fixed)
 
 
 class StageCallback(BaseCallback):
@@ -134,6 +182,8 @@ def train(args):
                 model = PPO('MlpPolicy', env, **parameters,
                             policy_kwargs={'net_arch': [256, 256], 'log_std_init': -1},
                             device='cpu', seed=args.seed, verbose=1)
+            if not (config and config['backend'] == 'gpu'):  # the gpu backend's env is the Humanoid's Warp one
+                freeze_normalization(env, task_id, robot_id, (config or {}).get('task_config') or {})
             session_dir = run / f'session_{time.time_ns()}'
             model.set_logger(configure(str(session_dir), ['stdout', 'csv']))
             callback = StageCallback(run, args.every, model.num_timesteps + args.steps, duration, getattr(args, 'parent_stop', None))
