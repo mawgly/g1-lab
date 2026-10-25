@@ -27,7 +27,23 @@ def joint_mirror(env):
     raw = env.unwrapped
     names = [raw.model.joint(j).name for j in raw.joints]
     raw.reset(seed=0)  # the home pose (± 0.01 rad), so joint axes are those of a symmetric pose
-    axes = [raw.data.xaxis[j].copy() for j in raw.joints]
+    return _mirror(names, [raw.data.xaxis[j].copy() for j in raw.joints])
+
+
+def model_joint_mirror(model, joints, qadr, home):
+    """joint_mirror's (permutation, signs) from a model alone, its joint axes in the home pose (home: the actuated
+    joints' angles at qadr, pelvis upright), without resetting an environment (tasks/g1_velocity: task_config
+    arm_targets mirrors its carry poses by it)."""
+    import mujoco
+    data = mujoco.MjData(model)
+    data.qpos[:] = model.qpos0
+    data.qpos[qadr] = home
+    mujoco.mj_kinematics(model, data)
+    return _mirror([model.joint(j).name for j in joints], [data.xaxis[j].copy() for j in joints])
+
+
+def _mirror(names, axes):
+    """(permutation, signs) of joints `names` with world axes `axes` in a symmetric pose."""
     permutation, signs = [], []
     for i, name in enumerate(names):
         other = name.replace('left', '\0').replace('right', 'left').replace('\0', 'right')

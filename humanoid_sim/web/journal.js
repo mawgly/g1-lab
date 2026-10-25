@@ -46,6 +46,7 @@ const ROLES = {
   watch: t('Дежурный'),
   chronicler: t('Летописец'),
   engineer: t('Инженер'),
+  reviewer: t('Ревизор'),
 };
 const STATES = { done: t('сделано'), active: t('идёт'), next: t('впереди') };
 const VERDICTS = { best: t('★ лучшая'), control: t('контроль'), dead_end: t('тупик'), active: t('идёт') };
@@ -69,7 +70,7 @@ function status(message, error = false) {
   $('journal-status').classList.toggle('error', error);
 }
 
-// #entries[/<entry id>], #council[/<iteration id>], #stages[/<stage n>[/<step n>]], #check.
+// #entries[/<entry id>], #council[/<iteration id>], #stages[/<stage n>[/<step n>]], #check[/skills].
 function route() {
   let parts = [];
   try {
@@ -181,6 +182,12 @@ const ticks = (check) =>
   `<span class="j-ticks" aria-hidden="true">${check.items.map((i) => `<span class="${markOf(i)}">${MARKS[markOf(i)]}</span>`).join('')}</span>`;
 const passed = (check) =>
   t('выполнено {done} из {total}', { done: check.items.filter((i) => i.ok).length, total: check.items.length });
+// The skills check (scripts/lab/skills_check.py): rows with ok null are «н/п» and are not counted.
+const judged = (skills) => ({ ...skills, items: skills.items.filter((i) => i.ok !== null) });
+const skillsScore = (skills) => {
+  const n = skills.items.length - judged(skills).items.length;
+  return `${ticks(judged(skills))} ${passed(judged(skills))}${n ? ` · ${t('неприменимо: {n}', { n })}` : ''}`;
+};
 const iterations = () => [...(journal.iterations || [])].sort((a, b) => b.at - a.at);
 
 // --- Entries ----------------------------------------------------------------------------------------------------
@@ -191,6 +198,10 @@ function asideMarkup() {
   const check = c
     ? `<section class="card" aria-labelledby="aside-check"><p class="eyebrow">${t('Последняя проверка')}</p><p class="j-meta">${time(c.at)}</p><h2 class="j-title" id="aside-check"><a href="#check">${esc(c.title)}</a></h2><p>${ticks(c)} ${passed(c)}</p><div class="j-now" data-now hidden></div></section>`
     : `<section class="card"><p class="eyebrow">${t('Последняя проверка')}</p><p>${t('Проверок пока не было.')}</p><div class="j-now" data-now hidden></div></section>`;
+  const s = journal.skills;
+  const skills = s
+    ? `<section class="card" aria-labelledby="aside-skills"><p class="eyebrow">${t('Проверка навыков')}</p><p class="j-meta">${time(s.at)}</p><h2 class="j-title" id="aside-skills"><a href="#check/skills">${esc(s.title)}</a></h2><p>${t('Эталон: {title}', { title: esc(s.against.title) })}</p><p>${skillsScore(s)}</p></section>`
+    : '';
   const council = latest
     ? `<section class="card" aria-labelledby="aside-council"><p class="eyebrow">${t('Совет лаборатории')}</p><p class="j-meta">${time(latest.at)}</p><h2 class="j-title" id="aside-council"><a href="#council/${esc(latest.id)}">${esc(latest.title)}</a></h2><p><b>${latest.decision ? t('Решение:') : t('Обсуждается:')}</b> ${esc(firstSentence(latest.decision || t('решения ещё нет'), 240))}</p></section>`
     : '';
@@ -202,7 +213,7 @@ function asideMarkup() {
         )
         .join('')}</ol></section>`
     : '';
-  return check + council + plan;
+  return check + skills + council + plan;
 }
 const entryMarkup = (x, focus) =>
   `<article class="card j-entry${x.id === focus ? ' j-focus' : ''}" id="entry-${esc(x.id)}"><p class="j-meta"><a href="#entries/${esc(x.id)}">${time(x.at)}</a></p><h2 class="j-title">${esc(x.title)}</h2><div class="j-text">${paragraphs(x.text)}</div>${clipMarkup(x, x.title)}${imageMarkup(x)}${figureMarkup(x, x.title)}${raceLink(x.race, t('Открыть в 3D'))}</article>`;
@@ -267,7 +278,7 @@ function storyMarkup(index, focusStep) {
   const sections = (story?.sections || [])
     .map((s, i) => {
       toc.push([`story-section-${i}`, esc(s.title)]);
-      return `<section class="card j-section" id="story-section-${i}"><h3>${esc(s.title)}</h3><div class="j-text">${paragraphs(s.text)}</div>${figureMarkup(s, s.title)}</section>`;
+      return `<section class="card j-section" id="story-section-${i}"><h3>${esc(s.title)}</h3><div class="j-text">${paragraphs(s.text)}</div>${clipMarkup(s, s.title)}${figureMarkup(s, s.title)}</section>`;
     })
     .join('');
   let steps = '';
@@ -324,14 +335,39 @@ function storyMarkup(index, focusStep) {
 
 function renderCheck() {
   const c = journal.check;
-  if (!c) return `<p class="muted">${t('Проверок пока не было.')}</p><div class="j-now" data-now hidden></div>`;
-  const rows = c.items
+  const goal = c
+    ? (() => {
+        const rows = c.items
+          .map((item) => {
+            const mark = markOf(item);
+            return `<tr class="${mark}"><td><span class="j-mark" aria-hidden="true">${MARKS[mark]}</span><span class="j-sr">${MARK_WORDS[mark]}: </span>${esc(item.label)}</td><td class="num" data-label="${t('Значение')}">${esc(item.value)}</td><td data-label="${t('Цель')}">${esc(item.target)}</td></tr>`;
+          })
+          .join('');
+        return `<div class="card j-check"><p class="eyebrow">${t('Последняя проверка')}</p><p class="j-meta">${time(c.at)} · ${esc(c.branch)} · ${t('{n} млн шагов', { n: fmt(c.stage / 1e6, 1) })}</p><h2 class="j-title">${esc(c.title)}</h2><p class="j-score">${ticks(c)} ${passed(c)}</p><div class="j-now" data-now hidden></div><div class="scroll-x"><table class="data j-checks"><thead><tr><th scope="col">${t('Условие')}</th><th scope="col">${t('Значение')}</th><th scope="col">${t('Цель')}</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+      })()
+    : `<p class="muted">${t('Проверок пока не было.')}</p><div class="j-now" data-now hidden></div>`;
+  return goal + skillsMarkup();
+}
+// The skills check: has the stage kept what its reference (the branch's parent, or a candidate) could do? A row a
+// skill's measure: the threshold, the stage's value, the reference's and which held (the note).
+function skillsMarkup() {
+  const s = journal.skills;
+  if (!s) return '';
+  let skill = null;
+  const rows = s.items
     .map((item) => {
       const mark = markOf(item);
-      return `<tr class="${mark}"><td><span class="j-mark" aria-hidden="true">${MARKS[mark]}</span><span class="j-sr">${MARK_WORDS[mark]}: </span>${esc(item.label)}</td><td class="num" data-label="${t('Значение')}">${esc(item.value)}</td><td data-label="${t('Цель')}">${esc(item.target)}</td></tr>`;
+      const head =
+        item.skill !== skill ? `<tr class="j-skill"><th scope="rowgroup" colspan="5">${esc(item.skill)}</th></tr>` : '';
+      skill = item.skill;
+      return `${head}<tr class="${mark}"><td><span class="j-mark" aria-hidden="true">${MARKS[mark]}</span><span class="j-sr">${MARK_WORDS[mark]}: </span>${esc(item.label)}</td><td data-label="${t('Порог')}">${esc(item.target)}</td><td class="num" data-label="${t('Этап')}">${esc(item.value)}</td><td class="num" data-label="${t('Эталон')}">${esc(item.reference)}</td><td class="j-note" data-label="${t('Итог')}">${esc(item.note)}</td></tr>`;
     })
     .join('');
-  return `<div class="card j-check"><p class="eyebrow">${t('Последняя проверка')}</p><p class="j-meta">${time(c.at)} · ${esc(c.branch)} · ${t('{n} млн шагов', { n: fmt(c.stage / 1e6, 1) })}</p><h2 class="j-title">${esc(c.title)}</h2><p class="j-score">${ticks(c)} ${passed(c)}</p><div class="j-now" data-now hidden></div><div class="scroll-x"><table class="data j-checks"><thead><tr><th scope="col">${t('Условие')}</th><th scope="col">${t('Значение')}</th><th scope="col">${t('Цель')}</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+  const spent =
+    s.seconds != null
+      ? ` · ${t('{n} мин', { n: fmt(s.seconds / 60, 1) })}, ${fmt(s.runs)} ${tn(s.runs || 0, 'прогон|прогона|прогонов')}`
+      : '';
+  return `<div class="card j-check" id="skills-card"><p class="eyebrow">${t('Проверка навыков')}</p><p class="j-meta">${time(s.at)} · ${esc(s.branch)} · ${t('{n} млн шагов', { n: fmt(s.stage / 1e6, 1) })}${spent}</p><h2 class="j-title">${esc(s.title)}</h2><p>${t('Эталон: {title}', { title: esc(s.against.title) })}</p><p class="j-score">${skillsScore(s)}</p><div class="scroll-x"><table class="data j-checks j-skills"><thead><tr><th scope="col">${t('Навык и мера')}</th><th scope="col">${t('Порог')}</th><th scope="col">${t('Этап')}</th><th scope="col">${t('Эталон')}</th><th scope="col">${t('Итог')}</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
 }
 
 // --- Showing a view ---------------------------------------------------------------------------------------------
@@ -403,7 +439,9 @@ function show(navigated) {
         ? $('iteration-' + rest[0])
         : view === 'stages' && rest[1]
           ? $('step-' + rest[1])
-          : null;
+          : view === 'check' && rest[0] === 'skills'
+            ? $('skills-card')
+            : null;
   if (target) jumpTo(target);
   else if ($('journal-tabs').getBoundingClientRect().top < 0) jumpTo($('journal-tabs'));
 }
@@ -486,7 +524,7 @@ async function load() {
     if (text === journalText) return renderNow();
     const first = !journal;
     journalText = text;
-    journal = { roadmap: [], check: null, entries: [], iterations: [], ...next };
+    journal = { roadmap: [], check: null, skills: null, entries: [], iterations: [], ...next };
     counts();
     show(first);
   } catch (error) {

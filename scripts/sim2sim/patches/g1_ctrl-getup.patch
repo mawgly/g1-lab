@@ -1,0 +1,226 @@
+--- a/deploy/include/FSM/State_RLBase.h
++++ b/deploy/include/FSM/State_RLBase.h
+@@ -15,6 +15,8 @@
+     
+     void enter()
+     {
++        // sim2sim getup patch: the state's time limit (config.yaml timeout) counts from here
++        entered_at = std::chrono::steady_clock::now();
+         // set gain
+         for (int i = 0; i < env->robot->data.joint_stiffness.size(); ++i)
+         {
+@@ -54,6 +56,10 @@
+     void run();
+     // sim2sim patch: Unitree's bad_orientation, from this FSM tick's IMU (tilt in rad); logs when it fires
+     bool fell_over(float limit_angle);
++    // sim2sim getup patch: longer than config.yaml's timeout (s) in the state; a joint faster than its own
++    // max_joint_speed (rad/s) on this FSM tick's lowstate. Each logs when it fires.
++    bool timed_out();
++    bool too_fast();
+     
+     void exit()
+     {
+@@ -70,6 +76,13 @@
+     bool policy_thread_running = false;
+     std::atomic<bool> policy_stepped{false};  // the policy thread has processed an action since enter()
+     int held_ticks = -1;  // FSM ticks run() kept the previous target for; -1 once reported
++    // sim2sim getup patch: this state's checks from config.yaml (fall_tilt rad, timeout s, max_joint_speed rad/s;
++    // a key missing: no such check) and when it was entered. max_joint_speed is kept per SDK motor (lowstate's
++    // order); config.yaml gives one number for all or a list in that order.
++    float fall_tilt = 0.0f;
++    float timeout = 0.0f;
++    std::vector<float> max_joint_speed;
++    std::chrono::steady_clock::time_point entered_at;
+ };
+ 
+ REGISTER_FSM(State_RLBase)
+--- a/deploy/robots/g1/src/State_RLBase.cpp
++++ b/deploy/robots/g1/src/State_RLBase.cpp
+@@ -3,6 +3,8 @@
+ #include "isaaclab/envs/mdp/observations/observations.h"
+ #include "isaaclab/envs/mdp/actions/joint_actions.h"
+ #include <unordered_map>
++#include <algorithm>  // sim2sim getup patch: max_joint_speed's checks
++#include <stdexcept>
+ 
+ namespace isaaclab
+ {
+@@ -32,7 +34,8 @@
+ }
+ 
+ // sim2sim patch: tilt from vertical (rad) past which Velocity goes to Passive. It is the limit Unitree passes to
+-// isaaclab::mdp::bad_orientation below; that check is commented out in terminations.h (returns false).
++// isaaclab::mdp::bad_orientation below; that check is commented out in terminations.h (returns false). Since the getup
++// patch each RLBase state takes its own from config.yaml (fall_tilt; this one without the key, 0: no tilt check).
+ static constexpr float kFallTilt = 1.0f;
+ static constexpr float kRadToDeg = 57.2957795f;
+ 
+@@ -48,14 +51,59 @@
+     );
+     env->alg = std::make_unique<isaaclab::OrtRunner>(policy_dir / "exported" / "policy.onnx");
+ 
+-    this->registered_checks.emplace_back(
+-        std::make_pair(
+-            [&]()->bool{ return fell_over(kFallTilt); },  // sim2sim patch: was bad_orientation(env.get(), 1.0)
+-            FSMStringMap.right.at("Passive")
+-        )
+-    );
+-    spdlog::info("{}: pelvis tilt past {:.1f} deg goes to Passive (sim2sim fall-passive patch)", state_string,
+-                 kFallTilt * kRadToDeg);
++    // sim2sim getup patch: the state's own tilt limit (config.yaml fall_tilt, rad; kFallTilt without it, as the
++    // fall-passive patch had it for every RLBase state); 0 turns the check off (GetUp: it starts lying).
++    fall_tilt = cfg["fall_tilt"] ? cfg["fall_tilt"].as<float>() : kFallTilt;
++    if (fall_tilt > 0.0f) {
++        this->registered_checks.emplace_back(
++            std::make_pair(
++                [this]()->bool{ return fell_over(fall_tilt); },  // sim2sim patch: was bad_orientation(env.get(), 1.0)
++                FSMStringMap.right.at("Passive")
++            )
++        );
++        spdlog::info("{}: pelvis tilt past {:.1f} deg goes to Passive (sim2sim fall-passive patch)", state_string,
++                     fall_tilt * kRadToDeg);
++    } else {
++        spdlog::info("{}: no pelvis tilt check, fall_tilt 0 in config.yaml (sim2sim getup patch)", state_string);
++    }
++    // sim2sim getup patch: Passive after timeout s in the state, or as soon as a joint turns faster than its
++    // max_joint_speed rad/s (config.yaml; GetUp: 10 s, a list per joint).
++    if (cfg["timeout"]) {
++        timeout = cfg["timeout"].as<float>();
++        this->registered_checks.emplace_back(
++            std::make_pair([this]()->bool{ return timed_out(); }, FSMStringMap.right.at("Passive")));
++        spdlog::info("{}: Passive after {:.1f} s in the state (sim2sim getup patch)", state_string, timeout);
++    }
++    if (cfg["max_joint_speed"]) {
++        // One number for every joint, or a list with one per SDK motor in lowstate's order (as many as the
++        // policy's joint_ids_map covers: 29 on the G1 29-DoF); anything else stops g1_ctrl here.
++        auto limits = cfg["max_joint_speed"];
++        size_t motors = 0;
++        for (float index : env->robot->data.joint_ids_map) {
++            motors = std::max(motors, static_cast<size_t>(index) + 1);
++        }
++        if (limits.IsSequence()) {
++            max_joint_speed = limits.as<std::vector<float>>();
++        } else {
++            max_joint_speed.assign(motors, limits.as<float>());
++        }
++        if (max_joint_speed.size() != motors) {
++            throw std::runtime_error(state_string + ": config.yaml max_joint_speed has " +
++                                     std::to_string(max_joint_speed.size()) + " numbers, the policy drives " +
++                                     std::to_string(motors) + " SDK motors (sim2sim getup patch)");
++        }
++        for (float limit : max_joint_speed) {
++            if (!(limit > 0.0f)) {
++                throw std::runtime_error(state_string + ": config.yaml max_joint_speed has " +
++                                         std::to_string(limit) + ", each must be above 0 (sim2sim getup patch)");
++            }
++        }
++        this->registered_checks.emplace_back(
++            std::make_pair([this]()->bool{ return too_fast(); }, FSMStringMap.right.at("Passive")));
++        auto [lowest, highest] = std::minmax_element(max_joint_speed.begin(), max_joint_speed.end());
++        spdlog::info("{}: Passive once a joint is faster than its max_joint_speed, {:.1f}-{:.1f} rad/s over {} SDK "
++                     "motors (sim2sim getup patch)", state_string, *lowest, *highest, max_joint_speed.size());
++    }
+ }
+ 
+ void State_RLBase::run()
+@@ -99,4 +147,45 @@
+     spdlog::warn("{}: pelvis tilt {:.1f} deg > {:.1f} deg at lowstate tick {}, going to Passive "
+                  "(sim2sim fall-passive patch)", getStateString(), tilt * kRadToDeg, limit_angle * kRadToDeg, tick);
+     return true;
++}
++
++bool State_RLBase::timed_out()
++{
++    // sim2sim getup patch: the time since enter() against config.yaml's timeout of this state
++    float seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - entered_at).count();
++    if (seconds <= timeout) {
++        return false;
++    }
++    spdlog::warn("{}: {:.2f} s in the state > {:.1f} s, going to Passive (sim2sim getup patch)", getStateString(),
++                 seconds, timeout);
++    return true;
++}
++
++bool State_RLBase::too_fast()
++{
++    // sim2sim getup patch: each of the policy's joints on the lowstate of this FSM tick against its own limit,
++    // config.yaml's max_joint_speed of this state by SDK motor; the one furthest past its limit is logged
++    float worst = 1.0f;  // speed / limit of the motor logged
++    float fastest = 0.0f;
++    int motor = -1;
++    uint32_t tick;
++    {
++        std::lock_guard<std::mutex> lock(lowstate->mutex_);
++        for (size_t i = 0; i < env->robot->data.joint_ids_map.size(); i++) {
++            int index = static_cast<int>(env->robot->data.joint_ids_map[i]);
++            float speed = std::fabs(lowstate->msg_.motor_state()[index].dq());
++            if (speed > worst * max_joint_speed[index]) {
++                worst = speed / max_joint_speed[index];
++                fastest = speed;
++                motor = index;
++            }
++        }
++        tick = lowstate->msg_.tick();
++    }
++    if (motor < 0) {
++        return false;
++    }
++    spdlog::warn("{}: motor {} at {:.1f} rad/s > {:.1f} rad/s at lowstate tick {}, going to Passive "
++                 "(sim2sim getup patch)", getStateString(), motor, fastest, max_joint_speed[motor], tick);
++    return true;
+ }
+\ No newline at end of file
+--- a/deploy/robots/g1/config/config.yaml
++++ b/deploy/robots/g1/config/config.yaml
+@@ -7,6 +7,7 @@
+     Velocity:
+       id: 3
+       type: RLBase
++    # GetUp: {id: 4, type: RLBase}  # sim2sim getup patch: on only with a policy in its policy_dir (run.sh --getup)
+ 
+     Mimic_Dance1_subject2:
+       id: 5
+@@ -16,6 +17,7 @@
+   Passive:
+     transitions: 
+       FixStand: LT + up.on_pressed
++      GetUp: LT + down.on_pressed  # sim2sim getup patch (skipped with a warning while GetUp is off)
+     mode: [
+       1,1,1,1,1,1,
+       1,1,1,1,1,1,
+@@ -69,6 +71,35 @@
+       Mimic_Dance1_subject2: RB + A.on_pressed
+ 
+     policy_dir: config/policy/velocity
++    fall_tilt: 1.0  # sim2sim getup patch: pelvis tilt (rad) past which it goes to Passive (1.0 without the key too)
++
++
++  # sim2sim getup patch: getting up after a fall (humanoid_sim task g1_getup), from Passive lying (LT + down). Once
++  # standing, on to Velocity (RT + A, as from FixStand; Velocity keeps GetUp's last target until its first policy step)
++  # or FixStand (LT + up; on the floor its pose tips the robot over within 2 s, ankle kp 40). fall_tilt 0: no tilt check
++  # (it starts lying); Passive after timeout s in the state or once a joint is faster than its max_joint_speed.
++  # Its deploy.yaml has no velocity command (ranges [0, 0]).
++  GetUp:
++    transitions:
++      FixStand: LT + up.on_pressed
++      Velocity: RT + A.on_pressed
++      Passive: LT + B.on_pressed
++
++    policy_dir: config/policy/getup
++    fall_tilt: 0
++    timeout: 10.0
++    # rad/s, one number for all or one per SDK motor: legs hip pitch, roll, yaw, knee, ankle pitch, roll (left, right),
++    # waist yaw, roll, pitch, arms shoulder pitch, roll, yaw, elbow, wrist roll, pitch, yaw (left, right). Iteration 35
++    # (critic): in 168 rises of stage 320 in humanoid_sim none of these fired, one 25 for all fired in 5; the locked
++    # wrists get 50 (their speed is passive). Iteration 38: shoulder pitch 26 -> 30 (stage 753 reached 24.1, p99 21.7;
++    # 30 is below the knee of the shoulder's 5020 motor torque-speed curve, 30.9 rad/s).
++    max_joint_speed: [
++      26,20,35,20,28,24,
++      26,20,35,20,28,24,
++      26,24,26,
++      30,26,30,36,28,50,50,
++      30,26,30,36,28,50,50,
++    ]
+ 
+ 
+   Mimic_Dance1_subject2:

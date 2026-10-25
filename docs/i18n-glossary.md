@@ -47,3 +47,14 @@ sim2sim, FixStand) не переводятся. Единицы после чис
 | тупик | dead end | 死路 | |
 | реалистичность | realism | 真实度 | |
 | проверка цели | goal check | 目标检查 | goal_check |
+| руки по целям | arms to targets | 手臂跟踪目标 | этап 3 |
+| ошибка рук | arm error | 手臂误差 | рад |
+| провис плеча | shoulder sag | 肩部下垂 | |
+| груз на кисть | load per hand | 每只手负载 | кг |
+| вставание | getting up | 起身 | g1_getup |
+| высота головы | head height | 头部高度 | |
+| дрожание моментов | torque chattering | 力矩抖动 | chatter.py |
+| паспорт кандидата | candidate passport | 候选护照 | passport.py |
+| храповик (кривой груза) | ratchet | 棘轮效应 | груз только сползает |
+| раскорякой (стоять) | in a wide straddle | 叉腿站立 | широкая стойка |
+| проверка навыков | skills check | 技能检查 | skills_check |

@@ -2136,3 +2136,1433 @@ def test_g1_gpu_arm_blind_freezes_the_arm_columns_and_normalizes_as_the_cpu_path
         np.testing.assert_array_equal(frozen.mean[columns], -z * task.ARM_BLIND_SCALE)
     finally:
         blind.close(), seen.close(), cpu.close()
+
+
+# g1_getup (iteration 33, part B): the CUDA task g1_getup_tensor_env.TensorG1GetupEnv against the CPU task G1GetupEnv.
+# It reads the start bank (runs/humanoid_lab/getup_bank/bank.npz, untracked): skipped without it.
+def _getup_bank():
+    from humanoid_sim.tasks import g1_getup_bank as bank_module
+    if not bank_module.BANK.is_file():
+        pytest.skip('the g1_getup start bank is not on this machine')
+    return bank_module.load()
+
+
+def _getup_rows(bank, classes, holdout=False):
+    """The first row of each class (training rows unless holdout)."""
+    return [int(np.flatnonzero((bank['start_class'] == bank['classes'].index(kind)) & (bank['holdout'] == holdout))[0])
+            for kind in classes]
+
+
+GETUP_CLASSES = ('back', 'front', 'side', 'fall', 'sit', 'stand')
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_from_the_same_bank_poses(monkeypatch):
+    """One world per start class, each against the CPU task reset from the same bank row with the same settings (assist
+    200 N, delay 0, motor friction 1, body friction 0.6; no sensor noise or COM offset on CUDA): the first observation
+    (the walking actor inputs with the command and phase at 0, then the six critic extras: pelvis velocity, pelvis
+    height, head height, assist) matches; over three steps of the same actions the observation, the reward and each of
+    its terms (task.getup_reward_components on both, numpy and torch), the lift (only the standing world's pelvis is
+    upright enough: 200 N, the lying ones 0) and the head height match within float32-vs-float64 and contact noise
+    (lying, many mesh-plane contacts; the walking tests' tolerances)."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    bank = _getup_bank()
+    rows = _getup_rows(bank, GETUP_CLASSES)
+    seen, original = [], task.getup_reward_components
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        seen.append((isinstance(args[0], torch.Tensor), {key: np.asarray(value.cpu() if isinstance(value, torch.Tensor)
+                                                                        else value, dtype=float).copy()
+                                                         for key, value in components.items()}))
+        return components, standing
+
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    options = dict(assist_force=200., action_delay_steps=0, motor_friction_scale=1., body_friction=.6)
+    cpus = [G1GetupEnv() for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False)
+    try:
+        cpu_obs = np.stack([cpu.reset(seed=4, options=dict(options, start=row))[0] for cpu, row in zip(cpus, rows)])
+        gpu.reset()
+        gpu.set_starts(rows)
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        gpu.set_assist(200.)
+        obs = gpu._obs('fill').cpu().numpy()
+        assert obs.shape == (len(rows), 496) and gpu.start_row.tolist() == rows
+        np.testing.assert_allclose(obs, cpu_obs, atol=1e-4, rtol=1e-4)
+        np.testing.assert_array_equal(obs[:, 490:][:, -1], 200.)
+        # Velocities (base angular, joints, every frame) against the rest: lying, contacts of meshes with the floor and
+        # with each other differ a little between MuJoCo C and MJWarp, which shows in the small links' speeds first
+        # (the force_push test: up to 0.07 rad/s at the shoulders).
+        speeds = np.zeros(496, dtype=bool)
+        speeds[task.joint_positions(29, 5, (), (0,), range(3)) + task.joint_positions(29, 5, (), (5,), range(29))] = True
+        rng = np.random.default_rng(0)
+        for step in range(3):
+            action = rng.normal(0., .5, 29)
+            seen.clear()
+            results = [cpu.step(action) for cpu in cpus]
+            nxt, reward, terminated, truncated, terminal = gpu.step(
+                torch.tensor(action, dtype=torch.float32, device=gpu.device).expand(len(rows), -1).contiguous())
+            gpu.check_health()
+            assert not terminated.any() and not truncated.any()
+            got, expected = terminal.cpu().numpy(), np.stack([r[0] for r in results])
+            np.testing.assert_allclose(got[:, ~speeds], expected[:, ~speeds], atol=.03, rtol=.02, err_msg=f'step {step}')
+            np.testing.assert_allclose(got[:, speeds], expected[:, speeds], atol=.1, rtol=.02, err_msg=f'step {step}')
+            np.testing.assert_allclose(reward.cpu().numpy(), [r[1] for r in results], atol=.03, rtol=.02)
+            np.testing.assert_allclose(gpu.lift.cpu().numpy(), [r[4]['lift'] for r in results], atol=1e-3)
+            np.testing.assert_allclose(gpu._head().cpu().numpy(), [r[4]['head_height'] for r in results], atol=2e-3)
+            cpu_terms = [terms for on_gpu, terms in seen if not on_gpu]
+            (gpu_terms,) = [terms for on_gpu, terms in seen if on_gpu]
+            for key in gpu_terms:
+                np.testing.assert_allclose(gpu_terms[key], [terms[key][0] for terms in cpu_terms], atol=.03, rtol=.02,
+                                           err_msg=key)
+        lifts = gpu.lift.cpu().numpy()
+        assert lifts[GETUP_CLASSES.index('stand')] == 200. and not lifts[:4].any()
+        assert not gpu.xfrc_applied.abs().max()  # only while the step runs
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_resets_bank_rows_assist_and_body_friction_per_world():
+    """256 worlds: resets draw training rows only, every class in roughly its bank share, and one body friction per
+    world in [0.3, 1.0] on every colliding robot geom and the floor (the other geoms keep the model's), redrawn at the
+    next reset; the observation's command and phase columns read 0 and the task's fixed normalization is the CPU
+    task's; the assist steps 20 N down at a reset after 2 s with the head above 1 m (not for a shorter episode, not
+    below 0), training_state / restore_training_state carry the forces (spread by quantiles over another world count);
+    the contact demand and the assist are logged per rollout."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    import warp as wp
+    bank = _getup_bank()
+    n = 256
+    env = TensorG1GetupEnv(n, seed=8, observation_noise=False, randomize=False)
+    cpu = G1GetupEnv()
+    try:
+        obs = env.reset()
+        rows = env.start_row.cpu().numpy()
+        assert not bank['holdout'][rows].any()
+        shares = np.bincount(bank['start_class'][rows], minlength=6) / n
+        np.testing.assert_allclose(shares, [.30, .30, .10, .15, .05, .10], atol=.1)
+        friction = env.friction.cpu().numpy()
+        assert friction.min() >= .3 and friction.max() <= 1. and len(np.unique(friction)) > 250
+        model = wp.to_torch(env.model.geom_friction).cpu().numpy()[:, :, 0]
+        geoms = cpu.friction_geoms
+        np.testing.assert_allclose(model[:, geoms], np.repeat(friction[:, None], len(geoms), 1), rtol=0, atol=0)
+        others = np.setdiff1d(np.arange(cpu.model.ngeom), geoms)
+        np.testing.assert_allclose(model[:, others], np.repeat(cpu.nominal_friction[None, others], n, 0), atol=1e-6)
+        columns, mean, variance = env.fixed_normalization
+        expected = cpu.fixed_normalization
+        np.testing.assert_array_equal(columns, expected[0])
+        assert len(columns) == 25 and (mean == 0).all() and (variance == 1).all()
+        assert not obs[:, torch.as_tensor(columns, device=env.device)].any()
+        action = torch.zeros((n, 29), device=env.device)
+        for _ in range(3):
+            obs, *_ = env.step(action)
+            env.check_health()
+        assert not obs[:, torch.as_tensor(columns, device=env.device)].any()
+        metrics = env.rollout_metrics()
+        assert set(metrics) == {'rollout/assist', 'rollout/getup_success', 'rollout/nefc_max', 'rollout/ncon_max',
+                                'rollout/bad_states'}
+        # The first episodes are cut at random steps (episode_limit), a few may end within these 3 steps.
+        success = metrics['rollout/getup_success']
+        assert metrics['rollout/assist'] == 200. and (math.isnan(success) or 0 <= success <= 1)
+        assert 0 < metrics['rollout/ncon_max'] < 128 and 0 < metrics['rollout/nefc_max'] < 512
+        assert metrics['rollout/bad_states'] == 0
+        # Assist: the head above 1 m over the last 2 s of an episode of at least 2 s steps it down.
+        half = n // 2
+        stream = wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(env.device)))
+        with stream:
+            env.head_window[:half], env.head_window[half:] = 1.05, .95
+            env.lengths.fill_(150)
+            env._masked_reset(torch.ones(n, dtype=torch.bool, device=env.device))
+        assist = env.assist.cpu().numpy()
+        assert (assist[:half] == 180.).all() and (assist[half:] == 200.).all()
+        assert not np.array_equal(env.friction.cpu().numpy(), friction)  # redrawn
+        with stream:
+            env.head_window.fill_(1.2)
+            env.lengths.fill_(99)  # shorter than 2 s: no step
+            env._masked_reset(torch.ones(n, dtype=torch.bool, device=env.device))
+            assert (env.assist.cpu().numpy() == assist).all()
+            env.set_assist(10.)
+            env.head_window.fill_(1.2)
+            env.lengths.fill_(100)
+            env._masked_reset(torch.ones(n, dtype=torch.bool, device=env.device))
+        assert not env.assist.any()  # not below 0
+        env.set_assist(torch.linspace(0., 200., n))
+        state = env.training_state()
+        assert len(state['assist_force']) == n and state['assist_force'][-1] == 200.
+        env.restore_training_state({'assist_force': [200., 100., 0., 50.]})
+        assert sorted(np.unique(env.assist.cpu().numpy()).tolist()) == [0., 50., 100., 200.]
+        assert np.bincount(env.assist.cpu().numpy().astype(int) // 50).tolist() == [64, 64, 64, 0, 64]
+        with pytest.raises(ValueError):
+            env.restore_training_state({'assist_force': [-1.]})
+        with pytest.raises(ValueError):
+            env.set_starts(len(bank['qpos']))
+    finally:
+        env.close(), cpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_episodes_end_by_time_out_of_step_and_the_assist_steps_down_after_one_up():
+    """Episodes end by the time limit: from set_starts every world runs exactly max_episode_steps (500) and is
+    truncated together, its episode length 500 (last_episode_lengths, what TensorPPO.collect averages as
+    rollout/ep_len_mean); one world held standing by hand (its bank pose written back after every step, the head at
+    ~1.3 m) gets 20 N less assist at that reset, the lying one keeps 200 N, and rollout/getup_success is 1 of 2.
+    After a full reset() the first episodes are cut at random steps of 1..500 (episode_limit), so the worlds end out of
+    step (the first root kept 4096 worlds in lockstep: an episode end in 1 rollout of ~21); later ones last 500."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    import warp as wp
+    bank = _getup_bank()
+    stand, back = _getup_rows(bank, ('stand', 'back'))
+    env = TensorG1GetupEnv(2, seed=3, observation_noise=False, randomize=False)
+    try:
+        assert env.max_episode_steps == 500
+        env.reset()
+        env.set_starts([stand, back])
+        assert env.episode_limit.tolist() == [500, 500]
+        pose = env.qpos[0].clone()
+        stream = wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(env.device)))
+        action = torch.zeros((2, 29), device=env.device)
+        env.rollout_metrics()
+        ends = []
+        for step in range(1, 501):
+            _, _, terminated, truncated, _ = env.step(action)
+            assert not terminated.any()
+            if truncated.any():
+                ends.append((step, truncated.tolist()))
+                break
+            with stream:  # the standing world held by hand
+                env.qpos[0], env.qvel[0] = pose, 0.
+                wp.capture_launch(env.forward_graph)
+            assert float(env._head()[0]) > 1.2
+        assert ends == [(500, [True, True])]
+        assert env.last_episode_lengths.tolist() == [500, 500] and env.lengths.tolist() == [0, 0]
+        assert env.assist.tolist() == [180., 200.]
+        metrics = env.rollout_metrics()
+        assert metrics['rollout/getup_success'] == .5 and metrics['rollout/assist'] == 190.
+    finally:
+        env.close()
+    env = TensorG1GetupEnv(64, seed=5, max_episode_steps=50, observation_noise=False, randomize=False)
+    try:
+        env.reset()
+        limits = env.episode_limit.cpu().numpy()
+        assert limits.min() >= 1 and limits.max() <= 50 and len(np.unique(limits)) > 25
+        lengths = []
+        action = torch.zeros((64, 29), device=env.device)
+        for _ in range(120):
+            _, _, terminated, truncated, _ = env.step(action)
+            done = (terminated | truncated).cpu().numpy()
+            lengths += env.last_episode_lengths.cpu().numpy()[done].tolist()
+        first, later = lengths[:64], lengths[64:]
+        assert len(set(first)) > 25  # the first episodes end spread over the steps
+        assert later and set(later) <= {50} | set(range(1, 50))  # the rest run the whole length (or end early)
+        assert np.mean(np.array(later) == 50) > .9 and (env.episode_limit == 50).all()
+    finally:
+        env.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_body_friction_reaches_the_contacts_of_each_world():
+    """Warp's collision reads the batched geom_friction written at a reset in place (no recapture): two worlds lying on
+    the same bank pose with body friction 0.3 and 1.2 get exactly those sliding frictions on their robot-floor
+    contacts (the soles take theirs by priority, which is the same value)."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    import warp as wp
+    bank = _getup_bank()
+    row = _getup_rows(bank, ('back',))[0]
+    env = TensorG1GetupEnv(2, seed=2, observation_noise=False, randomize=False)
+    try:
+        env.reset()
+        env.set_starts(row)
+        env.set_body_friction(torch.tensor([.3, 1.2]))
+        env.step(torch.zeros((2, 29), device=env.device))
+        env.check_health()
+        count = int(env.nacon.item())
+        world = env.contact_world[:count].long().cpu().numpy()
+        friction = wp.to_torch(env.data.contact.friction)[:count, 0].cpu().numpy()
+        geom = wp.to_torch(env.data.contact.geom)[:count].cpu().numpy()
+        floor = env.reference.model.geom('floor').id
+        on_floor = (geom == floor).any(axis=1)
+        for w, value in enumerate((.3, 1.2)):
+            mine = on_floor & (world == w)
+            assert mine.sum() >= 3
+            np.testing.assert_allclose(friction[mine], value, rtol=1e-6)
+    finally:
+        env.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_4096_worlds_fit_the_contact_buffers_stay_finite_and_report_speed():
+    """The training batch: 4096 worlds from the bank with the training randomization (sensor noise, COM, delay, motor
+    and body friction), 200 control steps of σ 1 action noise around home (an untrained policy's exploration), then
+    100 of bang-bang targets over the whole ±10 box held 0.1-0.3 s (flailing): no contact or constraint buffer overflow
+    (default nconmax / njmax 128 / 512 per world), no non-finite state; prints the most contacts and constraint rows of
+    one world and the steps per second (walking: ~50 thousand)."""
+    import time
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    _getup_bank()
+    n = 4096
+    env = TensorG1GetupEnv(n, seed=11)
+    try:
+        env.reset()
+        generator = torch.Generator(device=env.device).manual_seed(5)
+        for _ in range(10):  # warm-up
+            env.step(torch.randn((n, 29), device=env.device, generator=generator))
+        env.check_health()
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        for _ in range(200):
+            env.step(torch.randn((n, 29), device=env.device, generator=generator))
+            env.check_health()
+        torch.cuda.synchronize()
+        speed = 200 * n / (time.perf_counter() - started)
+        noise = env.rollout_metrics()
+        held, hold = torch.zeros((n, 29), device=env.device), torch.zeros(n, dtype=torch.long, device=env.device)
+        for _ in range(100):
+            fresh = hold <= 0
+            draw = (torch.rand((n, 29), device=env.device, generator=generator) * 2 - 1) * 10.
+            held = torch.where(fresh[:, None], draw, held)
+            hold = torch.where(fresh, torch.randint(5, 16, (n,), device=env.device, generator=generator), hold) - 1
+            env.step(held)
+            env.check_health()
+        flail = env.rollout_metrics()
+        print(f'g1_getup 4096 worlds: {speed:,.0f} steps/s (σ 1 noise); most per world: σ 1 noise '
+              f'{noise["rollout/ncon_max"]} contacts / {noise["rollout/nefc_max"]} rows, flailing '
+              f'{flail["rollout/ncon_max"]} / {flail["rollout/nefc_max"]}; bad states {noise["rollout/bad_states"]} / '
+              f'{flail["rollout/bad_states"]}; episodes ended up {noise["rollout/getup_success"]}')
+        for metrics in (noise, flail):
+            assert metrics['rollout/ncon_max'] < 128 and metrics['rollout/nefc_max'] < 400
+            assert metrics['rollout/bad_states'] == 0
+        assert speed > 10000
+    finally:
+        env.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_full_gpu_learner_keeps_and_restores_the_assist(tmp_path):
+    """full_gpu_train on the CUDA task: make_learner gives g1_getup the asymmetric policy (actor on 490 of 496 inputs)
+    and TensorNormalize the command and phase columns fixed at 0 / 1; one rollout and update; a stage saved with the
+    worlds' assist forces (training_state) gives them back to the next learner's worlds before their first reset."""
+    from humanoid_sim import full_gpu_train
+    from humanoid_sim.core import save_stage, write_json
+    from humanoid_sim.lab import validate_config
+    from humanoid_sim.policies import CriticExtrasPolicy
+    from humanoid_sim.tasks import g1_tensor_math as task
+    _getup_bank()
+    config = {**validate_config(dict(robot_id='g1_29dof', task_id='g1_getup', backend='full_gpu', envs=64, n_steps=8,
+                                     batch_size=512, n_epochs=1, steps=1024)), 'steps': 512}
+    run = tmp_path / 'run'
+    run.mkdir()
+    write_json(run / 'run_config.json', config)
+    learner, export = full_gpu_train.make_learner(config)
+    try:
+        assert isinstance(learner.model.policy, CriticExtrasPolicy) and learner.model.policy.actor_inputs == 490
+        columns = torch.as_tensor(task.zero_term_columns(29, 5), device=learner.device)
+        learner.collect()
+        learner.update()
+        assert bool((learner.normalizer.obs.mean[columns] == 0).all()) and bool((learner.normalizer.obs.var[columns]
+                                                                                 == 1).all())
+        learner.env.set_assist(torch.linspace(100., 200., 64))
+        learner.normalizer.export_normalizer(export)
+        stage = save_stage(run, learner.model, export, learner.env.training_state())
+    finally:
+        learner.env.close(), export.close()
+    resumed, export = full_gpu_train.make_learner({**config, 'envs': 32, 'batch_size': 256}, stage)
+    try:
+        expected = task.assist_resample(np.linspace(100., 200., 64, dtype=np.float32).astype(float), 32)
+        np.testing.assert_allclose(resumed.env.assist.cpu().numpy(), expected, rtol=1e-6)
+        assert float(resumed.obs[:, -1].std()) > 0  # the first observation (after the reset) shows each world's own
+    finally:
+        resumed.env.close(), export.close()
+
+
+# g1_getup task_config pd_bound (iteration 34): the PD error bound with its curriculum on CUDA.
+GETUP_PD_BOUND = [1., .6]
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_pd_bound():
+    """One world per start class against the CPU task reset from the same bank row, both at c = 0.15 under a 10 ms
+    delay (5 substeps; no sensor noise or COM offset on CUDA), actions over the whole ±10 box: the CUDA applied action
+    is exactly task.pd_bound of the clipped action around the newest frame of each world's history, then the wrists
+    at 0, and the CPU task's within float32 (its angles drift with the contacts after the first step); the first
+    step's actions in flight are the bounded zero on both (an unbounded home target would jerk the lying worlds apart);
+    observations and rewards match within the tolerances of the test without the bound, but for the locked wrists'
+    speeds (light links whose hand capsules touch the floor: MuJoCo C and MJWarp contact points, 0.6 rad/s apart on
+    the third step lying on the side, while every angle stays within 0.03); the bound and the share of bounded
+    joint-steps are logged."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    bank = _getup_bank()
+    rows = _getup_rows(bank, GETUP_CLASSES)
+    options = dict(assist_force=200., action_delay_steps=5, motor_friction_scale=1., body_friction=.6, pd_bound=.15)
+    cpus = [G1GetupEnv(pd_bound=GETUP_PD_BOUND) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, pd_bound=GETUP_PD_BOUND)
+    try:
+        cpu_obs = np.stack([cpu.reset(seed=4, options=dict(options, start=row))[0] for cpu, row in zip(cpus, rows)])
+        gpu.reset()
+        gpu.set_starts(rows)
+        gpu.set_action_delay_steps(5)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        gpu.set_assist(200.)
+        gpu.set_pd_bound(.15)
+        obs = gpu._obs('fill').cpu().numpy()
+        np.testing.assert_allclose(obs, cpu_obs, atol=1e-4, rtol=1e-4)
+        gpu.rollout_metrics()
+        speeds = np.zeros(496, dtype=bool)
+        speeds[task.joint_positions(29, 5, (), (0,), range(3))] = True
+        speeds[task.joint_positions(29, 5, (), (5,), range(29))] = True
+        wrists = np.zeros(496, dtype=bool)
+        wrists[task.joint_positions(29, 5, (), (5,), np.flatnonzero(cpus[0].wrist_mask.numpy()))] = True
+        speeds &= ~wrists
+        rng = np.random.default_rng(0)
+        for step in range(3):
+            action = rng.uniform(-10., 10., 29)
+            actions = torch.tensor(action, dtype=torch.float32, device=gpu.device).expand(len(rows), -1).contiguous()
+            position = gpu.frames[:, -1, gpu.position_entries].clone()
+            expected = task.lock_joints(task.pd_bound(actions, position, gpu.bound, gpu.peak, gpu.kp, gpu.scale,
+                                                      gpu.bound_free), gpu.wrist_mask)
+            results = [cpu.step(action) for cpu in cpus]
+            nxt, reward, terminated, truncated, terminal = gpu.step(actions)
+            gpu.check_health()
+            assert not terminated.any() and not truncated.any()
+            torch.testing.assert_close(gpu.previous_action, expected, rtol=0, atol=0)
+            np.testing.assert_allclose(gpu.previous_action.cpu().numpy(), np.stack([c.previous_action for c in cpus]),
+                                       atol=1e-3 if step == 0 else .1, err_msg=f'step {step}')
+            got, wanted = terminal.cpu().numpy(), np.stack([r[0] for r in results])
+            rest = ~speeds & ~wrists
+            np.testing.assert_allclose(got[:, rest], wanted[:, rest], atol=.03, rtol=.02, err_msg=f'step {step}')
+            np.testing.assert_allclose(got[:, speeds], wanted[:, speeds], atol=.1, rtol=.02, err_msg=f'step {step}')
+            np.testing.assert_allclose(got[:, wrists], wanted[:, wrists], atol=1., err_msg=f'step {step}')
+            np.testing.assert_allclose(reward.cpu().numpy(), [r[1] for r in results], atol=.03, rtol=.02)
+        metrics = gpu.rollout_metrics()
+        assert metrics['rollout/pd_bound'] == pytest.approx(.15) and metrics['rollout/pd_bound_share'] > .5
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_pd_bound_steps_down_keeps_its_state_and_is_off_without_the_setting(monkeypatch):
+    """256 worlds with pd_bound [1, 0.6]: every world starts at 1; at a reset after 2 s with the head above 1 m its
+    bound steps 0.02 down with the assist (not after a shorter episode), to exactly the lowest and not below;
+    training_state / restore_training_state carry the bounds (quantiles over another world count, within [lowest,
+    start]; a stage without them leaves the worlds' bounds); rollout/pd_bound and rollout/pd_bound_share are logged.
+    Without the setting the bound's functions never run and nothing is logged or kept for it."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    import warp as wp
+    _getup_bank()
+    n = 256
+    lowest = float(np.float32(.6))
+    env = TensorG1GetupEnv(n, seed=8, observation_noise=False, randomize=False, pd_bound=GETUP_PD_BOUND)
+    try:
+        env.reset()
+        assert bool((env.bound == 1.).all())
+        generator = torch.Generator(device=env.device).manual_seed(1)
+        for _ in range(3):
+            env.step(torch.randn((n, 29), device=env.device, generator=generator) * 5)
+            env.check_health()
+        metrics = env.rollout_metrics()
+        assert metrics['rollout/pd_bound'] == 1. and 0 < metrics['rollout/pd_bound_share'] < 1
+        everyone = torch.ones(n, dtype=torch.bool, device=env.device)
+        half = n // 2
+        stream = wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(env.device)))
+        with stream:
+            env.head_window[:half], env.head_window[half:] = 1.05, .95
+            env.lengths.fill_(150)
+            env._masked_reset(everyone)
+        bound = env.bound.cpu().numpy()
+        np.testing.assert_allclose(bound[:half], .98, rtol=0, atol=1e-6)
+        assert (bound[half:] == 1.).all() and (env.assist[:half] == 180.).all()
+        with stream:
+            env.head_window.fill_(1.2)
+            env.lengths.fill_(99)  # shorter than 2 s: no step
+            env._masked_reset(everyone)
+        assert (env.bound.cpu().numpy() == bound).all()
+        env.set_pd_bound(.61)
+        for _ in range(2):  # to the lowest itself, then no lower
+            with stream:
+                env.head_window.fill_(1.2)
+                env.lengths.fill_(100)
+                env._masked_reset(everyone)
+            assert (env.bound.cpu().numpy() == lowest).all()
+        state = env.training_state()
+        assert set(state) == {'assist_force', 'pd_bound'} and state['pd_bound'] == [lowest] * n
+        env.restore_training_state({'assist_force': [0.] * 4, 'pd_bound': [1., .8, .6, .3]})
+        values, counts = np.unique(env.bound.cpu().numpy(), return_counts=True)
+        np.testing.assert_allclose(values, [.6, .8, 1.], rtol=1e-6)
+        assert counts.tolist() == [128, 64, 64]  # 0.3 lifted to the lowest
+        env.set_pd_bound(.9)
+        env.restore_training_state({'assist_force': [0.]})  # a carried-over stage without bounds
+        np.testing.assert_allclose(env.bound.cpu().numpy(), .9, rtol=1e-6)
+        with pytest.raises(ValueError):
+            env.restore_training_state({'assist_force': [0.], 'pd_bound': [0.]})
+        with pytest.raises(ValueError):
+            env.set_pd_bound(-1.)
+    finally:
+        env.close()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError('pd_bound used without the setting')
+    monkeypatch.setattr(task, 'pd_bound', refuse)
+    monkeypatch.setattr(task, 'pd_bound_update', refuse)
+    plain = TensorG1GetupEnv(64, seed=8, observation_noise=False, randomize=False)
+    try:
+        plain.reset()
+        generator = torch.Generator(device=plain.device).manual_seed(1)
+        for _ in range(3):
+            plain.step(torch.randn((64, 29), device=plain.device, generator=generator) * 5)
+        stream = wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(plain.device)))
+        with stream:
+            plain.head_window.fill_(1.2)
+            plain.lengths.fill_(150)
+            plain._masked_reset(torch.ones(64, dtype=torch.bool, device=plain.device))
+        assert set(plain.rollout_metrics()) == {'rollout/assist', 'rollout/getup_success', 'rollout/nefc_max',
+                                                'rollout/ncon_max', 'rollout/bad_states'}
+        assert set(plain.training_state()) == {'assist_force'} and not plain.bounding
+    finally:
+        plain.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_full_gpu_learner_keeps_and_restores_the_pd_bound(tmp_path):
+    """full_gpu_train with pd_bound: the worlds start at the setting's first bound, a rollout logs rollout/pd_bound and
+    rollout/pd_bound_share, a stage (its action contract …-pdbound0.6) keeps the worlds' bounds next to the assist
+    forces and gives them back to the next learner's worlds (quantiles over another world count)."""
+    from humanoid_sim import full_gpu_train
+    from humanoid_sim.core import read_json, save_stage, write_json
+    from humanoid_sim.lab import validate_config
+    from humanoid_sim.tasks import g1_tensor_math as task
+    _getup_bank()
+    config = {**validate_config(dict(robot_id='g1_29dof', task_id='g1_getup', backend='full_gpu', envs=64, n_steps=8,
+                                     batch_size=512, n_epochs=1, steps=1024,
+                                     task_config={'pd_bound': GETUP_PD_BOUND})), 'steps': 512}
+    run = tmp_path / 'run'
+    run.mkdir()
+    write_json(run / 'run_config.json', config)
+    learner, export = full_gpu_train.make_learner(config)
+    try:
+        assert bool((learner.env.bound == 1.).all())
+        metrics = learner.collect()
+        assert metrics['rollout/pd_bound'] == 1. and 0 <= metrics['rollout/pd_bound_share'] <= 1
+        learner.update()
+        learner.env.set_pd_bound(torch.linspace(.6, 1., 64))
+        learner.normalizer.export_normalizer(export)
+        stage = save_stage(run, learner.model, export, learner.env.training_state())
+    finally:
+        learner.env.close(), export.close()
+    metadata = read_json(stage / 'metadata.json')
+    assert metadata['action_schema'].endswith('-pdbound0.6') and len(metadata['training_state']['pd_bound']) == 64
+    resumed, export = full_gpu_train.make_learner({**config, 'envs': 32, 'batch_size': 256}, stage)
+    try:
+        expected = task.assist_resample(np.linspace(.6, 1., 64, dtype=np.float32).astype(float), 32)
+        np.testing.assert_allclose(resumed.env.bound.cpu().numpy(), expected, rtol=1e-6)
+    finally:
+        resumed.env.close(), export.close()
+
+
+# g1_getup reward weight impact (iteration 35): the floor approach speeds on CUDA. The drop rows of
+# tests/test_g1_getup_impact.py (no start bank needed): the home pose on its back, on its front, on its front spinning,
+# the lowest geom but the soles 0.3 m up, then standing in home.
+GETUP_IMPACT = {'impact': 2.}
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_impact(monkeypatch):
+    """The three drops on CUDA and on the CPU task (zero action holds the pose; no assist, delay, sensor noise or COM
+    offset): the first floor contact comes in the same control step and physics substep, a body touches first on both,
+    and those touching on both close at the same speed within 10 % (√(2gh) = 2.43 m/s for the two still drops); that
+    step's impact term (task.getup_reward_components on both) agrees within 10 %, and every step before it charges 0."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    bank = drop_bank()
+    rows = [0, 1, 2]
+    seen, original = [], task.getup_reward_components
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        value = components['impact']
+        seen.append((isinstance(value, torch.Tensor), np.asarray(value.cpu() if isinstance(value, torch.Tensor)
+                                                                 else value, dtype=float).copy()))
+        return components, standing
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    cpus = [G1GetupEnv(bank=bank, reward_weights=GETUP_IMPACT) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank,
+                           reward_weights=GETUP_IMPACT)
+    try:
+        for cpu, row in zip(cpus, rows):
+            cpu.reset(seed=4, options=dict(OPTIONS, start=row))
+        gpu.reset()
+        gpu.set_starts(rows)
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        gpu.set_assist(0.)
+        gpu._obs('fill')
+        first = {}
+        expected = math.sqrt(2 * 9.81 * .3)
+        for step in range(30):
+            seen.clear()
+            for cpu in cpus:
+                cpu.step(np.zeros(29))
+            _, _, terminated, _, _ = gpu.step(torch.zeros((len(rows), 29), device=gpu.device))
+            gpu.check_health()
+            assert not terminated.any()
+            cpu_terms = np.array([terms[0] for on_gpu, terms in seen if not on_gpu])
+            (gpu_terms,) = [terms for on_gpu, terms in seen if on_gpu]
+            got = gpu.impact_substeps.cpu().numpy()
+            for world, cpu in enumerate(cpus):
+                if world in first:
+                    continue
+                wanted = cpu.impact_substeps
+                touched = np.flatnonzero(wanted.max(1) > 0), np.flatnonzero(got[world].max(1) > 0)
+                if not len(touched[0]) and not len(touched[1]):
+                    assert cpu_terms[world] == 0 and gpu_terms[world] == 0, (world, step)
+                    continue
+                assert len(touched[0]) and len(touched[1]) and touched[0][0] == touched[1][0], (world, step, touched)
+                substep = touched[0][0]
+                both = np.flatnonzero((wanted[substep] > 0) & (got[world, substep] > 0))
+                assert both.size, (world, step)
+                np.testing.assert_allclose(got[world, substep, both], wanted[substep, both], rtol=.1)
+                if world < 2:
+                    np.testing.assert_allclose(wanted[substep, both], expected, rtol=.05)
+                assert cpu_terms[world] < -1 and gpu_terms[world] == pytest.approx(cpu_terms[world], rel=.1)
+                first[world] = step, substep
+            if len(first) == len(rows):
+                break
+        assert sorted(first) == [0, 1, 2], first
+        assert first[0][0] == first[1][0] > first[2][0]  # the still drops together, the spinning one sooner
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_impact_is_logged_per_rollout_and_off_without_the_weight(monkeypatch):
+    """64 worlds, 16 on each drop row, zero actions for 20 steps (the drops hit at steps 6-13): rollout/impact is the
+    mean unweighted term per world-step and rollout/impact_hit the share of world-steps with a body above 1.5 m/s, as
+    the steps' own speeds give them, counted since the last call; every dropped world hits, the standing ones are never
+    charged. Without the weight the impact functions never run, no buffer is made and nothing is logged."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from test_g1_getup_impact import drop_bank
+    bank = drop_bank()
+    n = 64
+    rows = torch.arange(n) % 4
+    standing = rows == 3
+    env = TensorG1GetupEnv(n, seed=6, observation_noise=False, randomize=False, bank=bank, reward_weights=GETUP_IMPACT)
+    try:
+        assert tuple(env.impact_substeps.shape) == (n, 10, env.reference.model.nbody)
+        env.reset()
+        env.set_starts(rows)
+        env.set_action_delay_steps(0)
+        env.set_assist(0.)
+        env.rollout_metrics()
+        zero = torch.zeros((n, 29), device=env.device)
+        penalties, hits = [], []
+        for _ in range(20):
+            env.step(zero)
+            env.check_health()
+            speed = env.impact_substeps.amax(dim=1)
+            penalties.append(task.impact_penalty(speed).cpu())
+            hits.append(task.impact_hit(speed).cpu())
+        penalties, hits = torch.stack(penalties), torch.stack(hits)
+        metrics = env.rollout_metrics()
+        assert metrics['rollout/impact'] == pytest.approx(float(penalties.mean()), rel=1e-5)
+        assert metrics['rollout/impact_hit'] == pytest.approx(float(hits.float().mean()), rel=1e-6)
+        assert not penalties[:, standing].any() and bool(hits[:, ~standing].any(dim=0).all())
+        assert 0 < metrics['rollout/impact_hit'] < .5 and metrics['rollout/impact'] > 0
+        after = env.rollout_metrics()  # nothing stepped since the last call
+        assert math.isnan(after['rollout/impact']) and math.isnan(after['rollout/impact_hit'])
+    finally:
+        env.close()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError('impact computed with its weight at 0')
+    for name in ('impact_contacts', 'approach_speed', 'impact_penalty', 'impact_hit'):
+        monkeypatch.setattr(task, name, refuse)
+    plain = TensorG1GetupEnv(n, seed=6, observation_noise=False, randomize=False, bank=bank)
+    try:
+        assert plain.impact_substeps is None
+        plain.reset()
+        plain.set_starts(rows)
+        for _ in range(15):
+            plain.step(torch.zeros((n, 29), device=plain.device))
+            plain.check_health()
+        assert set(plain.rollout_metrics()) == {'rollout/assist', 'rollout/getup_success', 'rollout/nefc_max',
+                                                'rollout/ncon_max', 'rollout/bad_states'}
+    finally:
+        plain.close()
+
+
+# g1_getup reward weight sole_impact (iteration 44): the soles' floor approach speeds on CUDA, in the pass impact's
+# speeds come from. The rows of tests/test_g1_getup_sole_impact.py's sole_bank (no start bank needed): the home pose
+# upright with the soles 5 cm and 1 cm up, standing on the floor, and drop_bank's back and front drops 0.3 m up.
+GETUP_SOLE_IMPACT = {'impact': 2., 'sole_impact': 2.}
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_sole_impact(monkeypatch):
+    """Both weights on, the standing drops from 5 and 1 cm and the back and front drops on CUDA and on the CPU task
+    (zero action holds the pose; no assist, delay, sensor noise or COM offset). For the standing drops sole_impact
+    (per foot), for the lying ones impact (per body): the first floor contact comes in the same control step and
+    physics substep on both, the speeds of the entries touching on both agree within 10 % (the soles at √(2gh) within
+    5 %: 0.99 and 0.44 m/s), and that step's term (task.getup_reward_components on both) agrees within 10 % (the 1 cm
+    drop, below 0.5 m/s: 0 on the CPU, within 0.01 on CUDA); every step before charges 0. The standing drops never
+    charge impact."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS
+    from test_g1_getup_sole_impact import SOFT, SOFT_DROP, SOLE_DROP, STAND_DROP, sole_bank
+    bank = sole_bank()
+    rows = [STAND_DROP, SOFT, 0, 1]
+    seen, original = [], task.getup_reward_components
+
+    def host(value):
+        return np.asarray(value.cpu() if isinstance(value, torch.Tensor) else value, dtype=float).copy()
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        seen.append(dict(gpu=isinstance(args[0], torch.Tensor), impact=host(components['impact']),
+                         sole_impact=host(components['sole_impact'])))
+        return components, standing
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    cpus = [G1GetupEnv(bank=bank, reward_weights=GETUP_SOLE_IMPACT) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank,
+                           reward_weights=GETUP_SOLE_IMPACT)
+    try:
+        assert tuple(gpu.sole_impact_substeps.shape) == (len(rows), 10, 2)
+        assert tuple(gpu.impact_substeps.shape) == (len(rows), 10, gpu.reference.model.nbody)
+        for cpu, row in zip(cpus, rows):
+            cpu.reset(seed=4, options=dict(OPTIONS, start=row))
+        gpu.reset()
+        gpu.set_starts(rows)
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        gpu.set_assist(0.)
+        gpu._obs('fill')
+        first = {}
+        free_fall = {STAND_DROP: math.sqrt(2 * 9.81 * SOLE_DROP), SOFT: math.sqrt(2 * 9.81 * SOFT_DROP)}
+        terms = ['sole_impact', 'sole_impact', 'impact', 'impact']  # per world, the term compared
+        for step in range(40):
+            seen.clear()
+            for cpu in cpus:
+                cpu.step(np.zeros(29))
+            _, _, terminated, _, _ = gpu.step(torch.zeros((len(rows), 29), device=gpu.device))
+            gpu.check_health()
+            assert not terminated.any()
+            cpu_calls = [call for call in seen if not call['gpu']]
+            (gpu_call,) = [call for call in seen if call['gpu']]
+            speeds = dict(sole_impact=gpu.sole_impact_substeps.cpu().numpy(), impact=gpu.impact_substeps.cpu().numpy())
+            for world, (cpu, row, term) in enumerate(zip(cpus, rows, terms)):
+                if term == 'sole_impact':  # the standing drops touch with the soles only
+                    assert not cpu.impact_substeps.any() and not speeds['impact'][world].any(), (world, step)
+                    assert cpu_calls[world]['impact'][0] == 0 and gpu_call['impact'][world] == 0
+                if world in first:
+                    continue
+                wanted = cpu.sole_impact_substeps if term == 'sole_impact' else cpu.impact_substeps
+                got = speeds[term][world]
+                cpu_term, gpu_term = cpu_calls[world][term][0], gpu_call[term][world]
+                touched = np.flatnonzero(wanted.max(1) > 0), np.flatnonzero(got.max(1) > 0)
+                if not len(touched[0]) and not len(touched[1]):
+                    assert cpu_term == 0 and gpu_term == 0, (world, step)
+                    continue
+                assert len(touched[0]) and len(touched[1]) and touched[0][0] == touched[1][0], (world, step, touched)
+                substep = touched[0][0]
+                both = np.flatnonzero((wanted[substep] > 0) & (got[substep] > 0))
+                assert both.size, (world, step)
+                np.testing.assert_allclose(got[substep, both], wanted[substep, both], rtol=.1)
+                if row == SOFT:
+                    assert cpu_term == 0 and gpu_term == pytest.approx(0, abs=.01)
+                else:
+                    assert cpu_term < -.8 and gpu_term == pytest.approx(cpu_term, rel=.1)
+                if row in free_fall:
+                    np.testing.assert_allclose(wanted[substep, both], free_fall[row], rtol=.05)
+                first[world] = step, substep
+            if len(first) == len(rows):
+                break
+        assert sorted(first) == [0, 1, 2, 3], first
+        assert first[1][0] < first[0][0] < first[2][0]  # from 1 cm, then 5 cm, then the lying ones from 0.3 m
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_sole_impact_is_logged_per_rollout_and_off_without_the_weight(monkeypatch):
+    """64 worlds, 16 on each of the standing drops from 5 and 1 cm, standing on the floor and the back drop, sole_impact
+    alone (no impact buffer), zero actions for 25 steps: rollout/sole_impact is the mean unweighted term per world-step,
+    rollout/sole_impact_hit the share of world-steps with a foot above 0.5 m/s and rollout/flight the share of
+    world-steps 40 ms or more into a stretch without any floor contact (the host's count from each step's touching), as
+    the steps' own speeds give them, counted since the last call. The 5 cm drops hit and fly (0.10 s), the 1 cm ones fly
+    (0.045 s: two steps without contact) but land below 0.5 m/s, the standing ones do neither, the back drops fly. With
+    impact alone no sole buffer is made and nothing of it logged."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from test_g1_getup_sole_impact import SOFT, STAND_DROP, STANDING, sole_bank
+    bank = sole_bank()
+    n = 64
+    kinds = torch.tensor([STAND_DROP, SOFT, STANDING, 0])
+    rows = kinds[torch.arange(n) % 4]
+    env = TensorG1GetupEnv(n, seed=6, observation_noise=False, randomize=False, bank=bank,
+                           reward_weights={'sole_impact': 2.})
+    try:
+        assert env.impact_substeps is None and tuple(env.sole_impact_substeps.shape) == (n, 10, 2)
+        assert env.flight_steps == 2
+        env.reset()
+        env.set_starts(rows)
+        env.set_action_delay_steps(0)
+        env.set_assist(0.)
+        env.rollout_metrics()
+        zero = torch.zeros((n, 29), device=env.device)
+        penalties, hits, flights = [], [], []
+        airborne = torch.zeros(n, dtype=torch.long)
+        for _ in range(25):
+            env.step(zero)
+            env.check_health()
+            speed = env.sole_impact_substeps.amax(dim=1)
+            penalties.append(task.impact_penalty(speed, task.GETUP_SOLE_IMPACT_SPEED).cpu())
+            hits.append(task.impact_hit(speed, task.GETUP_SOLE_IMPACT_SPEED).cpu())
+            airborne = torch.where(env.touching.cpu(), 0, airborne + 1)
+            torch.testing.assert_close(env.airborne.cpu(), airborne, rtol=0, atol=0)
+            flights.append(airborne >= 2)
+        penalties, hits, flights = torch.stack(penalties), torch.stack(hits), torch.stack(flights)
+        metrics = env.rollout_metrics()
+        assert 'rollout/impact' not in metrics
+        assert metrics['rollout/sole_impact'] == pytest.approx(float(penalties.mean()), rel=1e-5)
+        assert metrics['rollout/sole_impact_hit'] == pytest.approx(float(hits.float().mean()), rel=1e-6)
+        assert metrics['rollout/flight'] == pytest.approx(float(flights.float().mean()), rel=1e-6)
+        for kind, hit, flew in ((STAND_DROP, True, True), (SOFT, False, True), (STANDING, False, False),
+                                (0, None, True)):
+            worlds = rows == kind
+            flew_each = flights[:, worlds].any(dim=0)
+            assert bool(flew_each.all()) if flew else not bool(flew_each.any()), kind
+            if hit is not None:
+                hit_each = hits[:, worlds].any(dim=0)
+                assert bool(hit_each.all()) if hit else not bool(hit_each.any()), kind
+        after = env.rollout_metrics()  # nothing stepped since the last call
+        assert all(math.isnan(after[key]) for key in ('rollout/sole_impact', 'rollout/sole_impact_hit',
+                                                       'rollout/flight'))
+    finally:
+        env.close()
+    impact = TensorG1GetupEnv(n, seed=6, observation_noise=False, randomize=False, bank=bank,
+                              reward_weights={'impact': 2.})
+    try:
+        assert impact.sole_impact_substeps is None and impact.impact_substeps is not None
+        impact.reset()
+        impact.set_starts(rows)
+        for _ in range(10):
+            impact.step(torch.zeros((n, 29), device=impact.device))
+            impact.check_health()
+        logged = impact.rollout_metrics()
+        assert 'rollout/impact' in logged and not {'rollout/sole_impact', 'rollout/sole_impact_hit',
+                                                   'rollout/flight'} & set(logged)
+    finally:
+        impact.close()
+
+
+# g1_getup reward weight stance_width (after branch 46): the feet's width on CUDA. The rows of
+# tests/test_g1_getup_stance_width.py's stance_bank: standing in home and in the wide stance on the floor, the standing
+# drop from 5 cm and drop_bank's back drop.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_stance_width(monkeypatch):
+    """The weight on, on CUDA and on the CPU task (no assist, delay, sensor noise or COM offset), 20 steps: the wide
+    stance held by its PD targets, the others with zero action. Per world and step both pass
+    task.getup_reward_components the same W (task.stance_width; within 2 mm, the lying back drop too until it lands:
+    its heading from the pelvis y axis, GETUP_STANCE_HEADING), count the term in the same steps
+    (task.stance_active: home and the wide stance always, the back drop never, the drop once landed) and charge it
+    alike (within 0.005; −2·(W − 0.30) in the wide stance, 0 standing in home); rollout/stance_width is the mean W over
+    the world-steps that counted, as the steps' own inputs give it. Without the weight nothing is read or logged."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS
+    from test_g1_getup_sole_impact import STAND_DROP, STANDING
+    from test_g1_getup_stance_width import WIDE, WORKING, hold, stance_bank
+    bank = stance_bank()
+    rows = [STANDING, WIDE, STAND_DROP, 0]
+    seen, original = [], task.getup_reward_components
+
+    def host(value):
+        return np.asarray(value.cpu() if isinstance(value, torch.Tensor) else value, dtype=float).copy()
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        seen.append(dict(gpu=isinstance(args[0], torch.Tensor), width=host(kwargs['stance_width']),
+                         active=host(task.stance_active(args[1], args[9])).astype(bool),
+                         term=host(components['stance_width'])))
+        return components, standing
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    cpus = [G1GetupEnv(bank=bank, reward_weights=WORKING) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank,
+                           reward_weights=WORKING)
+    try:
+        assert gpu.stance_weighted
+        for cpu, row in zip(cpus, rows):
+            cpu.reset(seed=4, options=dict(OPTIONS, start=row))
+        gpu.reset()
+        gpu.set_starts(rows)
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        gpu.set_assist(0.)
+        gpu._obs('fill')
+        gpu.rollout_metrics()
+        actions = np.stack([hold(cpus[0]) if row == WIDE else np.zeros(29) for row in rows])
+        widths, counted = [], []
+        for step in range(20):
+            seen.clear()
+            for cpu, action in zip(cpus, actions):
+                cpu.step(action)
+            _, _, terminated, _, _ = gpu.step(torch.tensor(actions, dtype=torch.float32, device=gpu.device))
+            gpu.check_health()
+            assert not terminated.any()
+            cpu_calls = [call for call in seen if not call['gpu']]
+            (gpu_call,) = [call for call in seen if call['gpu']]
+            cpu_width = np.array([call['width'][0] for call in cpu_calls])
+            cpu_active = np.array([call['active'][0] for call in cpu_calls])
+            # W everywhere while the back drop falls (it lands at step 13; lying, its pelvis x axis is vertical and the
+            # heading comes from the y axis), then where the term counts on both
+            compared = np.ones(len(rows), bool) if step < 10 else gpu_call['active'] & cpu_active
+            np.testing.assert_allclose(gpu_call['width'][compared], cpu_width[compared], rtol=0, atol=.002,
+                                       err_msg=f'step {step}')
+            # the landing drop may bounce over the 1 cm sole threshold a step apart: compared where both count
+            np.testing.assert_array_equal(gpu_call['active'][[0, 1, 3]], cpu_active[[0, 1, 3]], err_msg=f'step {step}')
+            same = gpu_call['active'] == cpu_active
+            np.testing.assert_allclose(gpu_call['term'][same], np.array([call['term'][0] for call in cpu_calls])[same],
+                                       rtol=0, atol=.005, err_msg=f'step {step}')
+            assert gpu_call['active'][:2].all() and not gpu_call['active'][3], step
+            assert gpu_call['term'][0] == 0 and gpu_call['term'][1] < -.15, step
+            widths.append(gpu_call['width'])
+            counted.append(gpu_call['active'])
+        widths, counted = np.array(widths), np.array(counted)
+        assert counted[-5:, 2].all()  # the drop landed and stands
+        metrics = gpu.rollout_metrics()
+        assert metrics['rollout/stance_width'] == pytest.approx(widths[counted].mean(), rel=1e-5)
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError('stance_width computed with its weight at 0')
+    monkeypatch.setattr(task, 'getup_reward_components', original)
+    for name in ('stance_width', 'stance_active'):
+        monkeypatch.setattr(task, name, refuse)
+    plain = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank)
+    try:
+        assert not plain.stance_weighted
+        plain.reset()
+        plain.set_starts(rows)
+        for _ in range(5):
+            plain.step(torch.zeros((len(rows), 29), device=plain.device))
+            plain.check_health()
+        assert 'rollout/stance_width' not in plain.rollout_metrics()
+    finally:
+        plain.close()
+
+
+# g1_getup task_config stand_pose_std (iteration 36): the standing pose term's σ on CUDA. The drop rows of
+# tests/test_g1_getup_impact.py: the home pose on its back and on its front 0.3 m up, then standing in home.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_stand_pose_std(monkeypatch):
+    """σ 0.7 on the CUDA and the CPU task, then the CUDA task without the setting (σ 0.1), zero actions for 15 steps
+    (no assist, delay, sensor noise or COM offset): both pass their σ to task.getup_reward_components; on CUDA the pose
+    term is w·[standing]·exp(−mean((q − home)²)/σ²) of its own joint angles (torch, float32), the standing world earns
+    it on both (CPU and CUDA within 0.01; > 0.49 at 0.7), the lying ones nothing."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.config import G1_GETUP_REWARD_WEIGHTS
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    bank = drop_bank()
+    rows = [0, 1, 3]
+    weight = G1_GETUP_REWARD_WEIGHTS['stand_pose']
+    seen, original = [], task.getup_reward_components
+
+    def host(value):
+        return np.asarray(value.cpu() if isinstance(value, torch.Tensor) else value, dtype=float).copy()
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        seen.append(dict(gpu=isinstance(args[0], torch.Tensor), std=kwargs.get('stand_pose_std'),
+                         pose=host(components['stand_pose']), standing=host(standing).astype(bool),
+                         position=host(args[4]), home=host(args[5])))
+        return components, standing
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    for std, settings in ((.7, {'stand_pose_std': .7}), (.1, {})):
+        cpus = [G1GetupEnv(bank=bank, stand_pose_std=std) for _ in rows]
+        gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank, **settings)
+        try:
+            assert gpu.stand_pose_std == std
+            for cpu, row in zip(cpus, rows):
+                cpu.reset(seed=4, options=dict(OPTIONS, start=row))
+            gpu.reset()
+            gpu.set_starts(rows)
+            gpu.set_action_delay_steps(0)
+            gpu.set_motor_friction(1.)
+            gpu.set_body_friction(.6)
+            gpu.set_assist(0.)
+            gpu._obs('fill')
+            for step in range(15):
+                seen.clear()
+                for cpu in cpus:
+                    cpu.step(np.zeros(29))
+                _, _, terminated, _, _ = gpu.step(torch.zeros((len(rows), 29), device=gpu.device))
+                gpu.check_health()
+                assert not terminated.any()
+                cpu_calls = [call for call in seen if not call['gpu']]
+                (gpu_call,) = [call for call in seen if call['gpu']]
+                assert gpu_call['std'] == std and [call['std'] for call in cpu_calls] == [std] * len(rows)
+                mean = ((gpu_call['position'] - gpu_call['home']) ** 2).mean(-1)
+                expected = weight * gpu_call['standing'] * np.exp(-mean / std ** 2)
+                np.testing.assert_allclose(gpu_call['pose'], expected, rtol=1e-5, atol=1e-7, err_msg=f'step {step}')
+                cpu_pose = np.array([call['pose'][0] for call in cpu_calls])
+                np.testing.assert_allclose(gpu_call['pose'], cpu_pose, rtol=0, atol=.01, err_msg=f'step {step}')
+                assert gpu_call['standing'].tolist() == [False, False, True], step
+                assert [bool(call['standing'][0]) for call in cpu_calls] == [False, False, True], step
+                assert gpu_call['pose'][2] > (.49 if std == .7 else 0) and not gpu_call['pose'][:2].any()
+        finally:
+            for cpu in cpus:
+                cpu.close()
+            gpu.close()
+
+
+# g1_getup task_config action_change_unbounded (iteration 37): the action_change term on the action before pd_bound on
+# CUDA. The drop rows of tests/test_g1_getup_impact.py: the home pose on its back, on its front, on its front spinning,
+# 0.3 m up, then standing in home.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_action_change_unbounded(monkeypatch):
+    """The CUDA and the CPU task with pd_bound at c 0.15 under a 10 ms delay (no assist, sensor noise or COM offset),
+    actions over and beyond the ±10 box, first with the setting, then without. With it each world's previous_unbounded
+    is exactly lock_joints of its box-clipped action and previous_action the bounded one (the PD, the delay queue and
+    the observation keep it); task.getup_reward_components gets the actions before the bound and those of the step
+    before (zero after a reset), its action_change term is −w·Σ(a − a_prev)² of them and the CPU task's within float32
+    (it depends on the actions alone, not on the physics); a reset of one world zeroes its previous one only. Without
+    it the term gets the bounded actions and there is no such state. The other terms match the CPU task's within the
+    tolerances of the test without the setting."""
+    import warp as wp
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.config import G1_GETUP_REWARD_WEIGHTS
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    bank = drop_bank()
+    rows = [0, 1, 2, 3]
+    weight = G1_GETUP_REWARD_WEIGHTS['action_change']
+    seen, original = [], task.getup_reward_components
+
+    def host(value):
+        return np.asarray(value.cpu() if isinstance(value, torch.Tensor) else value, dtype=float).copy()
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        seen.append(dict(gpu=isinstance(args[0], torch.Tensor), action=host(args[12]), previous=host(args[13]),
+                         terms={key: host(value) for key, value in components.items()}))
+        return components, standing
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    options = dict(OPTIONS, action_delay_steps=5, pd_bound=.15)
+    for flag in (True, False):
+        settings = dict(pd_bound=GETUP_PD_BOUND, action_change_unbounded=flag)
+        cpus = [G1GetupEnv(bank=bank, **settings) for _ in rows]
+        gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank, **settings)
+        try:
+            assert (gpu.previous_unbounded is not None) is flag
+            for cpu, row in zip(cpus, rows):
+                cpu.reset(seed=4, options=dict(options, start=row))
+            gpu.reset()
+            gpu.set_starts(rows)
+            gpu.set_action_delay_steps(5)
+            gpu.set_motor_friction(1.)
+            gpu.set_body_friction(.6)
+            gpu.set_assist(0.)
+            gpu.set_pd_bound(.15)
+            gpu._obs('fill')
+            if flag:
+                assert not gpu.previous_unbounded.any()
+            rng = np.random.default_rng(0)
+            before = torch.zeros((len(rows), 29), device=gpu.device)
+            for step in range(3):
+                action = rng.uniform(-12., 12., 29)
+                actions = torch.tensor(action, dtype=torch.float32, device=gpu.device).expand(len(rows), -1)
+                actions = actions.contiguous()
+                clipped = actions.clamp(-10., 10.)
+                position = gpu.frames[:, -1, gpu.position_entries].clone()
+                pre = task.lock_joints(clipped, gpu.wrist_mask)
+                bounded = task.lock_joints(task.pd_bound(clipped, position, gpu.bound, gpu.peak, gpu.kp, gpu.scale,
+                                                         gpu.bound_free), gpu.wrist_mask)
+                seen.clear()
+                for cpu in cpus:
+                    cpu.step(action)
+                _, _, terminated, _, _ = gpu.step(actions)
+                gpu.check_health()
+                assert not terminated.any()
+                torch.testing.assert_close(gpu.previous_action, bounded, rtol=0, atol=0)
+                charged = pre if flag else bounded
+                cpu_calls = [call for call in seen if not call['gpu']]
+                (gpu_call,) = [call for call in seen if call['gpu']]
+                np.testing.assert_array_equal(gpu_call['action'], charged.cpu().numpy())
+                np.testing.assert_array_equal(gpu_call['previous'], before.cpu().numpy())
+                expected = -weight * ((charged.double() - before.double()) ** 2).sum(-1).cpu().numpy()
+                np.testing.assert_allclose(gpu_call['terms']['action_change'], expected, rtol=1e-5,
+                                           err_msg=f'step {step}')
+                if flag:
+                    torch.testing.assert_close(gpu.previous_unbounded, pre, rtol=0, atol=0)
+                    np.testing.assert_allclose(np.stack([cpu.previous_unbounded for cpu in cpus]), pre.cpu().numpy(),
+                                               rtol=0, atol=2e-6)
+                    cpu_change = np.array([call['terms']['action_change'][0] for call in cpu_calls])
+                    np.testing.assert_allclose(gpu_call['terms']['action_change'], cpu_change, rtol=1e-5,
+                                               err_msg=f'step {step}')  # the actions alone: float32 against float64
+                    assert bool((pre != bounded).any())  # the bound acted: not the bounded actions' term
+                for key in (key for key in gpu_call['terms'] if key != 'action_change'):
+                    np.testing.assert_allclose(gpu_call['terms'][key], [call['terms'][key][0] for call in cpu_calls],
+                                               atol=.03, rtol=.02, err_msg=f'{key} step {step}')
+                before = charged
+            if flag:  # one world's reset zeroes its previous action before the bound, the others keep theirs
+                kept = gpu.previous_unbounded[1:].clone()
+                assert bool(gpu.previous_unbounded[0].any())
+                mask = torch.zeros(len(rows), dtype=torch.bool, device=gpu.device)
+                mask[0] = True
+                with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(gpu.device))):
+                    gpu._masked_reset(mask)
+                assert not gpu.previous_unbounded[0].any()
+                torch.testing.assert_close(gpu.previous_unbounded[1:], kept, rtol=0, atol=0)
+        finally:
+            for cpu in cpus:
+                cpu.close()
+            gpu.close()
+
+
+# task_config arm_targets (iteration 40, stage 3): the arm command in the upper-body slot, the residual arm action on home
+# moved by the targets, per-world modes, targets and hand loads (batched body masses), the load curve.
+ARM_TARGET_PROFILE = dict(real_robot=True, critic_extras=True, history=5, phase_stop=True, action_limit=10.,
+                          gait={'period': .6, 'stance_fraction': .55}, height_command=True, upper_body_slot=True,
+                          lock_wrists=True, arm_targets=True,
+                          reward_weights={'arm_track': 2., 'posture': .3, 'arm_press': .1, 'action_change': .05})
+ARM_TRACKED = [15, 16, 17, 18, 19, 22, 23, 24, 25, 26]  # shoulders, elbows, wrist roll: the joints arm_track follows
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_arm_targets_and_hand_loads(monkeypatch):
+    """Two worlds against the CPU task with the same arm command (set_arm_targets: world 0 a pose off home with both
+    shoulders rolled outward, world 1 a carry pose of the library, both in a 0.2 s quintic) and hand loads
+    (set_hand_load: 1 / 2 kg and 0.5 / 0 kg), world 1 with the motors 15 substeps late: the batched body masses, COMs and
+    subtree masses are the CPU model's and so is the subtree COM; over 12 steps the targets follow the same quintic, the
+    slot (every frame) and the observed last action (clip(a) + d/scale) match, the delay queue keeps each step's
+    offsets, and the reward's arm_track, posture and arm_press (0 with flag 1) match the CPU ones. The poses keep the
+    arms off the body (checked on the CPU every step): with the left shoulder rolled inward instead (0.18 − 0.39 rad) the
+    left wrist_yaw mesh goes into the left hip at step 9 (5-31 N), a mesh-mesh contact for which MuJoCo C and MJWarp make
+    different contact points, and from there the left arm's joint speeds differ by up to 0.4 rad/s, loads or not."""
+    import mujoco
+    import warp as wp
+    import humanoid_sim.g1_tensor_env as tensor_env
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
+    seen, original = [], tensor_env.reward_components
+
+    def spy(*args, **kwargs):
+        components, fell = original(*args, **kwargs)
+        seen.append((args, kwargs, components))
+        return components, fell
+
+    monkeypatch.setattr(tensor_env, 'reward_components', spy)
+    profile = {**ARM_TARGET_PROFILE, 'action_delay': .03}
+    cpus = [G1VelocityEnv(**profile) for _ in range(2)]
+    gpu = TensorG1Env(2, seed=4, resample_commands=False, push_velocity=0, observation_noise=False, randomize=False,
+                      **profile)
+    try:
+        poses = np.stack([cpus[0].home, cpus[0].home + cpus[0].arm_carry[5].numpy()])
+        # Left: pitch, roll (outward), yaw, elbow, wrist roll up; right: the same parts, its roll outward (negative).
+        poses[0, ARM_TRACKED] += np.abs(np.linspace(-.5, .5, 10)) * np.array([1, 1, 1, 1, 1, 1, -1, -1, 1, -1])
+        loads = np.array([[1., 2.], [.5, 0.]])
+        for cpu, steps, pose, load in zip(cpus, (0, 15), poses, loads):
+            cpu.reset(seed=4, options={'command': [0., 0., 0.], 'action_delay_steps': steps})
+            cpu.set_arm_targets(pose, 1, seconds=.2)
+            cpu.set_hand_load(load)
+        gpu.reset()
+        gpu.set_action_delay_steps(torch.tensor([0, 15]))
+        gpu.qpos.copy_(torch.tensor(np.stack([cpu.data.qpos for cpu in cpus]), device=gpu.device, dtype=torch.float32))
+        gpu.qvel.zero_()
+        gpu.command.zero_()
+        gpu.set_arm_targets(torch.tensor(poses, dtype=torch.float32), 1, seconds=.2)
+        gpu.set_hand_load(torch.tensor(loads, dtype=torch.float32))
+        with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(gpu.device))):
+            wp.capture_launch(gpu.forward_graph)
+        root = gpu.root
+        for world, cpu in enumerate(cpus):
+            np.testing.assert_allclose(gpu.body_mass[world].cpu().numpy(), cpu.model.body_mass, rtol=1e-6)
+            np.testing.assert_allclose(gpu.body_ipos[world].cpu().numpy(), cpu.model.body_ipos, atol=1e-7)
+            np.testing.assert_allclose(gpu.body_subtreemass[world].cpu().numpy(), cpu.model.body_subtreemass, rtol=1e-6)
+            mujoco.mj_forward(cpu.model, cpu.data)  # the same state with the loads
+            np.testing.assert_allclose(gpu.subtree_com[world, root].cpu().numpy(), cpu.data.subtree_com[root],
+                                       atol=2e-5)
+        start = gpu._obs('fill').cpu()
+        for world, cpu in enumerate(cpus):
+            np.testing.assert_allclose(start[world], cpu._observation('fill'), atol=2e-5, rtol=2e-5)
+        slot = np.array(task.term_positions(29, 5, cpus[0].extra_terms, task.UPPER_BODY_TERM)).reshape(5, 18)
+        last = np.array(task.newest_frame_columns(29, 5, cpus[0].extra_sizes, term=6))
+        for step in range(12):
+            action = .4 * np.sin(np.arange(29) + 1.7 * step)
+            results = [cpu.step(action) for cpu in cpus]
+            actions = torch.tensor(action, device=gpu.device, dtype=torch.float32)[None].expand(2, -1).contiguous()
+            _, reward, terminated, _, terminal = gpu.step(actions)
+            gpu.check_health()
+            args, kwargs, components = seen[-1]
+            assert bool(kwargs['arm_flag'].all()) and not terminated.any()
+            for world, (obs, value, _, _, info) in enumerate(results):
+                cpu = cpus[world]
+                geom = cpu.data.contact.geom
+                assert not (cpu.robot_geoms[geom].all(axis=1) & cpu.arm_geoms[geom].any(axis=1)).any()  # arms clear
+                np.testing.assert_allclose(gpu.previous_offset[world].cpu().numpy(), cpu.previous_offset, atol=1e-6)
+                np.testing.assert_allclose(gpu.arm_offset[world].cpu().numpy(), cpu.arm_offset, atol=1e-6)
+                np.testing.assert_allclose(terminal.cpu()[world, slot.ravel()], obs[slot.ravel()], atol=1e-6)
+                np.testing.assert_allclose(terminal.cpu()[world, last], obs[last], atol=.03, rtol=.02)
+                np.testing.assert_allclose(terminal.cpu()[world], obs, atol=.03, rtol=.02)
+                np.testing.assert_allclose(reward.cpu()[world], value, atol=.03, rtol=.02)
+                parts = info['reward_components']
+                for name in ('arm_track', 'posture'):
+                    np.testing.assert_allclose(float(components[name][world]), parts[name], atol=2e-3, rtol=1e-2)
+                assert float(components['arm_press'][world]) == 0 == parts['arm_press']
+            if gpu.delay_depth:
+                np.testing.assert_allclose(gpu.delay_offsets[1, 0].cpu().numpy(), cpus[1].delay_offsets[0], atol=1e-6)
+        assert float(gpu.arm_offset[0, 15]) == pytest.approx(poses[0, 15] - cpus[0].home[15], abs=1e-6)  # held
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_arm_targets_draw_per_world_run_the_curve_and_leave_the_task_stream_alone():
+    """4096 worlds in training (arm perturbation at share 0.5, random delay, COM spread, command resampling): the modes
+    in ARM_MODES' shares, the slot's newest frame upper_body_command(flag, d), no perturbation segment in a flag-1
+    world, the targets moving in the targets mode; a restored ceiling of 1 kg loads each flag-1 world's hands with its
+    shares into the batched masses (the pelvis COM spread kept); rollout_metrics logs the arm numbers and moves the
+    ceiling by task.load_curve_update, the loads following it; the task's own generator is that of the same task
+    without arm_targets, step for step. Without the setting: no arm logs, no training_state, no arm API."""
+    from humanoid_sim.tasks import g1_tensor_math as task
+    n = 4096
+    plain_profile = {key: value for key, value in ARM_TARGET_PROFILE.items() if key != 'arm_targets'}
+    profile = dict(push_velocity=0, observation_noise=False, randomize=True, arm_perturb=.5, arm_perturb_radians=1.,
+                   action_delay=.02, **plain_profile)
+    arms, plain = TensorG1Env(n, seed=5, arm_targets=True, **profile), TensorG1Env(n, seed=5, **profile)
+    try:
+        obs, _ = arms.reset(), plain.reset()
+        shares = torch.bincount(arms.arm_mode, minlength=3).double() / n
+        np.testing.assert_allclose(shares.cpu().numpy(), task.ARM_MODES, atol=.03)
+        assert torch.equal(arms.arm_flag, arms.arm_mode != task.ARM_FREE)
+        slot = torch.as_tensor(task.term_positions(29, 5, arms.reference.extra_terms, task.UPPER_BODY_TERM),
+                               device=arms.device).reshape(5, 18)
+        torch.testing.assert_close(obs[:, slot[-1]][:, 0], arms.arm_flag.float())
+        assert not arms.hand_load.any()  # the ceiling starts at 0
+        arms.restore_training_state({'load_max': [1.]})
+        flag = arms.arm_flag
+        assert arms.load_max == 1. and float(arms.hand_load[~flag].abs().max()) == 0
+        torch.testing.assert_close(arms.hand_load[flag], arms.load_share[flag])
+        hands = arms.hand_bodies
+        torch.testing.assert_close(arms.body_mass[:, hands], arms.hand_mass + arms.hand_load)
+        assert float(arms.body_ipos[:, arms.pelvis].std(dim=0).min()) > 1e-3  # the COM spread is still there
+        action = torch.zeros((n, 29), device=arms.device)
+        for _ in range(30):
+            obs, *_ = arms.step(action)
+            plain.step(action)
+            assert not bool((arms.perturb_steps[arms.arm_flag] > 0).any())
+            torch.testing.assert_close(obs[:, slot[-1]], task.upper_body_command(arms.arm_flag, arms.arm_offset))
+            assert torch.equal(arms.generator.get_state(), plain.generator.get_state())
+        moving = arms.arm_mode == task.ARM_TARGET
+        assert float(arms.arm_offset[moving].abs().max()) > .05
+        assert float(arms.arm_offset[~arms.arm_flag].abs().max()) == 0
+        assert bool((plain.perturb_steps > 0).any())
+        metrics = arms.rollout_metrics()
+        assert {'rollout/arm_track', 'rollout/arm_error', 'rollout/arm_falls', 'rollout/load_max'} <= set(metrics)
+        assert 0 < metrics['rollout/arm_track'] <= 1 and metrics['rollout/arm_error'] > 0
+        level = arms.load_max
+        arms._arm_steps.fill_(75000.), arms._arm_track_sum.fill_(.9 * 75000), arms._arm_falls.zero_()
+        assert arms.rollout_metrics()['rollout/load_max'] == pytest.approx(min(level + .1, 2.))
+        torch.testing.assert_close(arms.hand_load, arms.load_share * arms.load_max)
+        torch.testing.assert_close(arms.body_mass[:, hands], arms.hand_mass + arms.hand_load)
+        arms._arm_steps.fill_(75000.), arms._arm_track_sum.fill_(.9 * 75000), arms._arm_falls.fill_(3.)
+        assert arms.rollout_metrics()['rollout/load_max'] == pytest.approx(max(min(level + .1, 2.) - .1, 0.))
+        assert arms.training_state() == {'load_max': [arms.load_max]} and plain.training_state() is None
+        new_logs = {'rollout/arm_track', 'rollout/arm_error', 'rollout/arm_falls', 'rollout/load_max'}
+        assert not new_logs & set(plain.rollout_metrics())  # its rollout/arm_perturb and rollout/arm_press stay
+        for call in (lambda: plain.set_arm_targets(None, 1), lambda: plain.set_hand_load(1.)):
+            with pytest.raises(ValueError):
+                call()
+        arms.check_health()
+        plain.check_health()
+    finally:
+        arms.close(), plain.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_arm_targets_full_gpu_learner_freezes_the_arm_columns_and_keeps_the_load_ceiling(tmp_path):
+    """full_gpu_train with arm_targets: TensorNormalize keeps the arm columns at mean 0 and their fixed variances through
+    a rollout and an update (with the mirror loss); a stage saved with the ceiling (training_state) gives it back to the
+    next learner's worlds before their first reset, their loads its shares."""
+    from humanoid_sim import full_gpu_train
+    from humanoid_sim.core import read_json, save_stage, write_json
+    from humanoid_sim.lab import validate_config
+    config = {**validate_config(dict(robot_id='g1_29dof', task_id='g1_velocity', backend='full_gpu', envs=64, n_steps=8,
+                                     batch_size=512, n_epochs=1, steps=1024, mirror_coef=.3,
+                                     task_config=ARM_TARGET_PROFILE)), 'steps': 512}
+    run = tmp_path / 'run'
+    run.mkdir()
+    write_json(run / 'run_config.json', config)
+    learner, export = full_gpu_train.make_learner(config)
+    try:
+        positions, mean, variance = learner.env.fixed_normalization
+        columns = torch.as_tensor(positions[-210:], device=learner.device)
+        learner.collect()
+        learner.update()
+        assert not learner.normalizer.obs.mean[columns].any()
+        torch.testing.assert_close(learner.normalizer.obs.var[columns].cpu(), torch.as_tensor(variance[-210:]),
+                                   rtol=0, atol=0)
+        learner.env.restore_training_state({'load_max': [1.3]})
+        learner.normalizer.export_normalizer(export)
+        stage = save_stage(run, learner.model, export, learner.env.training_state())
+        assert read_json(stage / 'metadata.json')['training_state'] == {'load_max': [1.3]}
+    finally:
+        learner.env.close(), export.close()
+    resumed, export = full_gpu_train.make_learner({**config, 'envs': 32, 'batch_size': 256}, stage)
+    try:
+        assert resumed.env.load_max == pytest.approx(1.3)
+        torch.testing.assert_close(resumed.env.hand_load, resumed.env.load_share * 1.3)
+        assert float(resumed.env.hand_load.max()) > 0
+    finally:
+        resumed.env.close(), export.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_load_curve_decides_once_a_block_and_logs_the_free_falls():
+    """task_config load_curve (iteration 40b) on CUDA: 64 worlds stepping 5 times, then rollout windows with set flag-1
+    counts. With block 3 the ceiling holds through two windows (no rollout/arm_falls_block) and moves at the third on the
+    three windows' sums (73728 steps each: 3, 3 and 2 falls are 3.6 % per episode, below 4 %: +0.1 kg, the loads
+    following it); rollout/arm_falls stays the window's own. Without the setting the per-window rule moves it at once
+    (3 falls of a window, 4.1 %: -0.1 kg). rollout/free_falls is logged with arm_targets either way, from the flag-0
+    episodes' own counts."""
+    from humanoid_sim.tasks import g1_tensor_math as task
+    profile = dict(push_velocity=0, observation_noise=False, randomize=False, **ARM_TARGET_PROFILE)
+    curve = {'block': 3, 'raise_falls': .04, 'lower_falls': .06}
+    curved, plain = TensorG1Env(64, seed=6, load_curve=curve, **profile), TensorG1Env(64, seed=6, **profile)
+    try:
+        assert curved.load_block is not None and plain.load_block is None
+        for env in (curved, plain):
+            env.reset()
+            env.restore_training_state({'load_max': [1.]})
+            for _ in range(5):
+                env.step(torch.zeros((64, 29), device=env.device))
+            env.check_health()
+            steps = env._free_steps.item()
+            assert steps + env._arm_steps.item() == 5 * 64  # every world-step counted on one side
+            metrics = env.rollout_metrics()  # the real counts of these 5 steps: the block's first window for curved
+            assert 'rollout/free_falls' in metrics and 'rollout/arm_falls_block' not in metrics
+        assert curved.load_max == 1.  # no decision before the block is full
+        curved.load_block = task.LoadCurveBlock(**curve)  # a block of the windows below only
+        blocks = []
+        for falls in (3., 3., 2.):
+            curved._arm_steps.fill_(73728.), curved._arm_track_sum.fill_(.8 * 73728), curved._arm_falls.fill_(falls)
+            curved._free_steps.fill_(24576.), curved._free_falls.fill_(1.)
+            metrics = curved.rollout_metrics()
+            blocks.append((metrics['rollout/load_max'], metrics.get('rollout/arm_falls_block')))
+            assert metrics['rollout/arm_falls'] == pytest.approx(falls * 1000 / 73728)
+            assert metrics['rollout/free_falls'] == pytest.approx(1000 / 24576)
+        assert blocks[0] == (1., None) and blocks[1] == (1., None)
+        assert blocks[2][0] == pytest.approx(1.1) and blocks[2][1] == pytest.approx(8 * 1000 / (3 * 73728))
+        torch.testing.assert_close(curved.hand_load, curved.load_share * curved.load_max)
+        plain._arm_steps.fill_(73728.), plain._arm_track_sum.fill_(.8 * 73728), plain._arm_falls.fill_(3.)
+        before = plain.load_max
+        assert plain.rollout_metrics()['rollout/load_max'] == pytest.approx(max(before - .1, 0.))
+        assert curved.training_state() == {'load_max': [curved.load_max]}  # the block's counts are not kept
+        curved.check_health()
+        plain.check_health()
+    finally:
+        curved.close(), plain.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_arm_error_on_holds(monkeypatch):
+    """Reward weight arm_error (iteration 43) at 6: two worlds against the CPU task, both arms to the poses of
+    test_g1_cpu_gpu_arm_targets_and_hand_loads in a 0.2 s quintic (10 steps), 1 / 2 kg and 0.5 / 0 kg on the hands. Over
+    16 steps the holds (task.arm_holding) are the CPU task's, none in the quintic and all from its 11th step; arm_error
+    is 0 while the targets move and −6·mean |q − target| on a hold, the CPU one's; rollout/arm_error_hold is the mean
+    error over the hold world-steps. The arms stay off the body (checked on the CPU every step)."""
+    import warp as wp
+    import humanoid_sim.g1_tensor_env as tensor_env
+    from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
+    seen, original = [], tensor_env.reward_components
+
+    def spy(*args, **kwargs):
+        components, fell = original(*args, **kwargs)
+        seen.append((kwargs, components))
+        return components, fell
+
+    monkeypatch.setattr(tensor_env, 'reward_components', spy)
+    profile = {**ARM_TARGET_PROFILE, 'reward_weights': {**ARM_TARGET_PROFILE['reward_weights'], 'arm_error': 6.}}
+    cpus = [G1VelocityEnv(**profile) for _ in range(2)]
+    gpu = TensorG1Env(2, seed=4, resample_commands=False, push_velocity=0, observation_noise=False, randomize=False,
+                      **profile)
+    try:
+        poses = np.stack([cpus[0].home, cpus[0].home + cpus[0].arm_carry[5].numpy()])
+        poses[0, ARM_TRACKED] += np.abs(np.linspace(-.5, .5, 10)) * np.array([1, 1, 1, 1, 1, 1, -1, -1, 1, -1])
+        loads = np.array([[1., 2.], [.5, 0.]])
+        for cpu, pose, load in zip(cpus, poses, loads):
+            cpu.reset(seed=4, options={'command': [0., 0., 0.]})
+            cpu.set_arm_targets(pose, 1, seconds=.2)
+            cpu.set_hand_load(load)
+        gpu.reset()
+        gpu.qpos.copy_(torch.tensor(np.stack([cpu.data.qpos for cpu in cpus]), device=gpu.device, dtype=torch.float32))
+        gpu.qvel.zero_()
+        gpu.command.zero_()
+        gpu.set_arm_targets(torch.tensor(poses, dtype=torch.float32), 1, seconds=.2)
+        gpu.set_hand_load(torch.tensor(loads, dtype=torch.float32))
+        with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(gpu.device))):
+            wp.capture_launch(gpu.forward_graph)
+        gpu._obs('fill')
+        gpu.rollout_metrics()  # a fresh window
+        held, held_cpu = [], []
+        for step in range(16):
+            action = .4 * np.sin(np.arange(29) + 1.7 * step)
+            results = [cpu.step(action) for cpu in cpus]
+            actions = torch.tensor(action, device=gpu.device, dtype=torch.float32)[None].expand(2, -1).contiguous()
+            _, reward, terminated, _, _ = gpu.step(actions)
+            gpu.check_health()
+            kwargs, components = seen[-1]
+            assert not terminated.any() and bool(kwargs['arm_flag'].all())
+            assert kwargs['arm_hold'].tolist() == [info['arm_hold'] for *_, info in results] == [step >= 10] * 2
+            for world, (_, value, _, _, info) in enumerate(results):
+                cpu = cpus[world]
+                geom = cpu.data.contact.geom
+                assert not (cpu.robot_geoms[geom].all(axis=1) & cpu.arm_geoms[geom].any(axis=1)).any()  # arms clear
+                part = info['reward_components']['arm_error']
+                assert part == (pytest.approx(-6 * info['arm_error'], rel=1e-12) if step >= 10 else 0)
+                np.testing.assert_allclose(float(components['arm_error'][world]), part, atol=1e-2, rtol=2e-2)
+                np.testing.assert_allclose(reward.cpu()[world], value, atol=.03, rtol=.02)
+                if step >= 10:
+                    held.append(float(kwargs['arm_error'][world]))
+                    held_cpu.append(info['arm_error'])
+        metrics = gpu.rollout_metrics()
+        assert metrics['rollout/arm_error_hold'] == pytest.approx(np.mean(held), rel=1e-5)
+        assert metrics['rollout/arm_error_hold'] == pytest.approx(np.mean(held_cpu), rel=2e-2)
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()

@@ -65,8 +65,11 @@ def episode(stage, command, seed, stop_at=None, steps=500):
             creep_from = data.qpos[:2].copy()
     turned = math.degrees(math.remainder(st.heading_of(data.qpos) - start, 2 * math.pi))
     creep = float(np.linalg.norm(data.qpos[:2] - creep_from)) if creep_from is not None and fell is None else None
+    # moved: the pelvis path from the stop to the episode's end (skills_check: the 3 s after a stop)
+    moved = float(np.linalg.norm(data.qpos[:2] - stop_pos)) if stop_pos is not None and fell is None else None
     env.close()
-    return dict(fell=fell, speed=float(np.mean(speeds)) if speeds else None, turned=turned, brake=brake, creep=creep)
+    return dict(fell=fell, speed=float(np.mean(speeds)) if speeds else None, turned=turned, brake=brake, creep=creep,
+                moved=moved)
 
 
 def job(args):

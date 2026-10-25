@@ -1,6 +1,6 @@
 """Robot package for the first G1 run on the hoist (CPU only): runs/humanoid_lab/robot/<name>/.
 
-Usage: .venv\\Scripts\\python.exe scripts\\robot\\package.py --candidate n8|n9|n10 [--name NAME]
+Usage: .venv\\Scripts\\python.exe scripts\\robot\\package.py --candidate n8|n9|n10 [--getup EXPORT] [--name NAME]
 
 Three packages (PACKAGES):
   n8   the first floor run: candidate 8 (main) and 7 (spare), one contract (ONNX obs [1, 490]), the g1_ctrl patches
@@ -25,6 +25,13 @@ Puts together, for the person at the robot:
                REFERENCE.md: those tables and the sim2sim numbers of docs/sim2sim.md (each package's table)
   PROTOCOL.md  docs/robot-first-run.md;  README.md;  install_policy.sh (with a height policy: checks the tree and
                the build against the chosen policy);  package.json;  MD5SUMS (md5sum -c)
+--getup EXPORT (a folder in runs/humanoid_lab/export: export_g1 of a g1_getup stage) adds a getting-up policy for
+g1_ctrl's GetUp state (g1_ctrl-getup.patch, in every package): policy/getup-<stage> after checking its contract (the
+walking candidates' ONNX obs [1, 490] and deploy.yaml but for comments and the command ranges, [0, 0] each; the ONNX
+properties getup and pd_bound; locked wrists exactly 0, actions within +-10 and targets within the bound of the
+observed angles), install_policy.sh getup (into the state's policy_dir, and the state turned on in config.yaml) and
+getup-off, its sections in README.md and REFERENCE.md (GETUP_STAGES: the critic's probe, the bridge). Without it a
+package is the same as before, GetUp left commented out in config.yaml.
 Every copied file is checked against its source by md5. A rerun rebuilds the folder: built aside, then swapped in
 (only a folder this script made, by package.json, is replaced).
 """
@@ -349,6 +356,147 @@ HOIST_SEGMENTS = dict(stand='стоять (команда 0)', walk='идти 0,
                       crouch64='присед на 0,64 (команда 0)', rise='подъём к 0,78 (команда 0)')
 PHYSICS = dict(ours='наша', um='unitree_mujoco')
 
+# --getup: a getting-up export (humanoid_sim.export_g1 of a g1_getup stage, its deploy.yaml has a GETUP_HEADER line, as
+# scripts/sim2sim/run.sh checks) for g1_ctrl's GetUp state of GETUP_PATCH, which is in every package and lists the
+# state commented out among config.yaml's enabled ones (g1_ctrl builds every enabled state at start, and without a
+# policy in its policy_dir it would not start). install_policy.sh getup puts the policy there and turns the state on
+# with a line of its own (GETUP_STATE_NOTE) before Velocity's: the patch's lines stay as they are, so apply_patches.sh
+# still finds it applied and `git apply --reverse --check` still holds; getup-off takes that line out. Its contract:
+# GETUP_BOUND_TOL is how far past pd_bound_rad (the ONNX property) a free joint's target may lie from the newest
+# observed angle (rad; the graph's float32).
+GETUP_PATCH = 'g1_ctrl-getup.patch'
+GETUP_TASK = 'g1_getup'
+GETUP_HEADER = '# g1_getup: '
+GETUP_LABELS = ('getup', 'getup-off')
+GETUP_BOUND_TOL = 1e-5
+GETUP_STATE_NOTE = 'robot package: on with its policy in {policy_dir} (install_policy.sh getup)'
+GETUP_ABOUT_37 = ('ветка 37 exp-9a88a0d1732f47f5 (итерация 37: `impact` 2, `pd_bound` c 0,6, `stand_pose_std` 0,7, '
+                  '`action_change_unbounded`)')
+GETUP_ABOUT_39 = ('ветка 39 exp-f19f12fb1eff4ef3 (итерация 39: от этапа 753 ветки 37 с `stand_pose_std` 0,3; `impact` 2, '
+                  '`pd_bound` c 0,6, `action_change_unbounded` — как в ветке 37)')
+# The getting-up stages a package can carry, by steps (check_export's stage): the branch, the section of
+# docs/sim2sim.md for one that ran in the bridge (None: not run there; an optional note says what of it did), and
+# compare: the stage whose probe column stands next to its own in REFERENCE.md (the candidate before it), and whose
+# bridge REFERENCE.md shows for a stage without one of its own.
+GETUP_STAGES = {
+    '683606016': dict(about=GETUP_ABOUT_37, sim2sim='## Вставание: этап 683 (итерация 37)', compare=None),
+    '753795072': dict(about=GETUP_ABOUT_37, sim2sim='## Вставание: этап 753 (итерация 38)', compare='683606016'),
+    '823984128': dict(about=GETUP_ABOUT_39, sim2sim='## Вставание: этап 823 (итерация 39)', compare='753795072'),
+}
+# The critic's probe of iteration 38 (lab-critic/it38): ready38.py, 276 fresh starts (back, front, side, sitting 56 each,
+# candidate 8's falls 52) in 4 physics (ours, a 20 ms delay, soles 0.4 with the rest and the floor 0.2, the training's
+# sensor noise and encoder bias), GetUp 10 s without the assist under the per-joint speed limits with the shoulder pitch
+# at 26, then candidate 8's Velocity one second after getting up; pose38.py (60 hand-overs) and press38.py (60 starts,
+# ours); iteration 39 (lab-critic/it39, the lead's runs of its scripts): turn39.py (40 hand-overs, the feet's width too).
+# (what, {stage: value}); four numbers in a row are the four physics in that order.
+GETUP_PROBE = [
+    ('Успех: встал за 6 с, без отсечки скорости и повторного падения до передачи, Velocity №8 через 1 с без падения '
+     '(наша / задержка 20 мс / пол 0,4–0,2 / шум)',
+     {'823984128': '276 / 276 / 275 / 274 из 276 (100 / 100 / 99,6 / 99,3%)',
+      '753795072': '274 / 274 / 274 / 274 из 276 (99,3% в каждой)',
+      '683606016': '274 / 274 / 267 / 273 из 276 (99,3 / 99,3 / 96,7 / 98,9%)'}),
+    ('Встал за 6 с', {'823984128': '276 / 276 / 275 / 275', '753795072': '276 / 276 / 275 / 276',
+                      '683606016': '275 / 276 / 273 / 275'}),
+    ('Подъём, с: медиана / p90 / наибольший', {
+        '823984128': '1,10 / 1,82 / 4,16; 1,24 / 1,73 / 3,48; 1,06 / 2,09 / 5,92; 1,12 / 1,95 / 3,84',
+        '753795072': '1,14 / 1,83 / 5,70; 1,26 / 1,85 / 3,60; 1,06 / 1,99 / 4,08; 1,18 / 2,07 / 4,62',
+        '683606016': '1,14 / 1,96 / 5,00; 1,28 / 1,85 / 5,46; 1,08 / 2,30 / 5,02; 1,14 / 1,98 / 4,02'}),
+    ('Худший класс стартов (успех)', {'823984128': 'сидя 55 из 56 (пол, шум), живот 55 из 56 (шум)',
+                                      '753795072': 'падения №8 51 из 52 (наша, пол); живот 54 из 56 (шум)',
+                                      '683606016': 'сидя 51 из 56, падения №8 50 из 52 (пол)'}),
+    ('Отсечка скорости по порогам GetUp (тангаж плеч 26)', {
+        '823984128': '0 из 1104', '753795072': '0 из 1104',
+        '683606016': '1 из 1104 (пол: крен левого запястья 41,9 рад/с, ещё лёжа)'}),
+    ('Ближе всех к своему порогу до передачи, рад/с (порог)', {
+        '823984128': 'тангаж левого плеча 25,0 (26), p99 17,8 — пол; закреплённое правое запястье по тангажу 46,8 (50) '
+                     '— пол; в остальных физиках плечи до 21,5',
+        '753795072': 'тангаж левого плеча 24,1 (26), p99 21,7 — пол; в остальных физиках он до 20,5',
+        '683606016': 'тангаж левого плеча 24,0 (26) — пол, 23,2 — наша'}),
+    ('Повторное падение в GetUp после подъёма (за 10 с)', {
+        '823984128': '0 / 0 / 0 / 1, через 0,98 с после подъёма',
+        '753795072': '2 / 2 / 1 / 2, через 0,30–1,16 с после подъёма',
+        '683606016': '1 / 2 / 6 / 2, через 0,24–1,10 с после подъёма'}),
+    ('Velocity №8 из стойки: падений', {
+        '823984128': '0 (одно «падение после передачи» — повторное падение, начатое ещё в GetUp)',
+        '753795072': '0 (все «падения после передачи» — повторное падение, начатое ещё в GetUp)',
+        '683606016': '0 (все «падения после передачи» — повторное падение, начатое ещё в GetUp)'}),
+    ('Наклон таза при передаче, °: медиана / p90', {'823984128': '3,2–3,7 / 4,4–5,4',
+                                                    '753795072': '10,6–11,0 / 12,2–13,0',
+                                                    '683606016': '22,4–23,2 / 24,3–24,8'}),
+    ('Первая 1 с Velocity: рука, рад/с: медиана / наибольшая', {
+        '823984128': '1,6–3,0 / 3,8–6,6', '753795072': '3,3–3,5 / 6,7–18,2 (18,2 — шум)',
+        '683606016': '4,2–5,5 / 7,3–22,8 (22,8 — шум)'}),
+    ('Стоять 5 с в Velocity: смещение, м: медиана / p90 / наибольшее', {
+        '823984128': '0,04–0,05 / 0,07–0,15 / 0,28–0,47', '753795072': '0,05–0,06 / 0,08–0,19 / 0,23–0,53',
+        '683606016': '0,07–0,09 / 0,11–0,19 / 0,31–1,03'}),
+    ('Уползание стоя в GetUp за 10 с, м: p90 / наибольшее', {'823984128': '0,16–0,26 / 0,59–1,92',
+                                                             '753795072': '0,15–0,20 / 0,74–3,63',
+                                                             '683606016': '0,15–0,25 / 1,08–1,64'}),
+    ('Поза передачи (`pose38`, 60 передач): Σ(q − home)², рад², медиана; таз / торс, °', {
+        '823984128': '— (`turn39` — строкой ниже)', '753795072': '1,13; 10,8 / 4,4', '683606016': '1,97; 23,0 / 11,0'}),
+    ('Поворот за 5,4 с после R2+A (`pose38`): медиана; разброс; больше 9°', {
+        '823984128': '— (`turn39` — строкой ниже)',
+        '753795072': '−21,9°; −30,5…+10,5°; 52 из 60 (до 18°/с, смещение ≤ 0,30 м, падений 0)',
+        '683606016': '−21,7°; −33,5…+12,8°; 50 из 60 (до 29°/с, смещение ≤ 0,28 м, падений 0)'}),
+    ('Передача по `turn39` (40 передач): Σ(q − home)², медиана; таз, °; ширина стоп, м; поворот за 5,4 с — медиана, '
+     'разброс, больше 15°', {
+         '823984128': '0,56; 3,5; 0,451; −8,3°, −23,2…+15,8°, 11 из 40 (падений 0)',
+         '753795072': '1,13; 10,9; 0,540; −22,4°, −30,5…+10,5°, 31 из 40 (падений 0)', '683606016': 'не мерили'}),
+    ('Руки прижаты к корпусу стоя (60 стартов, наша): касание рука–корпус, медиана; \\|τ\\| / пик: левое плечо по '
+     'тангажу и крену, правое по крену', {'823984128': 'не мерили', '753795072': '226 Н; 0,59 и 0,61, 0,60',
+                                          '683606016': '242 Н; 0,58 и 0,60, 0,61'}),
+]
+# The bridge (docs/sim2sim.md, its section of GETUP_STAGES): unitree_mujoco + g1_ctrl in WSL2, the getup scenario of
+# gamepad.py (fall, 5 s lying, L2+down, R2+A after 5 s, candidate 8's Velocity: 5 s standing, 5 s at 0.5 m/s, stop).
+GETUP_BRIDGE = [
+    ('Прогонов; сборка `g1_ctrl`', {
+        '823984128': '18, строго по одному; `8e72aa9e…`, тангаж плеч с порогом 30 (как в пакете)',
+        '753795072': '18, строго по одному; `8e72aa9e…`, тангаж плеч с порогом 30 (как в пакете)',
+        '683606016': '18, строго по одному; `8e72aa9e…` (тангаж плеч тогда с порогом 26)'}),
+    ('Встал; время подъёма', {
+        '823984128': '18 из 18; 0,86–2,95 с, медиана 1,1, p90 2,3',
+        '753795072': '18 из 18; 0,86–2,05 с, медиана 1,1, p90 1,8',
+        '683606016': '18 из 18; 0,77–3,73 с, медиана 1,2, p90 2,8'}),
+    ('Как лёг перед GetUp', {
+        '823984128': 'спина 13, живот 5; на бок не лёг ни разу из 8 боковых падений, старта сидя не было',
+        '753795072': 'спина 11, живот 7; на бок не лёг ни разу из 8 боковых падений, старта сидя не было',
+        '683606016': 'спина 14, живот 4; на бок не лёг ни разу из 8 боковых падений, старта сидя не было'}),
+    ('Отсечки (тайм-аут, скорость сустава)', {
+        '823984128': '0 из 18', '753795072': '0 из 18', '683606016': '0 из 18'}),
+    ('Быстрее всего в GetUp; ближе всех к своему порогу', {
+        '823984128': 'рыскание левого плеча до 20,7 рад/с; левое колено 15,6 из 20 (0,78); тангаж плеч до 18,1 из 30',
+        '753795072': 'рыскание правого бедра до 22,8 рад/с; тангаж левого бедра 18,8 из 26 (0,72); тангаж плеч до '
+                     '21,5 из 30',
+        '683606016': 'рыскание левого бедра до 23,2 рад/с; тангаж левого плеча 20,9 из 26 (0,80)'}),
+    ('Закреплённые запястья / крены запястий в GetUp, рад/с', {
+        '823984128': '2,0–9,2 (9,2 — в одном прогоне, в остальных ≤ 6,5) / 13,7–15,2',
+        '753795072': '2,4–10,2 (10,2 — в одном прогоне, в остальных ≤ 5,2) / 13,7–14,8',
+        '683606016': '2,7–6,5 / 13,7–15,1'}),
+    ('Вне позы после подъёма', {
+        '823984128': 'в 0 из 18',
+        '753795072': 'в 1 из 18, на 0,01 с (торс 15,0°)',
+        '683606016': 'в 4 из 18, на 0,07–0,19 с (торс до 15,3–18,5°)'}),
+    ('Смещение стоя в GetUp от подъёма до R2+A', {
+        '823984128': '0,02–0,62 м, медиана 0,09; не меньше 0,3 м — в 3 (за 2,9–4,9 с)',
+        '753795072': '0,02–0,44 м, медиана 0,07; не меньше 0,3 м — в 1 (за 4,9 с)',
+        '683606016': '0,01–0,43 м, медиана 0,09; не меньше 0,3 м — в 3 (за 4,2–4,6 с)'}),
+    ('Поза передачи: Σ(q − home)²; наклон торса / таза', {
+        '823984128': '0,36–0,49 рад²; 1,1–4,6 / 2,1–6,7°',
+        '753795072': '0,84–1,45 рад²; 1,2–7,6 / 7,7–11,7°',
+        '683606016': '1,74–2,35 рад²; 4,8–13,1 / 20,9–22,4°'}),
+    ('Первая 1 с Velocity: рука; самый быстрый сустав', {
+        '823984128': '1,4–2,9; 1,4–5,9 рад/с', '753795072': '2,7–5,1; 2,9–7,5 рад/с',
+        '683606016': '5,1–6,8; 5,5–9,8 рад/с'}),
+    ('Курс таза через 5,4 с после R2+A', {
+        '823984128': '−18,5…−1,5°, медиана −6° (больше 8° в 5 из 18, вправо больше 9° в 2; через 0,5 с −5,5…−0,3°)',
+        '753795072': '−26,1…−8,2°, медиана −13° (вправо больше 9° в 15 из 18; через 0,5 с −7,6…+1,9°)',
+        '683606016': '−24,9…+8,4°, медиана −13° (вправо на 9–25° за 2–5 с в 13 из 18)'}),
+    ('Velocity №8: падений; стоять 5 с; ходьба 0,5 м/с; стоп за 3 с', {
+        '823984128': '0 из 18; 0,01–0,06 м; 0,43–0,45 м/с (0,47 после 1-й с); 0,21–0,26 м',
+        '753795072': '0 из 18; 0,02–0,08 м; 0,42–0,45 м/с (0,47–0,48 после 1-й с); 0,20–0,27 м',
+        '683606016': '0 из 18; 0,01–0,11 м; 0,42–0,44 м/с (0,46–0,47 после 1-й с); 0,20–0,27 м'}),
+]
+
 
 def md5(path):
     return hashlib.md5(Path(path).read_bytes()).hexdigest()
@@ -512,6 +660,277 @@ def onnx_contract(path, size, n=64, arms=None, draws=5):
                 max_abs=float(np.abs(out).max()), arm_blind=meta.get('arm_blind') == 'true',
                 arm_inputs=sum(len(c) for c in arms.values()) if arms else None, arm_draws=draws if arms else None,
                 arm_change=arm_change)
+
+
+def term_layout(terms):
+    """deploy.yaml's observation layout: term -> (its first ONNX input column, frame size, history_length)."""
+    layout, start = {}, 0
+    for name, term in terms.items():
+        size, history = len(term['scale']), int(term.get('history_length', 1))
+        layout[name] = (start, size, history)
+        start += size * history
+    return layout
+
+
+def without_ranges(deploy):
+    """deploy.yaml without the command ranges: what a getting-up export shares with the walking candidates."""
+    out = json.loads(json.dumps(deploy))
+    out.get('commands', {}).get('base_velocity', {}).pop('ranges', None)
+    return out
+
+
+def getup_onnx_contract(path, size, terms, action, n=64):
+    """onnx_contract for a getting-up export: its ONNX properties (getup, task_id, pd_bound: c, e per joint in rad of
+    target and the inputs of the angles it bounds around); on n random observations drawn as onnx_contract's, but with
+    joint_pos_rel within the clip in every frame (the bound carries a target as far out as an angle past the joint's
+    range): locked wrists exactly 0, finite actions within +-10, and how far a free joint's target scale*a lies past e
+    from the newest observed angle (rad, at most GETUP_BOUND_TOL)."""
+    import onnxruntime
+    session = onnxruntime.InferenceSession(str(path), providers=['CPUExecutionProvider'])
+    i, o = session.get_inputs()[0], session.get_outputs()[0]
+    meta = session.get_modelmeta().custom_metadata_map
+    load = lambda key: json.loads(meta[key]) if key in meta else None
+    start, frame, history = term_layout(terms)['joint_pos_rel']
+    newest = [start + (history - 1) * frame, start + history * frame]
+    offset, scale = np.array(action['offset'], float), np.array(action['scale'], float)
+    clip = np.array(action['clip'], float)
+    rng = np.random.default_rng(0)
+    obs = (rng.normal(size=(n, size)) * rng.choice([0.1, 1., 10.], size=(n, 1))).astype(np.float32)
+    for f in range(history):
+        obs[:, start + f * frame:start + (f + 1) * frame] = rng.uniform(clip[:, 0] - offset, clip[:, 1] - offset,
+                                                                          (n, frame))
+    out = np.concatenate([session.run(None, {i.name: x[None]})[0] for x in obs])
+    bound = np.array([np.nan if e is None else e for e in (load('pd_bound_rad') or [])], float)
+    excess = None
+    if bound.shape == (frame,):
+        free = ~np.isnan(bound)
+        gap = np.abs(scale * out.astype(float) - obs[:, newest[0]:newest[1]].astype(float)) - bound
+        excess = float(gap[:, free].max())
+    return dict(input=[i.name, list(i.shape)], output=[o.name, list(o.shape)], samples=n,
+                wrists_zero=bool(np.all(out[:, list(LOCKED_WRISTS)] == 0)), finite=bool(np.all(np.isfinite(out))),
+                max_abs=float(np.abs(out).max()), getup=meta.get('getup') == 'true', task_id=meta.get('task_id'),
+                pd_bound=load('pd_bound'), pd_bound_inputs=load('pd_bound_inputs'), newest_joint_pos=newest,
+                free=[k for k, e in enumerate(bound) if not np.isnan(e)], bound_excess=excess)
+
+
+def check_getup(folder, walking, checked):
+    """The getting-up export's contract (GETUP_PATCH's state): export_g1's g1_getup header, the input of the walking
+    candidate without the height terms (`walking`, check_export's `checked`) and its deploy.yaml but for comments and the
+    command ranges, [0, 0] each; the knee floor and step_dt; the ONNX (getup_onnx_contract): getup and task_id, pd_bound
+    around the newest joint_pos_rel, every joint but the locked wrists bounded, within GETUP_BOUND_TOL."""
+    for name in ('policy.onnx', 'deploy.yaml'):
+        if not (folder / name).exists():
+            fail(f'нет {folder / name}')
+    lines = (folder / 'deploy.yaml').read_text(encoding='utf-8').splitlines()
+    deploy = yaml.safe_load('\n'.join(lines))
+    comments = [line for line in lines if line.lstrip().startswith('#')]
+    m = re.search(r'stage_(\d+)', lines[0])
+    action = deploy['actions']['JointPositionAction']
+    clip = np.array(action['clip'], float)
+    terms = deploy['observations']
+    obs_size = sum(len(t['scale']) * int(t.get('history_length', 1)) for t in terms.values())
+    problems = []
+    if not any(line.startswith(GETUP_HEADER) for line in comments):
+        problems.append(f'в шапке deploy.yaml нет строки «{GETUP_HEADER.strip()}»: это не выгрузка вставания '
+                        '(export_g1 этапа g1_getup)')
+    if obs_size != walking['obs']:
+        problems.append(f"вход наблюдений {obs_size}, а у {walking['title']} {walking['obs']}")
+    if float(deploy['step_dt']) != 0.02:
+        problems.append(f"step_dt {deploy['step_dt']}")
+    if not np.allclose(clip[list(KNEES), 0], KNEE_FLOOR):
+        problems.append(f'нижняя граница clip колен {clip[list(KNEES), 0].tolist()}, а не {KNEE_FLOOR}')
+    ranges = deploy.get('commands', {}).get('base_velocity', {}).get('ranges', {})
+    for key in COMMAND_RANGES:
+        r = ranges.get(key)
+        if r is None or [float(v) for v in r] != [0., 0.]:
+            problems.append(f'диапазон команды {key} {r}, а у вставания команды хода нет: [0, 0]')
+    other = yaml.safe_load((checked['folder'] / 'deploy.yaml').read_text(encoding='utf-8'))
+    if without_ranges(deploy) != without_ranges(other):
+        problems.append(f"deploy.yaml отличается от deploy.yaml {walking['title']} не только комментариями и "
+                        'диапазонами команд: разъём другой')
+    onnx = getup_onnx_contract(folder / 'policy.onnx', obs_size, terms, action)
+    if onnx['input'] != ['obs', [1, walking['obs']]] or onnx['output'] != ['actions', [1, 29]]:
+        problems.append(f"ONNX {onnx['input']} -> {onnx['output']}")
+    if not onnx['getup'] or onnx['task_id'] != GETUP_TASK:
+        problems.append(f"ONNX: свойства getup {onnx['getup']}, task_id {onnx['task_id']}, а у вставания true и "
+                        f'{GETUP_TASK}')
+    if onnx['pd_bound'] is None:
+        problems.append('ONNX: нет свойства pd_bound (граница ошибки ПД)')
+    elif onnx['pd_bound_inputs'] != onnx['newest_joint_pos']:
+        problems.append(f"ONNX: pd_bound_inputs {onnx['pd_bound_inputs']}, а новейший кадр joint_pos_rel в deploy.yaml — "
+                        f"{onnx['newest_joint_pos']}")
+    elif onnx['free'] != [k for k in range(29) if k not in LOCKED_WRISTS]:
+        problems.append(f"ONNX: pd_bound_rad ограничивает суставы {onnx['free']}, а не все, кроме запястий 20, 21, 27, 28")
+    elif not onnx['bound_excess'] <= GETUP_BOUND_TOL:
+        problems.append(f"ONNX: цель дальше границы pd_bound от угла на {onnx['bound_excess']:.2e} рад "
+                        f'(> {GETUP_BOUND_TOL:g})')
+    if not onnx['wrists_zero']:
+        problems.append('ONNX: выходы запястий 20, 21, 27, 28 не равны 0')
+    if not onnx['finite'] or onnx['max_abs'] > 10:
+        problems.append(f"ONNX: выход вне ±10 (макс {onnx['max_abs']})")
+    if problems:
+        fail(f'{folder.name}: ' + '; '.join(problems))
+    stage = m.group(1).lstrip('0') if m else None
+    return dict(export=folder.name, folder=folder, stage=stage, slot=f'getup-{stage or folder.name}', onnx=onnx,
+                comments=comments, command_ranges={k: ranges[k] for k in COMMAND_RANGES},
+                knee_clip=clip[list(KNEES), 0].tolist(), same_deploy_as=walking['title'])
+
+
+def getup_patch_info(path):
+    """From GETUP_PATCH: GetUp's entry among config.yaml's enabled states (commented out there), the line
+    install_policy.sh getup puts in, the state's policy_dir and its max_joint_speed (29, SDK order)."""
+    text = path.read_text(encoding='utf-8')
+    state = re.search(r'^\+    # (GetUp: \{[^}]*\})', text, re.M)
+    policy_dir = re.search(r'^\+    policy_dir: (\S+)', text, re.M)
+    timeout = re.search(r'^\+    timeout: (\S+)', text, re.M)
+    speeds = re.search(r'^\+    max_joint_speed: \[\n((?:\+ .*\n)+?)\+    \]', text, re.M)
+    if not (state and policy_dir and timeout and speeds):
+        fail(f'в {path.name} нет строки GetUp в списке состояний, его policy_dir, timeout или max_joint_speed')
+    limits = [float(v) for v in re.findall(r'\d+(?:\.\d+)?', speeds.group(1))]
+    if len(limits) != 29:
+        fail(f'в {path.name} max_joint_speed из {len(limits)} чисел, а не 29')
+    line = f'    {state.group(1)}  # ' + GETUP_STATE_NOTE.format(policy_dir=policy_dir.group(1))
+    return dict(state_line=line, policy_dir=policy_dir.group(1), timeout=float(timeout.group(1)),
+                max_joint_speed=limits)
+
+
+def getup_limits_text(limits):
+    """GetUp's max_joint_speed by group, as the patch's comment lists it (legs, waist, arms; left and right)."""
+    group = lambda values: '[' + ', '.join(f'{v:g}' for v in values) + ']'
+    pair = lambda left, right: f'{group(left)} ×2' if left == right else f'{group(left)} / {group(right)}'
+    return (f'ноги {pair(limits[0:6], limits[6:12])}, талия {group(limits[12:15])}, руки '
+            f'{pair(limits[15:22], limits[22:29])}')
+
+
+def stage_title(steps):
+    """753795072 -> '753' (millions of steps, as the lab names stages)."""
+    return str(int(steps) // 1_000_000)
+
+
+def getup_stages(stage):
+    """A getting-up stage and its GETUP_STAGES compare stage (if any): the probe columns of REFERENCE.md."""
+    compare = GETUP_STAGES[stage]['compare']
+    return [stage] + ([compare] if compare else [])
+
+
+def getup_bridged(stage):
+    """The stage whose bridge REFERENCE.md shows for a getting-up stage: its own, else its compare stage's (None:
+    neither ran in the bridge)."""
+    for s in getup_stages(stage):
+        if GETUP_STAGES[s]['sim2sim']:
+            return s
+    return None
+
+
+def getup_reference_md(getup):
+    """REFERENCE.md's section on the getting-up policy: the critic's probe (GETUP_PROBE) of its stage next to its compare
+    stage's, and the bridge (GETUP_BRIDGE) of getup_bridged's stage."""
+    stage = getup['stage']
+    stages = getup_stages(stage)
+    head = lambda ss: ('| Что | ' + ' | '.join(stage_title(s) + (' (в пакете)' if s == stage else '') for s in ss)
+                       + ' |\n|---|' + '---|' * len(ss))
+    rows = lambda table, ss: '\n'.join(f'| {what} | ' + ' | '.join(values[s] for s in ss) + ' |' for what, values in table)
+    shown = getup_bridged(stage)
+    note = GETUP_STAGES[stage].get('note')
+    alone = f'Этап {stage_title(stage)} в связке не гоняли' + (f', был только {note}' if note else '')
+    if shown is None:
+        bridge = alone + '.'
+    else:
+        bridge = ((f'{alone}; ниже — этап той же ветки.\n\n' if shown != stage else '')
+                  + f"`unitree_mujoco` + `g1_ctrl` в WSL2, сценарий `getup` (`docs/sim2sim.md`, "
+                  f"«{GETUP_STAGES[shown]['sim2sim'][3:]}»): падение, 5 с лёжа, L2 + вниз, через 5 с\nR2 + A, Velocity "
+                  '№8 — 5 с стоять, 5 с 0,5 м/с, стоп. В `unitree_mujoco` нет капсул кисти и стоп: кисть там '
+                  f'опирается\nкраем запястья, а политика обучена с капсулами.\n\n{head([shown])}\n'
+                  f'{rows(GETUP_BRIDGE, [shown])}')
+    shoulder = getup['max_joint_speed'][15]
+    return f"""## Вставание (GetUp)
+
+Политика вставания `policy/{getup['slot']}` — этап {stage_title(stage)} ({stage} шагов), {GETUP_STAGES[stage]['about']};
+выгрузка `{getup['export']}`. Состояние GetUp `g1_ctrl` (`patches/{GETUP_PATCH}`), передача в Velocity — R2 + A, в
+Velocity — №8. Как вести сеанс — `PROTOCOL.md`, «Вставание после падения».
+
+### Проба критика (итерации 38–39)
+
+`lab-critic/it38/ready38.py`: 276 новых стартов — спина, живот, бок, сидя по 56 и падения №8 52 — в четырёх физиках:
+«наша» (трение из файлов, без задержки), «задержка 20 мс», «пол 0,4–0,2» (подошвы 0,4, остальное и пол 0,2) и «шум»
+(шум датчиков и смещение энкодеров, как в обучении). GetUp 10 с без подтяжки, с порогами скорости по суставам
+(тангаж плеч в пробе 26, в пакете {shoulder:g}); через 1 с после подъёма — Velocity №8 в той же физике: 5 с стоять, 5 с
+0,5 м/с. Четыре числа подряд — эти физики по порядку. Поза передачи и поворот после неё — `pose38.py` (60 передач) и
+`lab-critic/it39/turn39.py` (40 передач, ещё и ширина стоп), руки у корпуса — `press38.py` (60 стартов, наша).
+
+{head(stages)}
+{rows(GETUP_PROBE, stages)}
+
+### Связка (sim2sim)
+
+{bridge}
+
+"""
+
+
+def getup_readme(getup):
+    """README.md's pieces for a package with a getting-up policy: a row of «Состав», the section «Политика вставания»
+    and the install lines of «Политика на место»."""
+    o, stage = getup['onnx'], getup['stage']
+    excess = ('ни одна цель не дальше e' if o['bound_excess'] <= 0 else
+              f"цель дальше e не больше чем на {sci(o['bound_excess'])} рад")
+    row = (f"\n| `policy/{getup['slot']}/` | политика вставания для состояния GetUp `g1_ctrl` (`install_policy.sh … "
+           'getup`) |')
+    section = f"""
+
+## Политика вставания
+
+`policy/{getup['slot']}` — этап {stage_title(stage)} ({stage} шагов), {GETUP_STAGES[stage]['about']}; выгрузка
+`{getup['export']}`. Для состояния GetUp `g1_ctrl` (`patches/{GETUP_PATCH}`): из Passive лёжа L2 + вниз — GetUp,
+встал — R2 + A, дальше Velocity (передача проверена только в №8). Сеанс — `PROTOCOL.md`, «Вставание после падения»;
+числа — `REFERENCE.md`, «Вставание (GetUp)».
+
+""" + ru(
+        f"Разъём — как у {getup['same_deploy_as']}: ONNX `obs` [1, {o['input'][1][1]}] → `actions` [1, 29]; `deploy.yaml` "
+        f"совпадает с `deploy.yaml` {getup['same_deploy_as']},\nкроме комментариев и диапазонов команд: у вставания они "
+        "[0, 0] (команды хода нет, фаза шага стоит). В ONNX — свойства `getup`\nи `task_id` g1_getup и граница ошибки "
+        f"ПД `pd_bound` c = {o['pd_bound']:g}: цель каждого сустава, кроме закреплённых запястий, не дальше\n"
+        f"e = c·пик/kp от угла, который политика видит (входы {o['pd_bound_inputs'][0]}–{o['pd_bound_inputs'][1] - 1}, "
+        "новейший кадр `joint_pos_rel`; e по суставам — в шапке `deploy.yaml`);\nв `g1_ctrl` для этого ставить нечего. "
+        f"На {o['samples']} случайных наблюдениях с углами суставов в пределах `clip` выходы запястий 20, 21,\n27, 28 "
+        f"ровно 0, действия в ±10, {excess} (порог сборки {sci(GETUP_BOUND_TOL)}).") + ru(
+        f"\n\nПороги GetUp из патча: дольше {getup['timeout']:g} с в GetUp — Passive; сустав быстрее своего порога — "
+        f"Passive (рад/с, порядок SDK):\n{getup_limits_text(getup['max_joint_speed'])}.") + f"""
+
+| Слот | Политика | Выгрузка | Этап, шагов | md5 `policy.onnx` | md5 `deploy.yaml` |
+|---|---|---|---|---|---|
+| `policy/{getup['slot']}` | вставание | `{getup['export']}` | {stage} | `{getup['md5']['policy.onnx']}` | `{getup['md5']['deploy.yaml']}` |
+
+`policy/{getup['slot']}/deploy.yaml`:
+
+```
+""" + '\n'.join(getup['comments']) + '\n```'
+    limits = getup['max_joint_speed']
+    install = f"""
+
+Вставание — только на его сеанс (`PROTOCOL.md`, «Вставание после падения»), после политики хода:
+
+```bash
+bash install_policy.sh ./unitree_rl_mjlab getup        # политика вставания на место, GetUp включён
+bash install_policy.sh ./unitree_rl_mjlab getup-off    # после сеанса: GetUp выключен (политика остаётся)
+```
+
+`getup` проверяет, что в дереве этот `patches/{GETUP_PATCH}` и `g1_ctrl` собран с ним, кладёт `policy.onnx` в
+`deploy/robots/g1/{getup['policy_dir']}/v9_lab/exported/`, `deploy.yaml` — в `…/v9_lab/params/` (сверяет md5) и
+включает GetUp в `config.yaml` строкой перед `Velocity:` в списке включённых состояний (`FSM._`):
+
+```
+{getup['state_line']}
+```
+
+Строки патча (там GetUp закомментирован) остаются, поэтому `apply_patches.sh` и после этого видит патч наложенным.
+Без этой строки `g1_ctrl` GetUp не строит, и L2 + вниз в Passive не действует (в выводе предупреждение); со строкой,
+но без политики в `{getup['policy_dir']}` `g1_ctrl` не запустится. В выводе `g1_ctrl` при старте с GetUp — `Policy
+directory: …/getup/v9_lab` и строки патча `GetUp: no pelvis tilt check, fall_tilt 0 in config.yaml (sim2sim getup
+patch)`, `GetUp: Passive after {getup['timeout']:.1f} s in the state (sim2sim getup patch)`, `GetUp: Passive once a
+joint is faster than its max_joint_speed, {min(limits):.1f}-{max(limits):.1f} rad/s over {len(limits)} SDK motors
+(sim2sim getup patch)`."""
+    return row, section, install
 
 
 def git_state():
@@ -725,6 +1144,7 @@ def reference_md(info, package, sources):
     fix_rest = fix_rest + '\n\n' if fix_rest else ''
     columns = ' | '.join(f"{c['title']} ({c['reference']})" for c in cands)
     about = ', '.join(f"{c['title']} — {c['role']} ({c['about']})" for c in cands)
+    getup = getup_reference_md(info['getup']) if info.get('getup') else ''
     return f"""# Эталоны для первого запуска
 
 Собрано `scripts/robot/package.py` {info['created']}. Числа ниже — то, с чем сравнивать робота; пороги остановки — в
@@ -782,7 +1202,7 @@ Unitree) с моделью стоп из обучения этапа (у {feet} 
 
 Поворот стоя поэтому мерить на самом роботе и поправлять стиком; увод при ходьбе от калибровки меняется мало.
 
-## Источники
+{getup}## Источники
 
 | Файл | md5 |
 |---|---|
@@ -891,6 +1311,10 @@ def readme_md(info):
         dirty = ('\nИсточники пакета с незакоммиченными правками на момент сборки: '
                  + ', '.join(f"`{line[3:]}`" for line in info['git']['uncommitted']) + '.\n')
     commit = info['git']['commit'] if info['git'] else 'нет git'
+    getup_row = getup_section = getup_install = ''
+    if info.get('getup'):
+        title += f", вставание {stage_title(info['getup']['stage'])}"
+        getup_row, getup_section, getup_install = getup_readme(info['getup'])
     return f"""# Пакет для робота: G1, {title}
 
 Собран {info['created']} скриптом `scripts/robot/package.py` (лаборатория, коммит `{commit}`). Перед сеансом прочитать
@@ -901,7 +1325,7 @@ def readme_md(info):
 
 | Путь | Что |
 |---|---|
-| `policy/<слот>/policy.onnx`, `deploy.yaml` | политика и её разъём для `g1_ctrl` (выгрузка `humanoid_sim.export_g1`) |
+| `policy/<слот>/policy.onnx`, `deploy.yaml` | политика и её разъём для `g1_ctrl` (выгрузка `humanoid_sim.export_g1`) |{getup_row}
 | `patches/g1_ctrl-*.patch`, `apply_patches.sh` | правки лаборатории к `unitree_rl_mjlab/deploy` и их наложение |
 | `install_policy.sh` | кладёт выбранную политику туда, откуда её берёт `g1_ctrl` |
 | `tools/sim2sim_probe/` | регистратор DDS (`rt/lowstate`, `rt/lowcmd`) — исходник, собирать на машине у робота |
@@ -923,7 +1347,7 @@ def readme_md(info):
 |---|---|---|---|---|---|
 {rows}
 
-{headers}
+{headers}{getup_section}
 
 ## Патчи g1_ctrl
 
@@ -951,7 +1375,7 @@ bash install_policy.sh ./unitree_rl_mjlab {main['label']}    # или {spare_lab
 
 Скрипт кладёт `policy.onnx` в `deploy/robots/g1/config/policy/velocity/v9_lab/exported/`, `deploy.yaml` — в
 `…/v9_lab/params/`, сверяет md5 и проверяет, что `g1_ctrl` возьмёт именно `v9_lab` (он берёт последнюю по имени
-папку с `exported` в `config/policy/velocity`). В выводе `g1_ctrl` при старте: `Policy directory: …/velocity/v9_lab`.{install_note}
+папку с `exported` в `config/policy/velocity`). В выводе `g1_ctrl` при старте: `Policy directory: …/velocity/v9_lab`.{install_note}{getup_install}
 
 ## Запись и разбор
 
@@ -1078,13 +1502,80 @@ elif [ "$OBS" -nt "$BIN" ]; then
 fi
 """
 
+# install_policy.sh of a package with a getting-up policy, before the walking slots (GETUP_PATCH, GETUP_STATE_NOTE):
+# getup checks the tree and the build against the package's getup patch, puts the policy into GetUp's policy_dir and
+# turns the state on with its own line before Velocity's among config.yaml's enabled states; getup-off takes the line
+# out (the policy stays). The patch must still check out reversed after either, so apply_patches.sh keeps working.
+INSTALL_GETUP = """# Вставание ({getup_patch}, состояние GetUp): getup — политика в {policy_dir}/v9_lab и GetUp включён в config.yaml
+# (своей строкой перед Velocity в списке включённых состояний FSM._, строки патча не трогаются); getup-off — строка снята.
+case "${{2:-}}" in
+  getup|getup-off)
+    CFG="$REPO/deploy/robots/g1/config/config.yaml"
+    LINE='{line}'
+    [ -f "$CFG" ] || {{ echo "нет $CFG: это не unitree_rl_mjlab?"; exit 1; }}
+    if ! git -c 'safe.directory=*' -C "$REPO" apply --reverse --check "$HERE/patches/{getup_patch}" 2>/dev/null; then
+      echo "в $REPO не наложен patches/{getup_patch} этого пакета: bash apply_patches.sh $REPO --build"
+      exit 1
+    fi
+    if [ "$2" = getup-off ]; then
+      if grep -qxF "$LINE" "$CFG"; then
+        grep -vxF "$LINE" "$CFG" > "$CFG.getup-tmp"
+        cat "$CFG.getup-tmp" > "$CFG" && rm -f "$CFG.getup-tmp"
+        echo "GetUp выключен: строка пакета снята из $CFG (политика осталась в {policy_dir}/v9_lab)"
+      else
+        echo "GetUp и так выключен: строки пакета в $CFG нет"
+      fi
+      [ "$(grep -c '^    GetUp:' "$CFG")" = 0 ] || {{ echo "ВНИМАНИЕ: в $CFG GetUp включён другой строкой"; exit 1; }}
+      exit 0
+    fi
+    BIN="$REPO/deploy/robots/g1/build/g1_ctrl"
+    if [ ! -e "$BIN" ]; then
+      echo "ВНИМАНИЕ: g1_ctrl ещё не собран ($BIN): bash apply_patches.sh $REPO --build"
+    elif ! grep -q 'sim2sim getup patch' "$BIN"; then
+      echo "$BIN собран без {getup_patch}: пересобрать — bash apply_patches.sh $REPO --build"
+      exit 1
+    fi
+    SRC="$HERE/policy/{slot}"
+    GETUP="$REPO/deploy/robots/g1/{policy_dir}"
+    DST="$GETUP/v9_lab"
+    mkdir -p "$DST/exported" "$DST/params"
+    cp "$SRC/policy.onnx" "$DST/exported/policy.onnx"
+    cp "$SRC/deploy.yaml" "$DST/params/deploy.yaml"
+    echo "{slot} (пакет $(basename "$HERE"))" > "$DST/PACKAGE.txt"
+    for pair in "policy.onnx:exported/policy.onnx" "deploy.yaml:params/deploy.yaml"; do
+      a=$(md5sum < "$SRC/${{pair%%:*}}" | cut -d' ' -f1)
+      b=$(md5sum < "$DST/${{pair#*:}}" | cut -d' ' -f1)
+      [ "$a" = "$b" ] || {{ echo "md5 не совпал: $DST/${{pair#*:}}"; exit 1; }}
+      echo "$DST/${{pair#*:}}: md5 $b"
+    done
+    [ -d "$GETUP/exported" ] && echo "ВНИМАНИЕ: в $GETUP есть exported/ — g1_ctrl возьмёт его, а не v9_lab"
+    last=$(for d in "$GETUP"/*/; do [ -d "$d/exported" ] && basename "$d"; done | LC_ALL=C sort | tail -1)
+    [ "$last" = v9_lab ] || {{ echo "ВНИМАНИЕ: g1_ctrl возьмёт $last (последняя по имени папка с exported), а не v9_lab"; exit 1; }}
+    if grep -qxF "$LINE" "$CFG"; then
+      echo "GetUp в $CFG уже включён строкой пакета"
+    else
+      [ "$(grep -c '^    GetUp:' "$CFG")" = 0 ] || {{ echo "в $CFG GetUp уже включён другой строкой: снимите её"; exit 1; }}
+      [ "$(grep -cx '    Velocity:' "$CFG")" = 1 ] ||
+        {{ echo "в $CFG не одна строка «    Velocity:» (список включённых состояний FSM._)"; exit 1; }}
+      awk -v line="$LINE" '$0 == "    Velocity:" {{ print line }} {{ print }}' "$CFG" > "$CFG.getup-tmp"
+      cat "$CFG.getup-tmp" > "$CFG" && rm -f "$CFG.getup-tmp"
+      echo "GetUp включён: в $CFG перед «    Velocity:» строка «$LINE»"
+    fi
+    git -c 'safe.directory=*' -C "$REPO" apply --reverse --check "$HERE/patches/{getup_patch}" ||
+      {{ echo "после правки $CFG patches/{getup_patch} не сходится с деревом"; exit 1; }}
+    echo "g1_ctrl построит GetUp ({slot}): в его выводе при старте — «Policy directory: $DST» и строки GetUp патча"
+    echo "после сеанса вставания: bash install_policy.sh $REPO getup-off"
+    exit 0 ;;
+esac
+"""
+
 INSTALL_SH = """#!/bin/bash
 # Кладёт политику пакета туда, откуда её берёт g1_ctrl: <unitree_rl_mjlab>/deploy/robots/g1/config/policy/velocity/v9_lab
 # Запуск: bash install_policy.sh <папка unitree_rl_mjlab> {labels}
 set -eu
 HERE="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 REPO="${{1:?запуск: bash install_policy.sh <папка unitree_rl_mjlab> {labels}}}"
-case "${{2:-}}" in
+{getup}case "${{2:-}}" in
 {cases}
   *) echo "какую политику: {labels}"; exit 1 ;;
 esac
@@ -1113,7 +1604,7 @@ fi
 """
 
 
-def build(name, key):
+def build(name, key, getup_dir=None):
     package = PACKAGES[key]
     candidates = package['candidates']
     height = any(c['height'] for c in candidates)
@@ -1141,6 +1632,26 @@ def build(name, key):
     if no_feet:
         fail(f"у {', '.join(no_feet)} в шапке deploy.yaml нет foot_collision, а REFERENCE.md пишет, что стопы "
              'сталкиваются капсулами Unitree')
+    # a getting-up policy (--getup): its contract against the candidate without the height terms, its reference numbers
+    getup = None
+    if getup_dir is not None:
+        walking = [(c, x) for c, x in zip(candidates, checked) if not c['height']]
+        if not walking:
+            fail('в пакете нет кандидата без термов высоты, с чьим разъёмом сверить политику вставания')
+        getup = check_getup(getup_dir, *walking[0])
+        stage = getup['stage']
+        if stage not in GETUP_STAGES or any(s not in values for s in getup_stages(stage) for _, values in GETUP_PROBE):
+            fail(f'нет справочных чисел вставания этапа {stage} или его этапа сравнения: добавить в GETUP_STAGES и '
+                 'столбец в GETUP_PROBE (проба критика, lab-critic/it38: ready38.py, pose38.py, press38.py; it39: '
+                 'turn39.py)')
+        shown = getup_bridged(stage)
+        if shown is not None and any(shown not in values for _, values in GETUP_BRIDGE):
+            fail(f'в GETUP_BRIDGE нет чисел связки этапа {shown}')
+        if shown is not None and GETUP_STAGES[shown]['sim2sim'] not in text:
+            print(f"ВНИМАНИЕ: в docs/sim2sim.md нет раздела {GETUP_STAGES[shown]['sim2sim']!r}: числа связки вставания "
+                  'сверить вручную')
+        if shown != stage:
+            print(f'ВНИМАНИЕ: у этапа вставания {stage} нет раздела связки: в REFERENCE.md связка этапа {shown}')
     # patches: the height patch only in a package with a height policy
     found = {p.name: p for p in sorted(SIM2SIM.joinpath('patches').glob('g1_ctrl-*.patch'))}
     if not found:
@@ -1149,6 +1660,10 @@ def build(name, key):
         fail(f'в scripts/sim2sim/patches нет {HEIGHT_PATCH}, а без него g1_ctrl политику с высотой не примет')
     if not height:
         found.pop(HEIGHT_PATCH, None)
+    if getup is not None:
+        if GETUP_PATCH not in found:
+            fail(f'в scripts/sim2sim/patches нет {GETUP_PATCH}, а без него g1_ctrl состояния GetUp не знает')
+        getup.update(getup_patch_info(found[GETUP_PATCH]))
     order, not_in_setup = patch_order(list(found))
     info['patches_not_in_setup'] = not_in_setup
 
@@ -1171,6 +1686,11 @@ def build(name, key):
                                        comments=x['comments'], command_ranges=x['command_ranges'],
                                        height_terms=x['height_terms'],
                                        md5={f: md5(x['folder'] / f) for f in ('policy.onnx', 'deploy.yaml')}))
+    if getup is not None:
+        for f in ('policy.onnx', 'deploy.yaml'):
+            copy(getup['folder'] / f, pending / 'policy' / getup['slot'] / f, copied)
+        info['getup'] = dict({k: v for k, v in getup.items() if k != 'folder'},
+                             md5={f: md5(getup['folder'] / f) for f in ('policy.onnx', 'deploy.yaml')})
     info['patches'] = []
     for n in order:
         copy(found[n], pending / 'patches' / n, copied)
@@ -1199,7 +1719,13 @@ def build(name, key):
             height_slots='|'.join(c['slot'] for c in info['candidates'] if c['height']), **names)
     else:
         write(pending / 'apply_patches.sh', APPLY_SH.format(commit=info['unitree_rl_mjlab'], patches=' '.join(order)))
-    write(pending / 'install_policy.sh', INSTALL_SH.format(labels=labels, cases=cases, height_check=height_check))
+    getup_block = ''
+    if getup is not None:
+        labels += '|' + '|'.join(GETUP_LABELS)
+        getup_block = INSTALL_GETUP.format(getup_patch=GETUP_PATCH, policy_dir=getup['policy_dir'],
+                                           line=getup['state_line'], slot=getup['slot'])
+    write(pending / 'install_policy.sh', INSTALL_SH.format(labels=labels, cases=cases, height_check=height_check,
+                                                           getup=getup_block))
     info['sources'] = {str(t.relative_to(pending)).replace('\\', '/'): dict(source=str(s.relative_to(SIM)).replace(
         '\\', '/'), md5=md5(s)) for t, s in copied.items()}
     write(pending / 'package.json', json.dumps(info, ensure_ascii=False, indent=1, default=str) + '\n')
@@ -1232,13 +1758,24 @@ def main():
     parser.add_argument('--candidate', required=True, choices=list(PACKAGES),
                         help='n8 — первый пол (№8 и запасной №7); n9 — экспериментальный с приседом (№9 и запасной №8); '
                              'n10 — экспериментальный со слепыми руками и приседом (№10 и запасной №8)')
-    parser.add_argument('--name', help='имя папки в runs/humanoid_lab/robot (по умолчанию g1-<кандидат>-<выгрузка>)')
+    parser.add_argument('--getup', help='выгрузка этапа вставания (export_g1 этапа g1_getup) — папка в '
+                                        'runs/humanoid_lab/export, имя или путь: политика для состояния GetUp g1_ctrl')
+    parser.add_argument('--name', help='имя папки в runs/humanoid_lab/robot (по умолчанию g1-<кандидат>-<выгрузка>, с '
+                                       '--getup ещё -getup-<этап>)')
     args = parser.parse_args()
     main_candidate = PACKAGES[args.candidate]['candidates'][0]
-    name = args.name or f"g1-{main_candidate['label']}-{main_candidate['export']}"
+    getup_dir = None
+    if args.getup:
+        getup_dir = Path(args.getup) if Path(args.getup).is_dir() else EXPORTS / args.getup
+        getup_dir = getup_dir.resolve()
+        if getup_dir.parent != EXPORTS.resolve() or not getup_dir.is_dir():
+            fail(f'--getup: нужна папка выгрузки в {EXPORTS} ({args.getup!r})')
+    steps = re.search(r'-(\d+)$', getup_dir.name) if getup_dir else None
+    name = args.name or (f"g1-{main_candidate['label']}-{main_candidate['export']}"
+                         + (f"-getup-{steps.group(1) if steps else getup_dir.name}" if getup_dir else ''))
     if not re.fullmatch(r'[A-Za-z0-9._-]+', name) or name.startswith('.'):
         fail(f'имя папки: латиница, цифры, . _ -, не с точки ({name!r})')
-    final, info, copied, sums = build(name, args.candidate)
+    final, info, copied, sums = build(name, args.candidate, getup_dir)
     print(f'пакет: {final}')
     print('политики (md5 выгрузки = md5 в пакете):')
     for c in info['candidates']:
@@ -1246,6 +1783,16 @@ def main():
             target = final / 'policy' / c['slot'] / f
             print(f"  {c['title']} {c['slot']}/{f}: {c['md5'][f]} = {md5(target)}"
                   f" {'совпал' if c['md5'][f] == md5(target) else 'НЕ СОВПАЛ'}")
+    if info.get('getup'):
+        g = info['getup']
+        for f in ('policy.onnx', 'deploy.yaml'):
+            target = final / 'policy' / g['slot'] / f
+            print(f"  вставание {g['slot']}/{f}: {g['md5'][f]} = {md5(target)}"
+                  f" {'совпал' if g['md5'][f] == md5(target) else 'НЕ СОВПАЛ'}")
+        o = g['onnx']
+        print(f"  вставание: ONNX {o['input']} -> {o['output']}, pd_bound c {o['pd_bound']:g} по входам "
+              f"{o['pd_bound_inputs']}, цель дальше e на {o['bound_excess']:.2e} рад (порог {GETUP_BOUND_TOL:g}), "
+              f"|a| до {o['max_abs']:.2f}; deploy.yaml как у {g['same_deploy_as']}, кроме комментариев и команд [0, 0]")
     print('патчи по порядку: ' + ', '.join(p['name'] for p in info['patches'])
           + (f"; не из setup.sh: {', '.join(info['patches_not_in_setup'])}" if info['patches_not_in_setup'] else ''))
     print(f'файлов {len(sums) + 1}, MD5SUMS сверен; копий с источником сверено {len(copied)}')

@@ -32,6 +32,23 @@ def lab_with_journal(tmp_path):
     return lab
 
 
+def test_a_story_section_clip_goes_out_with_the_site(tmp_path):
+    lab = lab_with_journal(tmp_path)
+    journal.set_roadmap(lab.root, [{'title': 'Руки', 'status': 'active'}])
+    clip = journal.add_media(lab.root, tmp_path / 'race.webp', 'stage3-sag.webp')
+    poster = journal.add_media(lab.root, tmp_path / 'race-poster.jpg', 'stage3-sag.jpg')
+    journal.set_story(lab.root, 0, {'sections': [{'title': 'Провис', 'text': 'Плечо висит.', 'clip': clip,
+                                                  'poster': poster}]})
+    out = tmp_path / 'site'
+    summary = site_export.export(out, lab.original)
+    for lang in i18n.LANGUAGES:
+        data = json.loads((out / 'data' / f'journal.{lang}.json').read_text(encoding='utf-8'))
+        section = data['roadmap'][0]['story']['sections'][0]
+        assert (section['clip'], section['poster']) == ('stage3-sag.webp', 'stage3-sag.jpg')
+    assert {'stage3-sag.webp', 'stage3-sag.jpg'} <= {path.name for path in (out / 'media').iterdir()}
+    assert [name for name in summary['missing'] if name.startswith('media/')] == []
+
+
 def test_export_writes_the_static_site(tmp_path):
     lab = lab_with_journal(tmp_path)
     experiment = lab.create({'name': 'Осторожный PPO'})

@@ -13,9 +13,10 @@ from ..robots.registry import RobotRegistry, RobotSpec
 from .registry import TaskRegistry, TaskSpec
 from .identity import asset_identity
 from ..checkpoint_schema import LEGACY
-from .evaluation import locomotion_metrics, reach_metrics
+from .evaluation import getup_metrics, locomotion_metrics, reach_metrics
 from .playback import PlaybackSpec
-from .config import g1_config, g1_config_identity, G1_PARAMETERS
+from .config import (g1_config, g1_config_identity, G1_PARAMETERS, g1_getup_config, g1_getup_config_identity,
+                     g1_getup_identity, G1_GETUP_PARAMETERS)
 
 ROOT = Path(__file__).resolve().parents[2]
 CPU = frozenset({'cpu'})
@@ -58,11 +59,22 @@ def _g1_identity(robot):
     return identity
 
 
+def _g1_getup(robot, config):
+    from .g1_getup import G1GetupEnv
+    return G1GetupEnv(**config)
+
+
+def _g1_getup_identity(robot):
+    """Its own task_id and schemas; the model of config.G1_GETUP_PROFILE (the real robot with foot and hand capsules)."""
+    return g1_getup_identity(asset_identity(robot, directory=ROOT / 'assets/robots/g1', task_id='g1_getup',
+                                            control_dt=.02, observation_version=2))
+
+
 # robot_id, label, base_type, capabilities, factory whose model provides joint/actuator names
 ROBOTS = (
     ('humanoid', 'Gymnasium Humanoid', 'floating', {'humanoid_v5'}, _humanoid),
     ('so101', 'SO-101', 'fixed', {'so101_reach'}, _arm),
-    ('g1_29dof', 'Unitree G1 · 29 DoF', 'floating', {'g1_velocity'}, partial(_g1_model, False)),
+    ('g1_29dof', 'Unitree G1 · 29 DoF', 'floating', {'g1_velocity', 'g1_getup'}, partial(_g1_model, False)),
     ('g1_12dof', 'Unitree G1 · ноги (12 DoF)', 'floating', {'g1_velocity'}, partial(_g1_model, True)),
 )
 
@@ -88,6 +100,15 @@ TASKS = (
                                    metric_key='forward_m', fall_height=.45),
              config_validator=g1_config, parameters=G1_PARAMETERS, config_identity=g1_config_identity,
              label='Следование скорости', jobs=LOCOMOTION_JOBS | {'command_suite'}),
+    # Iteration 33: getting up after a fall (tasks/g1_getup.py), 29-DoF only; full_gpu: g1_getup_tensor_env (part B).
+    # No race yet (its scenarios give walking commands; the stage player follows nothing); stages are evaluated
+    # without the assist force and, with task_config pd_bound (iteration 34), at its lowest bound.
+    TaskSpec('g1_getup', frozenset({'g1_getup'}), CPU, _g1_getup, _g1_getup_identity,
+             training_backends=frozenset({'cpu', 'full_gpu'}),
+             evaluation_metrics=getup_metrics, playback=PlaybackSpec(target=(0., 0., .5), camera_offset=(2., -2.5, 1.2)),
+             config_validator=g1_getup_config, parameters=G1_GETUP_PARAMETERS, config_identity=g1_getup_config_identity,
+             label='Вставание после падения', jobs=frozenset({'report'}),
+             evaluation_options={'assist_force': 0., 'pd_bound': 'min'}),
 )
 
 

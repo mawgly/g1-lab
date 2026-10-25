@@ -67,6 +67,20 @@ def test_stage_story_and_clips_are_kept_with_the_plan(tmp_path):
         journal.set_story(tmp_path, 0, {'races': [{'title': 'x', **race, 'clip': '../other.webp'}]})
 
 
+def test_a_story_section_keeps_its_clip(tmp_path):
+    """A section of a stage's story carries a clip and its poster as path steps do; without them it is as before."""
+    journal.set_roadmap(tmp_path, [{'title': 'Руки', 'status': 'active'}])
+    journal.set_story(tmp_path, 0, {'sections': [
+        {'title': 'Провис', 'text': 'Плечо висит.', 'clip': 'arms.webp', 'poster': 'arms.jpg'},
+        {'title': 'Без ролика', 'text': 'Текст.'}]})
+    sections = journal.load(tmp_path)['roadmap'][0]['story']['sections']
+    assert sections[0] == {'title': 'Провис', 'text': 'Плечо висит.', 'clip': 'arms.webp', 'poster': 'arms.jpg'}
+    assert sections[1] == {'title': 'Без ролика', 'text': 'Текст.'}
+    for bad in ('../arms.webp', 'arms.gif'):
+        with pytest.raises(ValueError, match='Ролик'):
+            journal.set_story(tmp_path, 0, {'sections': [{'title': 'x', 'text': 'y', 'clip': bad}]})
+
+
 def test_journal_is_served_read_only_with_its_images(tmp_path):
     server = DashboardServer(('127.0.0.1', 0), tmp_path / 'original')
     image = tmp_path / 'shot.png'

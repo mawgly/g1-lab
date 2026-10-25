@@ -6,16 +6,36 @@ import math
 G1_REWARD_WEIGHTS = dict(velocity=2., forward=0., sideways=0., heading=0., yaw=1., yaw_drift=0., alive=.5, gait=.5,
                          swing=10., tilt=1.,
                          orientation=0., height=0., height_ceiling=0., torso=0., base_motion=2., still=0.,
-                         stand_pose=0., slip=0., feet_flat=0., clearance=0., self_contact=0., arm_press=0., posture=.1,
-                         hips=0., effort=1e-5, action_change=.01, fall=5.)
+                         stand_pose=0., slip=0., feet_flat=0., clearance=0., self_contact=0., arm_press=0., arm_track=0.,
+                         arm_error=0., posture=.1, hips=0., effort=1e-5, action_change=.01, fall=5.)
 # Values the browser form starts with for a new experiment.
 G1_RECOMMENDED = {**G1_REWARD_WEIGHTS, 'torso': 2.}
 # g1_getup weights (iteration 33, the critic's specification; tasks/g1_tensor_math.getup_reward_components): the task
 # (head height 1, torso upright 0.5), the standing state (bonus 1, pose 0.5, pelvis stillness), regularization always
-# (torques 2e-5, joint speeds 1e-4, action change as the walking recipe's 0.05, legs beyond the soft joint limits).
-# stand_still and joint_limits were not given numbers: 1 each, to be tuned by branches.
+# (torques 2e-5, joint speeds 1e-4, action change as the walking task's 0.01, legs beyond the soft joint limits).
+# stand_still and joint_limits were not given numbers: 1 each, to be tuned by branches. The action change is the walking
+# task's default, not candidate 8's 0.05: the gate requires that standing in home under σ 1 action noise earns more than
+# lying still (tests/test_g1_getup_gate.py), and at 0.05 the noise alone costs 2.39 per step (standing −0.15 against
+# the best lying 0.46; 0.84 at σ 0.8), at 0.01 0.48 (standing 1.76).
+# impact (iteration 35, working value 2): the speed at which a body other than the feet hits the floor
+# (g1_tensor_math.impact_penalty); 0, the default, is the original task bit for bit and computes nothing. A reward
+# weight only: the contract and branching are unchanged.
+# sole_impact (iteration 44, working value 2): the same charge on the sole spheres, which impact leaves out, above 0.5
+# m/s (g1_tensor_math.GETUP_SOLE_IMPACT_SPEED; landing a jump on the feet); 0, the default, is the task before it bit
+# for bit and computes nothing. A reward weight only, as impact.
+# stance_width (after branch 46, working value 2): the feet's width beyond 0.30 m while the pelvis is above 0.5 m and
+# both soles are down (g1_tensor_math.GETUP_STANCE_WIDTH, stance_active); 0, the default, is the task before it bit for
+# bit and computes nothing. A reward weight only.
 G1_GETUP_REWARD_WEIGHTS = dict(head=1., upright=.5, stand=1., stand_pose=.5, stand_still=1., effort=2e-5,
-                               joint_speed=1e-4, action_change=.05, joint_limits=1.)
+                               joint_speed=1e-4, action_change=.01, joint_limits=1., impact=0., sole_impact=0.,
+                               stance_width=0.)
+# g1_getup's robot, fixed by the task (not settings; part of its identity): the walking candidates' real-robot model
+# with Unitree's foot and hand capsules, locked wrists, the knee floor and the action box, and the walking observation
+# layout (history 5, the phase stopped, critic extras) with heading hold off; the command is always zero.
+G1_GETUP_PROFILE = dict(real_robot=True, critic_extras=True, history=5, phase_stop=True, lock_wrists=True,
+                        knee_floor=.061, foot_collision=True, hand_collision=True, action_limit=10.,
+                        heading_hold=False, stand_heading_hold=False, side_heading_hold=False,
+                        gait=dict(period=.6, stance_fraction=.55))
 G1_LABELS = dict(velocity='Следование скорости', forward='Скорость вперёд: чем быстрее, тем больше (до 4 м/с)',
                  sideways='Штраф за бег боком (боковая скорость таза)',
                  heading='Штраф за корпус, отвёрнутый от курса (бег наискось)', yaw='Следование повороту / курсу',
@@ -38,6 +58,10 @@ G1_LABELS = dict(velocity='Следование скорости', forward='Ск
                                'доля под-шагов физики, как self_collisions у Unitree'),
                  arm_press=('Штраф за давление рук (упор в тело): сумма по суставам рук (цель мотора − угол)², '
                             'рад²; плавно падает, когда упор слабеет'),
+                 arm_track=('Руки по целям: среднее по 10 свободным суставам рук exp(−ошибка²/0,3²) (только при '
+                            'командах рук)'),
+                 arm_error=('Штраф за ошибку рук на удержании цели: среднее |ошибка| по 10 свободным суставам рук, '
+                            'рад, линейный (только при командах рук, не во время перехода)'),
                  posture='Штраф за отклонение рук, корпуса и бёдер от исходной позы',
                  hips='Штраф за разведение и разворот бёдер (ноги под корпусом)', effort='Штраф за усилие моторов',
                  action_change='Штраф за резкие действия', fall='Штраф за падение')
@@ -99,6 +123,9 @@ DEPLOY_PHASE_PERIOD = .6
 # the simulator, for the PPO critic alone; the actor never sees them (policies.CriticExtrasPolicy), so the
 # deployed policy still uses only what the robot measures. Asymmetric actor-critic as in legged_gym and mjlab.
 CRITIC_EXTRAS = 4
+# g1_getup's critic extras: those four, then the head height and the assist force (tasks/g1_tensor_math.
+# getup_critic_extras).
+GETUP_CRITIC_EXTRAS = 6
 # history (real robot only): frames of observation history per term, as Unitree's controller builds them with
 # history_length (unitree_rl_lab G1 velocity uses 5): each term's frames oldest first, terms in deploy.yaml order.
 # A different observation contract (obs-unitree-deploy-v0-hN).
@@ -173,6 +200,39 @@ HAND_COLLISION_SUFFIX = '-handcol'
 # scripts/lab/blind_branch.py), frozen in training. Same layout, different content: its own observation contract
 # (observation_schema …-armblind, ARM_BLIND_SUFFIX). False (missing) is the original task, bit for bit.
 ARM_BLIND_SUFFIX = '-armblind'
+# arm_targets (real robot, 29-DoF, needs upper_body_slot and lock_wrists; iteration 40, stage 3 "arms to targets"): the
+# upper-body slot carries an arm command, flag 1 and the arm joints' targets relative to home, and the arm action is a
+# residual on it (target = home + d + scale·a; the observed last action clip(a) + d/scale). Each training episode draws
+# free arms (flag 0: the old task), arms at home or random targets with hand loads on a curve; resets with a command
+# keep flag 0 (tasks/g1_tensor_math ARM_MODES ... load_curve_update). The policy sees its arms (not with arm_blind): its
+# own observation contract (…-armtgt, ARM_TARGETS_SUFFIX) and action contract (…-armres, ARM_RESIDUAL_SUFFIX); a stage
+# moves there with warm_start.unblind_arms (scripts/lab/arm_branch.py). False (missing) is the original task, bit for
+# bit.
+ARM_TARGETS_SUFFIX = '-armtgt'
+ARM_RESIDUAL_SUFFIX = '-armres'
+# load_curve (needs arm_targets; iteration 40b): the hand load ceiling decides once every `block` rollout windows of the
+# full-GPU trainer on their summed flag-1 counts, up below raise_falls, down above lower_falls (falls per episode of
+# max_episode_steps; tasks/g1_tensor_math.LoadCurveBlock); the step, the 2 kg ceiling and the arm_track threshold stay.
+# Training only: the CPU task, the contract and branching are unchanged. None (missing) is the per-window rule.
+LOAD_CURVE_KEYS = ('block', 'raise_falls', 'lower_falls')
+LOAD_CURVE_BLOCK_RANGE = (1, 1000)
+
+
+def load_curve_setting(value):
+    """task_config load_curve normalized: None, or {'block': whole number in LOAD_CURVE_BLOCK_RANGE, 'raise_falls',
+    'lower_falls': shares in [0, 1], raise_falls ≤ lower_falls}; anything else raises ValueError."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != set(LOAD_CURVE_KEYS):
+        raise ValueError('G1 load_curve must be null or {"block": n, "raise_falls": share, "lower_falls": share}')
+    block, low, high = value['block'], value['raise_falls'], value['lower_falls']
+    if type(block) not in (int, float) or block != int(block) or not LOAD_CURVE_BLOCK_RANGE[0] <= block <= \
+            LOAD_CURVE_BLOCK_RANGE[1]:
+        raise ValueError(f'G1 load_curve block must be a whole number in [{LOAD_CURVE_BLOCK_RANGE[0]},'
+                         f'{LOAD_CURVE_BLOCK_RANGE[1]}] rollouts')
+    if any(type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1 for v in (low, high)) or low > high:
+        raise ValueError('G1 load_curve raise_falls and lower_falls must be shares in [0,1], raise_falls <= lower_falls')
+    return {'block': int(block), 'raise_falls': float(low), 'lower_falls': float(high)}
 G1_PARAMETERS = (
     dict(group=None, key='real_robot', label='Реальный робот: моторы, датчики и разброс Unitree', default=False,
          type='bool'),
@@ -253,6 +313,16 @@ G1_PARAMETERS = (
     dict(group=None, key='arm_blind', default=False, type='bool',
          label=('Слепые руки: политика не видит углы, скорости и прошлые команды суставов рук (их входы — '
                 'постоянные числа этапа-родителя)')),
+    # Real robot only, needs upper_body_slot and lock_wrists; missing in a saved config means off (the slot stayed
+    # zeros). Its own observation and action contracts (…-armtgt, …-armres); a stage moves there with
+    # warm_start.unblind_arms (scripts/lab/arm_branch.py).
+    dict(group=None, key='arm_targets', default=False, type='bool',
+         label=('Руки по целям: в эпизодах обучения цели рук в слоте верха тела (флаг 1), действие рук — поправка к '
+                'цели, груз на кистях; при команде сброса — свободные руки, как раньше')),
+    # Needs arm_targets; missing or null in a saved config means the per-window rule (the first branch 40's).
+    dict(group=None, key='load_curve', default=None,
+         label=('Кривая груза на кистях: решение раз в block раскаток, вверх при доле падений ниже raise_falls, вниз '
+                'выше lower_falls (пусто — решение каждую раскатку, 1% / 3%)')),
     dict(group=None, key='action_limit', label='Предел команды моторов (1 — прежний, 4 — почти весь ход суставов)',
          default=1., min=ACTION_LIMIT_RANGE[0], max=ACTION_LIMIT_RANGE[1]),
     *(dict(group='commands', key=key, label=G1_COMMAND_LABELS[key], default=G1_COMMANDS[key],
@@ -347,18 +417,20 @@ def g1_config(values):
     height_command and upper_body_slot missing mean off (no such observation terms). arm_perturb_radians missing means
     ARM_PERTURB_RADIANS (the original arm poses), arm_perturb_contact_mask missing means off (arm contacts charged in a
     perturbation segment too). arm_blind missing means off (the policy saw its arms). hand_collision missing means off
-    (the hands touched nothing).
+    (the hands touched nothing). arm_targets missing means off (the upper-body slot stayed zeros). load_curve missing
+    means None (the load curve decided every rollout window, 1 % / 3 %).
     """
     keys = {'reward_weights', 'heading_hold', 'commands', 'gait', 'action_limit', 'real_robot', 'critic_extras',
             'training_realism', 'history', 'stand_heading_hold', 'phase_stop', 'sole_contact', 'random_phase',
             'action_delay', 'arm_perturb', 'arm_perturb_radians', 'arm_perturb_contact_mask', 'lock_wrists',
             'knee_floor', 'force_push', 'feet_flat_stance', 'foot_collision', 'side_heading_hold', 'motor_friction',
-            'height_command', 'upper_body_slot', 'arm_blind', 'hand_collision'}
+            'height_command', 'upper_body_slot', 'arm_blind', 'hand_collision', 'arm_targets', 'load_curve'}
     if not isinstance(values, dict) or set(values)-keys:
         raise ValueError('Unknown G1 task setting')
     for key in ('heading_hold', 'real_robot', 'critic_extras', 'stand_heading_hold', 'phase_stop', 'sole_contact',
                 'random_phase', 'arm_perturb_contact_mask', 'lock_wrists', 'feet_flat_stance', 'foot_collision',
-                'side_heading_hold', 'height_command', 'upper_body_slot', 'arm_blind', 'hand_collision'):
+                'side_heading_hold', 'height_command', 'upper_body_slot', 'arm_blind', 'hand_collision',
+                'arm_targets'):
         if type(values.get(key, False)) is not bool:
             raise ValueError(f'{key} must be true or false')
     if values.get('critic_extras') and not values.get('real_robot'):
@@ -409,9 +481,17 @@ def g1_config(values):
         raise ValueError('history requires real_robot')
     if values.get('phase_stop') and not real:
         raise ValueError('phase_stop requires real_robot')
-    for key in ('height_command', 'upper_body_slot', 'arm_blind'):  # about the deploy observation layout
+    for key in ('height_command', 'upper_body_slot', 'arm_blind', 'arm_targets'):  # about the deploy observation layout
         if values.get(key) and not real:
             raise ValueError(f'{key} requires real_robot')
+    if values.get('arm_targets'):  # the slot carries the targets; the locked wrists keep their offsets at 0
+        if not values.get('upper_body_slot') or not values.get('lock_wrists'):
+            raise ValueError('arm_targets requires upper_body_slot and lock_wrists')
+        if values.get('arm_blind'):
+            raise ValueError('arm_targets needs the arms seen: not with arm_blind')
+    load_curve = load_curve_setting(values.get('load_curve'))
+    if load_curve is not None and not values.get('arm_targets'):
+        raise ValueError('load_curve requires arm_targets')
     commands = g1_commands(values.get('commands'))
     if any(commands['crouch_share']) and not values.get('height_command'):
         raise ValueError('G1 command crouch_share requires height_command')
@@ -445,7 +525,9 @@ def g1_config(values):
             'height_command': values.get('height_command', False),
             'upper_body_slot': values.get('upper_body_slot', False),
             'arm_blind': values.get('arm_blind', False),
-            'hand_collision': values.get('hand_collision', False)}
+            'hand_collision': values.get('hand_collision', False),
+            'arm_targets': values.get('arm_targets', False),
+            'load_curve': load_curve}
 
 
 # Bumped when the real-robot physics or observation layout changes.
@@ -460,6 +542,8 @@ def g1_config_identity(identity, config):
         identity = {**identity, 'action_schema': f"{identity['action_schema']}-wristlock"}
     if config.get('knee_floor') is not None:  # knee actions below the floor no longer move the knee target
         identity = {**identity, 'action_schema': f"{identity['action_schema']}-knee{config['knee_floor']:g}"}
+    if config.get('arm_targets'):  # the arm actions are a residual on the slot's targets
+        identity = {**identity, 'action_schema': f"{identity['action_schema']}{ARM_RESIDUAL_SUFFIX}"}
     if config.get('real_robot'):
         import hashlib
         schema = ('obs-unitree-deploy-v0' + (f'-h{config["history"]}' if config.get('history', 1) > 1 else '')
@@ -467,6 +551,7 @@ def g1_config_identity(identity, config):
                   + ('-hcmd' if config.get('height_command') else '')
                   + ('-ubslot' if config.get('upper_body_slot') else '')
                   + (ARM_BLIND_SUFFIX if config.get('arm_blind') else '')
+                  + (ARM_TARGETS_SUFFIX if config.get('arm_targets') else '')
                   + (f'-critic{CRITIC_EXTRAS}' if config.get('critic_extras') else ''))
         identity = {**identity, 'observation_schema': f"{identity['task_id']}:{schema}",
                     'model_revision': hashlib.sha256(f"{identity['model_revision']}:{REAL_ROBOT_REVISION}".encode()).hexdigest()}
@@ -475,6 +560,144 @@ def g1_config_identity(identity, config):
     if config.get('hand_collision'):  # likewise
         identity = {**identity, 'model_revision': f"{identity['model_revision']}{HAND_COLLISION_SUFFIX}"}
     return identity
+
+
+# g1_getup settings (iteration 33): the reward weights (G1_GETUP_REWARD_WEIGHTS), the assist force a fresh run starts
+# with (N; each world then loses 20 N whenever it stood up, tasks/g1_tensor_math.assist_update; a resumed run restores
+# its worlds' forces from the stage's training_state) and the domain randomization of every episode: the largest
+# policy-to-motor delay (s, as task_config action_delay), the largest multiplier of the motor model's joint friction (as
+# motor_friction) and the range of one sliding friction drawn for the whole robot and the floor (GETUP_BODY_FRICTION).
+# None of them changes the policy contract.
+# pd_bound (iteration 34, HoST's β): a hard bound on the PD error, [start, lowest] in shares c of each motor's peak
+# torque y1: every motor target but the locked wrists' stays within c·y1/kp of the joint angle the policy observed
+# (tasks/g1_tensor_math.pd_bound), so the active torque is at most c·y1. Each world starts at `start` and steps
+# PD_BOUND_STEP down to `lowest` at a reset after an episode up, by the assist's rule (pd_bound_update); stages keep
+# the worlds' c (training_state), evaluation and export use `lowest`. A different meaning of the actions: its own
+# action contract (action_schema …-pdbound<lowest>, g1_getup_config_identity), a stage moves there with
+# warm_start.carry_over. None (missing) is the original task, bit for bit.
+# stand_pose_std (iteration 36, rad): the width σ of the standing pose term w·[standing]·exp(−mean((q − home)²)/σ²)
+# (tasks/g1_tensor_math.getup_reward_components). At GETUP_POSE_STD (missing), the original 0.1, the term is dead after
+# getting up (critic, lab-critic/it36/post_pose.txt: the arms, waist and right shoulder yaw rest on their stops, Σ Δq²
+# ≈ 23 rad², e^−83; candidate 8 standing 0.18); at the working value 0.7 it gives 0.09-0.10 per standing step there and
+# 0.494 in candidate 8's pose. A reward setting only: the contract and branching are unchanged.
+# action_change_unbounded (iteration 37, bool): the action_change term −w·Σ(a − a_prev)² charges the action before
+# pd_bound (the box-clipped one with the locked wrists at 0) and that action of the step before, kept on its own (zero
+# at a reset, as the applied one), instead of the applied, bounded action. Why (critic, lab-critic/it37, noise_cost.py,
+# noise_episode.py): an action mean beyond pd_bound's clamp hides the policy's noise from the term, so PPO pushes the
+# mean out. After getting up the right shoulder yaw's mean stands at 8.42, its range edge at 5.95 and the clamp's at
+# 8.32 (σ 1.0); its noise costs 0.0082 per step there against 0.0189 at the range edge. The clamp hides 38 % of the
+# joint-steps (before getting up 0.279 per step against 0.574 unclamped), and at the hand-over to walking that arm
+# swings at up to 29 rad/s. The PD, the delay queue and the observed last action keep the applied action, PPO the
+# policy's. A reward setting only: the contract and branching are unchanged. False (missing) is the original term, bit
+# for bit; without a bound the two actions are the same.
+GETUP_POSE_STD = .1
+GETUP_POSE_STD_RANGE = (.02, 2.)
+G1_GETUP_DEFAULTS = dict(assist_force=200., action_delay=.02, motor_friction=1.25, body_friction=[.3, 1.],
+                         pd_bound=None, stand_pose_std=GETUP_POSE_STD, action_change_unbounded=False)
+GETUP_ASSIST_RANGE = (0., 500.)
+GETUP_BODY_FRICTION_RANGE = (.05, 2.)
+PD_BOUND_RANGE = (.1, 1.)
+G1_GETUP_LABELS = dict(head='Высота макушки: от 0,15 до 1,20 м', upright='Корпус вертикально (при тазе выше 0,4 м)',
+                       stand='Бонус за стойку: макушка выше 1,15 м, наклон меньше 15°, таз выше 0,70 м, обе стопы на полу',
+                       stand_pose='Поза стоя близко к исходной (только в стойке)',
+                       stand_still='Штраф за скорость таза в стойке', effort='Штраф за моменты моторов',
+                       joint_speed='Штраф за скорости суставов', action_change='Штраф за резкие действия',
+                       joint_limits='Штраф за ноги у упоров (последние 5% хода бедра, колена, голеностопа)',
+                       impact=('Штраф за удары о пол не стопами: сумма по телам квадратов превышения скорости '
+                               'сближения с полом над 1,5 м/с'),
+                       sole_impact=('Штраф за жёсткую постановку стоп (приземление после прыжка): сумма по стопам '
+                                    'квадратов превышения скорости сближения подошвы с полом над 0,5 м/с'),
+                       stance_width=('Штраф за широкую стойку: на сколько метров стопы шире 0,30 м поперёк курса таза '
+                                     '(при тазе выше 0,5 м и обеих подошвах на полу)'))
+G1_GETUP_PARAMETERS = (
+    dict(group=None, key='assist_force', default=G1_GETUP_DEFAULTS['assist_force'], min=GETUP_ASSIST_RANGE[0],
+         max=GETUP_ASSIST_RANGE[1],
+         label='Подтяжка за таз вверх в начале обучения, Н (у мира, который встал, убывает на 20 Н)'),
+    dict(group=None, key='action_delay', default=G1_GETUP_DEFAULTS['action_delay'], min=ACTION_DELAY_RANGE[0],
+         max=ACTION_DELAY_RANGE[1], label='Случайная задержка команды в обучении, с (0 — без задержки)'),
+    dict(group=None, key='motor_friction', default=G1_GETUP_DEFAULTS['motor_friction'], min=MOTOR_FRICTION_RANGE[0],
+         max=MOTOR_FRICTION_RANGE[1],
+         label=('Разброс трения моторов в обучении: верхняя граница множителя трения суставов (0 — без разброса; '
+                'на эпизод множитель от 0 до этого числа)')),
+    dict(group=None, key='body_friction', default=G1_GETUP_DEFAULTS['body_friction'],
+         min=GETUP_BODY_FRICTION_RANGE[0], max=GETUP_BODY_FRICTION_RANGE[1],
+         label='Трение тела и пола на эпизод: от и до, пара чисел'),
+    # Missing or null in a saved config means off (the motor target anywhere in the box); a different action contract.
+    dict(group=None, key='pd_bound', default=G1_GETUP_DEFAULTS['pd_bound'], min=PD_BOUND_RANGE[0],
+         max=PD_BOUND_RANGE[1],
+         label=('Мягкость: цель мотора не дальше доли c пика момента от угла сустава; пара [начало, минимум], у мира, '
+                'который встал, c убывает на 0,02 (пусто — без границы)')),
+    # Missing in a saved config means GETUP_POSE_STD (the original pose term).
+    dict(group=None, key='stand_pose_std', default=G1_GETUP_DEFAULTS['stand_pose_std'], min=GETUP_POSE_STD_RANGE[0],
+         max=GETUP_POSE_STD_RANGE[1],
+         label=('Поза стоя: ширина σ, рад, награды exp(−среднее по суставам (q − исходная)²/σ²) '
+                '(0,1 — прежняя; шире — тянет к исходной позе и издалека)')),
+    # Missing means off (the term charged the applied, bounded action).
+    dict(group=None, key='action_change_unbounded', default=G1_GETUP_DEFAULTS['action_change_unbounded'],
+         type='bool',
+         label=('Штраф за резкие действия — по действию до границы мягкости (а не по ограниченному: граница '
+                'не прячет шум)')),
+    *(dict(group='reward_weights', key=key, label=G1_GETUP_LABELS[key], default=G1_GETUP_REWARD_WEIGHTS[key], min=0,
+           max=100) for key in G1_GETUP_REWARD_WEIGHTS),
+)
+
+
+def g1_getup_config(values):
+    """g1_getup's task_config, every setting spelled out (G1_GETUP_DEFAULTS for the missing ones; pd_bound None:
+    off; stand_pose_std GETUP_POSE_STD: the original pose term; action_change_unbounded false: the original
+    action_change term)."""
+    if not isinstance(values, dict) or set(values) - {'reward_weights', *G1_GETUP_DEFAULTS}:
+        raise ValueError('Unknown G1 getup setting')
+    weights = values.get('reward_weights') or {}
+    if not isinstance(weights, dict) or set(weights) - set(G1_GETUP_REWARD_WEIGHTS):
+        raise ValueError('Unknown G1 getup reward weight')
+    if any(type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 100 for v in weights.values()):
+        raise ValueError('Reward weights must be finite and in [0,100]')
+    result = {**G1_GETUP_DEFAULTS, **{key: value for key, value in values.items() if key != 'reward_weights'}}
+    for key, (low, high) in (('assist_force', GETUP_ASSIST_RANGE), ('action_delay', ACTION_DELAY_RANGE),
+                             ('motor_friction', MOTOR_FRICTION_RANGE), ('stand_pose_std', GETUP_POSE_STD_RANGE)):
+        value = result[key]
+        if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
+            raise ValueError(f'G1 getup {key} must be in [{low:g},{high:g}]')
+    friction, (low, high) = result['body_friction'], GETUP_BODY_FRICTION_RANGE
+    if not isinstance(friction, (list, tuple)) or len(friction) != 2 or any(
+            type(v) not in (int, float) or not math.isfinite(v) or not low <= v <= high for v in friction) \
+            or friction[0] > friction[1]:
+        raise ValueError(f'G1 getup body_friction must be two numbers (from, to) in [{low:g},{high:g}]')
+    bound, (low, high) = result['pd_bound'], PD_BOUND_RANGE
+    if bound is not None and (not isinstance(bound, (list, tuple)) or len(bound) != 2 or any(
+            type(v) not in (int, float) or not math.isfinite(v) or not low <= v <= high for v in bound)
+            or bound[0] < bound[1]):
+        raise ValueError(f'G1 getup pd_bound must be null or two numbers (start, lowest) in [{low:g},{high:g}], '
+                         'start >= lowest')
+    if type(result['action_change_unbounded']) is not bool:
+        raise ValueError('G1 getup action_change_unbounded must be true or false')
+    return {'reward_weights': {**G1_GETUP_REWARD_WEIGHTS, **{k: float(v) for k, v in weights.items()}},
+            'assist_force': float(result['assist_force']), 'action_delay': float(result['action_delay']),
+            'motor_friction': float(result['motor_friction']), 'body_friction': [float(v) for v in friction],
+            'pd_bound': None if bound is None else [float(v) for v in bound],
+            'stand_pose_std': float(result['stand_pose_std']),
+            'action_change_unbounded': result['action_change_unbounded']}
+
+
+def g1_getup_config_identity(identity, config):
+    """g1_getup's contract refined by its normalized task_config (TaskSpec.config_identity): pd_bound bounds what the
+    actions do, its own action contract (…-pdbound<lowest>: g1_getup:action-v2-limit10-wristlock-knee0.061-pdbound0.6
+    for [1, 0.6]); without it the identity of g1_getup_identity, bit for bit."""
+    if config.get('pd_bound') is not None:
+        identity = {**identity, 'action_schema': f"{identity['action_schema']}-pdbound{config['pd_bound'][1]:g}"}
+    return identity
+
+
+def g1_getup_identity(identity):
+    """g1_getup's contract from its asset identity (task_id g1_getup): G1_GETUP_PROFILE's model revision, action schema
+    and observation schema as g1_config_identity gives them, the critic extras counted as GETUP_CRITIC_EXTRAS
+    (g1_getup:obs-unitree-deploy-v0-h5-phasestop-critic6, g1_getup:action-v2-limit10-wristlock-knee0.061)."""
+    identity = g1_config_identity(identity, g1_config(G1_GETUP_PROFILE))
+    schema = identity['observation_schema']
+    if not schema.endswith(f'-critic{CRITIC_EXTRAS}'):
+        raise ValueError('g1_getup expects the walking layout with critic extras')
+    return {**identity, 'observation_schema': schema[:-len(f'-critic{CRITIC_EXTRAS}')] + f'-critic{GETUP_CRITIC_EXTRAS}'}
 
 
 def empty_config(values):

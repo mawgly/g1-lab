@@ -1,0 +1,133 @@
+--- a/deploy/include/isaaclab/envs/mdp/observations/observations.h
++++ b/deploy/include/isaaclab/envs/mdp/observations/observations.h
+@@ -4,6 +4,10 @@
+ #pragma once
+ 
+ #include "isaaclab/envs/manager_based_rl_env.h"
++#include "unitree_joystick_dsl.hpp"  // sim2sim arms patch: arm_command
++#include <functional>
++#include <map>
++#include <spdlog/spdlog.h>
+ 
+ namespace isaaclab
+ {
+@@ -108,6 +112,119 @@ REGISTER_OBSERVATION(last_action)
+     return std::vector<float>(data.data(), data.data() + data.size());
+ };
+ 
++// sim2sim arms patch (humanoid_sim iteration 40, task_config arm_targets): the arm command of an arm_targets export, the
++// upper-body slot [flag, d of joints first_joint..] (size entries; d relative to default_joint_pos), as humanoid_sim's
++// G1VelocityEnv builds it in training; policy.onnx adds the newest d / scale to its arm outputs. Params from
++// humanoid_sim.export_g1.arm_command_params (deploy.yaml): poses (name, keys: a joystick DSL expression, held;
++// offsets: d), release (keys), speed (rad/s) and min_seconds. A pose's keys pressed (the expression's rising edge,
++// taken here at the policy's 50 Hz: .on_pressed lasts one FSM tick) move d from where it is to the pose's in the
++// quintic s^3 (10 - 15 s + 6 s^2) over T = max(min_seconds, max |delta d| / speed) in whole policy steps, flag 1 from
++// the press on; the release keys move d back to 0 the same way, then the term reads zeros (flag 0, free arms: the old
++// behaviour). Every Velocity entry (env->reset(): episode_length 0) starts with free arms, and a key held then counts
++// only once let go. Each change is a warn line with its policy step: scripts/sim2sim/analyze.py replays the term.
++struct ArmCommand
++{
++    std::vector<std::string> names;  // the poses', then "release"
++    std::vector<std::function<bool(const unitree::common::UnitreeJoystick&)>> keys;
++    std::vector<std::vector<float>> offsets;  // the poses' d
++    std::vector<bool> held;  // each expression at the last policy step
++    std::vector<float> start, end, shown;
++    float speed = 1.5f, min_seconds = 1.0f;
++    int clock = 0, move = 1;
++    bool active = false, releasing = false;
++};
++
++inline ArmCommand & arm_command_of(ManagerBasedRLEnv* env, YAML::Node & params)
++{
++    static std::map<ManagerBasedRLEnv*, ArmCommand> commands;  // one per policy (RLBase state)
++    auto found = commands.find(env);
++    if (found != commands.end()) {
++        return found->second;
++    }
++    ArmCommand & arm = commands[env];
++    const size_t size = params["size"].as<int>(18);
++    auto compile = [](const std::string & expression) {
++        return unitree::common::dsl::Compile(*unitree::common::dsl::Parser(expression).Parse());
++    };
++    for (const auto & pose : params["poses"]) {
++        arm.names.push_back(pose["name"].as<std::string>());
++        arm.keys.push_back(compile(pose["keys"].as<std::string>()));
++        arm.offsets.push_back(pose["offsets"].as<std::vector<float>>());
++        if (arm.offsets.back().size() + 1 != size) {
++            throw std::runtime_error("arm_command: pose " + arm.names.back() + " has " +
++                                     std::to_string(arm.offsets.back().size()) + " offsets for " +
++                                     std::to_string(size) + " entries (sim2sim arms patch)");
++        }
++    }
++    arm.names.push_back("release");
++    arm.keys.push_back(compile(params["release"].as<std::string>()));
++    arm.held.assign(arm.keys.size(), false);
++    arm.speed = params["speed"].as<float>(1.5f);
++    arm.min_seconds = params["min_seconds"].as<float>(1.0f);
++    arm.start.assign(size - 1, 0.0f);
++    arm.end = arm.start;
++    arm.shown = arm.start;
++    return arm;
++}
++
++REGISTER_OBSERVATION(arm_command)
++{
++    auto & arm = arm_command_of(env, params);
++    std::vector<float> obs(arm.shown.size() + 1, 0.0f);
++    const auto & joystick = *env->robot->data.joystick;
++    std::vector<bool> pressed(arm.keys.size());
++    for (size_t k = 0; k < arm.keys.size(); ++k) {
++        pressed[k] = arm.keys[k](joystick);
++    }
++    if (env->episode_length == 0) {  // a new entry: free arms; keys held now count once let go
++        arm.active = arm.releasing = false;
++        arm.held = pressed;
++        std::fill(arm.shown.begin(), arm.shown.end(), 0.0f);
++        return obs;
++    }
++    int chosen = -1;  // the first expression just pressed, in deploy.yaml's order (the release last, only when active)
++    for (size_t k = 0; k < arm.keys.size(); ++k) {
++        if (pressed[k] && !arm.held[k] && chosen < 0 && (k + 1 < arm.keys.size() || arm.active)) {
++            chosen = static_cast<int>(k);
++        }
++        arm.held[k] = pressed[k];
++    }
++    if (chosen >= 0) {
++        const bool release = chosen + 1 == static_cast<int>(arm.keys.size());
++        arm.start = arm.active ? arm.shown : std::vector<float>(arm.shown.size(), 0.0f);
++        arm.end = release ? std::vector<float>(arm.shown.size(), 0.0f) : arm.offsets[chosen];
++        float delta = 0.0f;
++        for (size_t i = 0; i < arm.end.size(); ++i) {
++            delta = std::max(delta, std::fabs(arm.end[i] - arm.start[i]));
++        }
++        arm.move = static_cast<int>(std::max(1L, std::lround(std::max(arm.min_seconds, delta / arm.speed) /
++                                                             env->step_dt)));
++        arm.clock = 0;
++        arm.active = true;
++        arm.releasing = release;
++        spdlog::warn("arm_command: {} at policy step {}, {} steps (sim2sim arms patch)", arm.names[chosen],
++                     env->episode_length, arm.move);
++    }
++    if (!arm.active) {
++        return obs;
++    }
++    const float s = std::min(1.0f, static_cast<float>(arm.clock) / static_cast<float>(arm.move));
++    const float q = s * s * s * (10.0f - 15.0f * s + 6.0f * s * s);
++    for (size_t i = 0; i < arm.shown.size(); ++i) {
++        arm.shown[i] = arm.start[i] + q * (arm.end[i] - arm.start[i]);
++    }
++    if (arm.releasing && arm.clock >= arm.move) {  // back home: free arms from this step on
++        arm.active = arm.releasing = false;
++        std::fill(arm.shown.begin(), arm.shown.end(), 0.0f);
++        spdlog::warn("arm_command: free at policy step {} (sim2sim arms patch)", env->episode_length);
++        return obs;
++    }
++    arm.clock = std::min(arm.clock + 1, arm.move);
++    obs[0] = 1.0f;
++    std::copy(arm.shown.begin(), arm.shown.end(), obs.begin() + 1);
++    return obs;
++}
++
+ REGISTER_OBSERVATION(velocity_commands)
+ {
+     std::vector<float> obs(3);

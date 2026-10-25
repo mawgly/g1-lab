@@ -57,16 +57,25 @@ def make_learner(config, stage=None):
             model.set_random_seed(config['seed'])
         else:
             policy, policy_kwargs = 'MlpPolicy', {'net_arch': [256, 256], 'log_std_init': -1}
-            if task_config.get('critic_extras'):  # asymmetric actor-critic: the actor sees only robot inputs
+            # Asymmetric actor-critic when the task's observation ends with critic-only inputs (G1 critic_extras,
+            # g1_getup's six): the actor sees only the robot's own, the first actor_inputs.
+            actor_inputs = getattr(base.envs[0].unwrapped, 'actor_inputs', None)
+            if actor_inputs is not None and actor_inputs < base.observation_space.shape[0]:
                 from .policies import CriticExtrasPolicy
                 policy = CriticExtrasPolicy
-                policy_kwargs['actor_inputs'] = base.envs[0].unwrapped.actor_inputs
+                policy_kwargs['actor_inputs'] = actor_inputs
             model = PPO(policy, export, **parameters, device='cuda', seed=config['seed'], policy_kwargs=policy_kwargs)
         # PPO.load restores optimizer state, including its previous learning rate.
         for group in model.policy.optimizer.param_groups:
             group['lr'] = config['learning_rate']
         env = backends().make(robot_id, task_id, 'full_gpu', n_envs=config['envs'], seed=config['seed'], **task_config)
-        # Columns with set statistics (G1 height_command / upper_body_slot terms) stay frozen.
+        # What the stage kept of the training beyond the weights (save_stage's training_state: g1_getup's assist
+        # forces), back into the worlds before their first reset (TensorPPO's), as train.restore_vec_training_state.
+        saved = (read_json(stage / 'metadata.json', {}) or {}).get('training_state') if stage else None
+        if saved and hasattr(env, 'restore_training_state'):
+            env.restore_training_state(saved)
+        # Columns with set statistics (G1 height_command / upper_body_slot terms, g1_getup's command and phase) stay
+        # frozen.
         norm = TensorNormalize(env.observation_space.shape, config['envs'], env.device, config['gamma'],
                                fixed=getattr(base.envs[0].unwrapped, 'fixed_normalization', None))
         if stage:
@@ -102,8 +111,10 @@ def train_full_gpu(args, config):
             session = run / f'session_{time.time_ns()}'
             logger = configure(str(session), ['stdout', 'csv'])
             model.set_logger(logger)
+            # training_state: the worlds' state each stage keeps (g1_getup: assist forces); None for other tasks.
             callback = StageCallback(run, config['every'], model.num_timesteps + config['steps'], duration,
-                                     getattr(args, 'parent_stop', None))
+                                     getattr(args, 'parent_stop', None),
+                                     training_state=getattr(learner.env, 'training_state', None))
             callback.init_callback(model)
             callback.initial_steps = model.num_timesteps
             parameters = {key: config.get(key) for key in ('learning_rate', 'n_steps', 'batch_size', 'n_epochs',

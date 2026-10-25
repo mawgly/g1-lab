@@ -5,6 +5,7 @@ import copy
 
 import pytest
 
+from test_chatter import chatter_runs
 from test_g1_lock_wrists import lab_probe
 
 
@@ -17,9 +18,10 @@ def stage(tmp_path):
     return tmp_path / 'exp-0000000000000000' / 'stage_000000000100'
 
 
-def select_jobs(ss, tmp_path, height=False):
-    """Step 2's jobs of a made-up stage, without (the rule before) or with task_config height_command."""
-    return ss.select_jobs(stage(tmp_path), height)
+def select_jobs(ss, tmp_path, height=False, arms=False):
+    """Step 2's jobs of a made-up stage, without (the rule before) or with task_config height_command; arms: with
+    task_config arm_targets (chatter's carry scenario)."""
+    return ss.select_jobs(stage(tmp_path), height, arms)
 
 
 def made_up(ss, jobs, rate=.01, stop=.05, turn=4.5):
@@ -55,7 +57,7 @@ def test_runs_of_the_two_steps(ss, tmp_path):
     Step 3: the critic's fresh check, timing windows step 2 does not use, no pushes."""
     select = select_jobs(ss, tmp_path)
     every = [job for kind, job in select if kind == 'run']
-    assert len(select) == 55 + 23 + 4 + 2 * (480 + 144) + 20 and len(every) == 82
+    assert len(select) == 55 + 23 + 4 + 2 * (480 + 144) + 20 + 18 and len(every) == 82
     checked = [case for case in every if case['plan'] == 'side1']
     runs = [case for case in every if case['plan'] != 'side1']
     assert len(runs) == 78 and [(c['physics'], c['stale'], c['delay'], c['start'], c.get('phase', 0)) for c in checked] \
@@ -340,11 +342,12 @@ def test_step_2_runs_the_height_checks_for_a_stage_with_the_height_command(ss, t
     Without the flag select_jobs reads it from the stage (stand_turn.has_height)."""
     without, with_height = select_jobs(ss, tmp_path), select_jobs(ss, tmp_path, height=True)
     added = [job for kind, job in with_height if kind == 'run' and job['plan'] in ss.st.HEIGHT_PLANS]
-    assert len(with_height) == len(without) + 3 == 55 + 23 + 4 + 3 + 2 * (480 + 144) + 20
+    assert len(with_height) == len(without) + 3 == 55 + 23 + 4 + 3 + 2 * (480 + 144) + 20 + 18
     assert [(kind, job) for kind, job in with_height if job not in added] == without
     assert added == [dict(ss.st.case(plan=plan), stage=str(stage(tmp_path))) for plan in (
         'crouch_walk05', 'crouch_stand74', 'crouch_stand64')]
     assert {ss.variant_of(job) for job in added} == {'um_6ms'}
+    monkeypatch.setattr(ss.ch, 'has_arm_targets', lambda path: False)
     for height, jobs in ((True, with_height), (False, without)):
         monkeypatch.setattr(ss.st, 'has_height', lambda path: height)
         assert ss.select_jobs(stage(tmp_path)) == jobs
@@ -528,3 +531,41 @@ def test_step_3_judges_drift_at_the_bridge_delay_only(ss, tmp_path):
         segment(where(runs, delay=4, plan='side')[0], 'stop')['disp'] = .35
 
     assert verdict(stop_8ms)['reasons'] == ['сдвиг после стопа за шагом вбок 0.35 м >= 0.3 (задержка 8 мс)']
+
+
+def test_step_2_runs_and_judges_torque_chattering(ss, tmp_path, capsys):
+    """Iteration 42 (chatter.py): step 2 runs the stage's six chatter scenarios x 3 seeds at its training delay (with
+    arm_targets the carry pose too), main the reference's at that delay; a chatter summary that is not ok fails the
+    stage, its reasons before the height checks'; its line is printed above the verdict. Without a chatter summary
+    nothing is judged (the rule before)."""
+    jobs = [job for kind, job in select_jobs(ss, tmp_path) if kind == 'chatter']
+    assert [(job['scenario'], job['seed']) for job in jobs] == [(name, 74000 + k) for name in ss.ch.BASE
+                                                               for k in range(3)]
+    assert {(job['stage'], job['delay'], job['seconds']) for job in jobs} == {(str(stage(tmp_path)), None, 10.)}
+    carry = [job for kind, job in select_jobs(ss, tmp_path, arms=True) if kind == 'chatter']
+    assert carry[:18] == jobs and [job['scenario'] for job in carry[18:]] == ['carry'] * 3
+    assert ss.cost('chatter', jobs[0]) == 10. / ss.st.TICK + 700
+    reference = ss.ch.reference_jobs(.02)
+    assert [(job['scenario'], job['seed']) for job in reference] == [(j['scenario'], j['seed']) for j in jobs]
+    assert {(job['stage'], job['delay']) for job in reference} == {('unitree_v0', .02)}
+
+    runs, pushes = made_up(ss, select_jobs(ss, tmp_path, height=True))
+    where(runs, plan='crouch_walk05')[0]['fell_at'] = 12.3
+    theirs = chatter_runs(reference)
+    ok = ss.ch.summarize(chatter_runs(jobs, torque=5.), theirs)
+    shaky = ss.ch.summarize(chatter_runs(jobs, torque=7.), theirs)
+    assert ss.select_summary(runs, pushes, True)['reasons'] == ss.select_summary(runs, pushes, True, ok)['reasons'] == [
+        'падение на ходу 0.5 м/с на 0.70 (Unitree +6 мс (связка): crouch_walk05 12.3 с)']
+    got = ss.select_summary(runs, pushes, True, shaky)
+    assert got['chatter'] is shaky and got['reasons'] == [
+        'дрожание моментов: torque_hf_rms_nm 7 (joint03) > 1.5 x v0 4 (joint03)',
+        'падение на ходу 0.5 м/с на 0.70 (Unitree +6 мс (связка): crouch_walk05 12.3 с)']
+    ss.report(dict(label='этап', select=got, runs=dict(select=1371), seconds=dict(select=1.)))
+    out = capsys.readouterr().out
+    assert ('  дрожание моментов (CPU, шум датчиков; судится: худший сустав: torque_hf_rms_nm и action_hf_rms_rad <= '
+            '1.5 x Unitree v0, без падений): ВЧ момента, Н·м 7.00 (v0 4.00 x1.75), ВЧ цели, рад 0.1000 (v0 0.1000 '
+            'x1.00)') in out and 'худший сустав joint03 — не ok\n' in out
+    assert ('итог: не проходит: дрожание моментов: torque_hf_rms_nm 7 (joint03) > 1.5 x v0 4 (joint03) | команда '
+            'высоты: падение') in out
+    runs, pushes = made_up(ss, select_jobs(ss, tmp_path))
+    assert ss.select_summary(runs, pushes, chatter=ok)['passes']

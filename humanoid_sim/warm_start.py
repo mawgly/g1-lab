@@ -10,10 +10,12 @@ so the result is a new root, not a branch (validate_resume rejects the old stage
 
 carry_over moves a stage to a contract with the same layout; insert_terms to one with observation terms added
 (task_config height_command, upper_body_slot): new columns with zero weights and fixed normalization; blind_arms to
-task_config arm_blind: the arm columns' normalization fixed at the stage's own mean normalized arm inputs.
+task_config arm_blind: the arm columns' normalization fixed at the stage's own mean normalized arm inputs; unblind_arms
+from arm_blind to task_config arm_targets: the blind constant folded into the first layers' biases, the arm columns'
+weights zero, their normalization fixed and wide.
 
     python -m humanoid_sim.warm_start <source stage dir> <new experiment dir> [--same-layout | --insert-terms |
-        --blind-arms]
+        --blind-arms | --unblind-arms]
 """
 import argparse
 import pickle
@@ -28,7 +30,7 @@ from .checkpoint_schema import checkpoint_identity, validate_resume
 from .core import load_stage, read_json, save_stage, stage_task_config, write_json
 from .tasks import g1_tensor_math as task
 from .tasks.catalog import make_task
-from .tasks.config import ARM_BLIND_SUFFIX, FOOT_COLLISION_SUFFIX, HAND_COLLISION_SUFFIX
+from .tasks.config import ARM_BLIND_SUFFIX, ARM_TARGETS_SUFFIX, FOOT_COLLISION_SUFFIX, HAND_COLLISION_SUFFIX
 from .tasks.identity import task_identity
 
 PARAMETERS = ('learning_rate', 'n_steps', 'batch_size', 'n_epochs', 'gamma', 'gae_lambda', 'ent_coef', 'clip_range',
@@ -140,11 +142,16 @@ def carried_fields(saved, wanted):
 
 def check_same_arm_blind(saved, wanted):
     """Raises if `saved` and `wanted` differ in task_config arm_blind (ARM_BLIND_SUFFIX in the observation schema):
-    carried as they are, the arm columns would keep the old statistics, so only blind_arms switches it on."""
+    carried as they are, the arm columns would keep the old statistics, so only blind_arms switches it on; or in
+    task_config arm_targets (ARM_TARGETS_SUFFIX), which only unblind_arms switches on."""
     blind = [ARM_BLIND_SUFFIX in str(identity.get('observation_schema')) for identity in (saved, wanted)]
     if blind[0] != blind[1]:
         raise ValueError('Слепые руки (arm_blind) включает только blind_arms (scripts/lab/blind_branch.py): ей нужна '
                          'нормировка рук этапа-родителя')
+    targets = [ARM_TARGETS_SUFFIX in str(identity.get('observation_schema')) for identity in (saved, wanted)]
+    if targets[0] != targets[1]:  # the arm columns' fixed normalization would replace the stage's own
+        raise ValueError('Руки по целям (arm_targets) включает только unblind_arms (scripts/lab/arm_branch.py): ей '
+                         'нужна своя нормировка столбцов рук')
 
 
 def check_carry_over(saved, wanted):
@@ -164,12 +171,13 @@ def carry_over(source, run_dir):
     """The source stage as the first stage of run_dir when the new contract keeps the same input and output layout
     and changes only what some inputs or outputs mean (task_config phase_stop: the gait phase reads 0 while standing;
     lock_wrists: four action entries no longer reach the motors; knee_floor: knee actions below the floor no longer
-    move the knee target) or adds contacts to the physics (foot_collision: the feet collide with each other;
-    hand_collision: the hands with the floor and the body). Only the
-    observation and action schemas and a model revision suffix of CARRIED_MODEL_SUFFIXES may differ; robot, the rest
-    of the model revision, normalization and control step must match, the observation must keep its size and
+    move the knee target; g1_getup's pd_bound: actions are bounded around the observed angles) or adds contacts to the
+    physics (foot_collision: the feet collide with each other; hand_collision: the hands with the floor and the body).
+    Only the observation and action schemas and a model revision suffix of CARRIED_MODEL_SUFFIXES may differ; robot,
+    the rest of the model revision, normalization and control step must match, the observation must keep its size and
     the action space (size and box) must be the same. Weights, normalization and optimizer state are kept as they
-    are; the stage gets the new run's identity."""
+    are, and so is the source's training_state (g1_getup: the worlds' assist forces, which a fresh start would put
+    back at the task's initial force); the stage gets the new run's identity."""
     source, run_dir = Path(source), Path(run_dir)
     config = read_json(run_dir / 'run_config.json')
     robot_id, task_id, task_config = config['robot_id'], config['task_id'], config['task_config']
@@ -187,7 +195,7 @@ def carry_over(source, run_dir):
         norm.observation_space = base.observation_space
         norm.set_venv(base)
         model = PPO.load(source / 'policy.zip', env=norm, device='cpu')
-        stage = save_stage(run_dir, model, norm)
+        stage = save_stage(run_dir, model, norm, saved.get('training_state'))
         write_json(stage / 'warm_start.json', {'source': str(source.resolve()), 'steps': model.num_timesteps,
                                                'method': 'same layout, new contract: weights carried over unchanged',
                                                'from_schema': saved.get('observation_schema'),
@@ -419,6 +427,119 @@ def blind_arms(source, run_dir, reference=None):
         base.close()
 
 
+def check_unblind_arms(saved, robot_id, task_id, task_config):
+    """Raises unless a stage of identity `saved` may move by unblind_arms to the task `task_config`: arm_targets on
+    there (so arm_blind off) and every field validate_resume compares the same as that task's with arm_blind instead
+    of arm_targets (so the stage is blind and nothing else changes)."""
+    if task_config.get('arm_targets') is not True or task_config.get('arm_blind'):
+        raise ValueError('Для рук по целям в задаче новой ветки нужен arm_targets: true (и arm_blind: false)')
+    validate_resume(saved, task_identity(robot_id, task_id, {**task_config, 'arm_targets': False, 'arm_blind': True}))
+
+
+def first_layers(policy, inputs):
+    """Names of a policy's first-layer weights (those whose last axis takes the `inputs` observation entries: the actor's
+    and the critic's), in state-dict order."""
+    return [name for name, value in policy.state_dict().items() if name.endswith('.weight') and value.dim() == 2
+            and value.shape[1] == inputs]
+
+
+def unblind_arms(source, run_dir):
+    """The source stage (arm_blind) as the first stage of run_dir under task_config arm_targets (the run's task: the
+    source's with arm_targets instead of arm_blind, check_unblind_arms). The source's network saw its normalized arm
+    inputs as z + x/ARM_BLIND_SCALE (z = −mean/ARM_BLIND_SCALE of the arm columns, its statistics); each first layer
+    (the actor's and the critic's) takes b + W[:, arms]·z as its bias and 0 as W[:, arms], so the new network acts as the
+    source with x/ARM_BLIND_SCALE dropped (~1e-5) and does not depend on its arms yet. The arm columns' normalization is
+    the task's fixed one (mean 0, task.ARM_TARGET_VARIANCE; TensorNormalize and train.FrozenMoments keep it frozen), the
+    other columns' statistics and the count as they are. Adam: those weights start with no momentum and the mean second
+    moment of the row's other columns. Steps and updates are kept; the upper-body slot's weights stay as the source has
+    them (0 after insert_terms). warm_start.json records z and the columns."""
+    source, run_dir = Path(source), Path(run_dir)
+    config = read_json(run_dir / 'run_config.json')
+    robot_id, task_id, task_config = config['robot_id'], config['task_id'], config['task_config']
+    saved = read_json(source / 'metadata.json')
+    check_unblind_arms(saved, robot_id, task_id, task_config)
+    base = DummyVecEnv([lambda: make_task(task_id, robot_id, task_config)])
+    try:
+        raw = base.envs[0].unwrapped
+        columns = np.asarray(raw.arm_columns)
+        with open(source / 'normalize.pkl', 'rb') as file:
+            norm = pickle.load(file)
+        if norm.obs_rms.mean.shape != base.observation_space.shape:
+            raise ValueError('Раскладка входа изменилась: руки по целям её не меняют')
+        if getattr(norm, 'action_space', None) != base.action_space:
+            raise ValueError('Раскладка или предел действия изменились: веса так не переносятся')
+        if not np.all(norm.obs_rms.var[columns] == task.ARM_BLIND_SCALE ** 2):
+            raise ValueError('У источника руки не слепые: нет постоянных входов рук')
+        z = -np.asarray(norm.obs_rms.mean[columns], dtype=np.float64) / task.ARM_BLIND_SCALE
+        positions, mean, variance = raw.fixed_normalization
+        arm = np.isin(positions, columns)  # the arm columns' fixed values; the extra terms' stay the source's
+        rms_mean, rms_var = norm.obs_rms.mean.astype(np.float64), norm.obs_rms.var.astype(np.float64)
+        rms_mean[positions[arm]], rms_var[positions[arm]] = mean[arm], variance[arm]
+        norm.obs_rms.mean, norm.obs_rms.var = rms_mean, rms_var
+        norm.observation_space = base.observation_space
+        norm.set_venv(base)
+        model = PPO.load(source / 'policy.zip', env=norm, device='cpu')
+        names = [name for name, _ in model.policy.named_parameters()]
+        state = model.policy.state_dict()
+        layers = first_layers(model.policy, base.observation_space.shape[0])
+        if len(layers) != 2:
+            raise ValueError('Ожидались два первых слоя (актёр и критик)')
+        arms = torch.as_tensor(columns)
+        reference = torch.as_tensor(z)
+        for name in layers:
+            weight, bias = state[name], state[name[:-len('weight')] + 'bias']
+            bias.copy_((bias.double() + weight[:, arms].double() @ reference).to(bias.dtype))
+            weight[:, arms] = 0.
+        model.policy.load_state_dict(state)
+        optimizer = model.policy.optimizer.state_dict()
+        others = torch.as_tensor(np.setdiff1d(np.arange(base.observation_space.shape[0]), columns))
+        for number, moments in optimizer['state'].items():
+            if names[number] in layers:
+                moments['exp_avg'][:, arms] = 0.
+                moments['exp_avg_sq'][:, arms] = moments['exp_avg_sq'][:, others].mean(dim=1, keepdim=True)
+        model.policy.optimizer.load_state_dict(optimizer)
+        stage = save_stage(run_dir, model, norm)
+        write_json(stage / 'warm_start.json', {
+            'source': str(source.resolve()), 'steps': model.num_timesteps,
+            'method': 'arm_targets: the blind constant z folded into the first layers\' biases (b + W[:, arms] z), '
+                      'W[:, arms] = 0; arm columns normalized as fixed_normalization (mean 0, variances '
+                      f'{task.ARM_TARGET_VARIANCE}); Adam m 0, v the row mean of the other columns',
+            'from_schema': saved.get('observation_schema'),
+            'to_schema': task_identity(robot_id, task_id, task_config)['observation_schema'],
+            'from_action_schema': saved.get('action_schema'),
+            'to_action_schema': task_identity(robot_id, task_id, task_config)['action_schema'],
+            'layers': layers, 'columns': columns.tolist(), 'z': z.tolist()})
+        return stage
+    finally:
+        base.close()
+
+
+def start_difference(source, stage, runs=BLIND_RUNS, seed=BLIND_SEED):
+    """Largest |action difference| between two stages' deterministic policies on the observations of `source`'s own
+    runs (blind_reference's runs: standing, 0.5 and 1 m/s, reset seed `seed`, heading hold off, phase 0), each stage
+    normalizing them with its own statistics: unblind_arms' start against its source. Resets with a command keep
+    arm_targets' flag 0, so both tasks give these observations bit for bit."""
+    (first, first_norm), (second, second_norm) = load_stage(source), load_stage(stage)
+    env = make_task(*(checkpoint_identity(read_json(Path(source) / 'metadata.json'))[key]
+                      for key in ('task_id', 'robot_id')), {**stage_task_config(source), 'heading_hold': False})
+    worst = 0.
+    try:
+        for command, _, last in runs:
+            obs, _ = env.reset(seed=seed, options={'command': list(command), 'phase_steps': 0})
+            for _ in range(last):
+                action = first.predict(first_norm.normalize_obs(obs), deterministic=True)[0]
+                other = second.predict(second_norm.normalize_obs(obs), deterministic=True)[0]
+                worst = max(worst, float(np.abs(action - other).max()))
+                obs, _, terminated, _, _ = env.step(action)
+                if terminated:
+                    break
+    finally:
+        env.close()
+        first_norm.close()
+        second_norm.close()
+    return worst
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('source', type=Path)
@@ -429,9 +550,11 @@ def main(argv=None):
                         help='new observation terms (height_command, upper_body_slot): insert_terms')
     layout.add_argument('--blind-arms', action='store_true',
                         help='arm_blind: the arm columns normalized to the stage\'s own constants (blind_arms)')
+    layout.add_argument('--unblind-arms', action='store_true',
+                        help='arm_blind -> arm_targets: the blind constant into the biases (unblind_arms)')
     args = parser.parse_args(argv)
     method = (carry_over if args.same_layout else insert_terms if args.insert_terms else blind_arms if args.blind_arms
-              else widen_history)
+              else unblind_arms if args.unblind_arms else widen_history)
     print(method(args.source, args.run_dir))
 
 

@@ -57,7 +57,16 @@ own:
      after every stage a table across the stages with the height command (step 2 without them and with them). Stages
      without the height command keep the rule before, the 30 s turn printed only: the rule that chose candidate 8 is
      unchanged.
-     1350 runs a stage, 1353 with the height command (1327 before iteration 27, 699 before iteration 24);
+     Since iteration 42 (the user's request of 25.10, chatter.py) step 2 also judges torque chattering, on the CPU in
+     our physics: the deterministic policy with the CUDA task's sensor noise and encoder bias and its training delay,
+     six scenarios (standing, 0.5 / 1 m/s, stop-start, side steps ±0.3 m/s) x 3 seeds, 10 s each, and the same runs of
+     Unitree v0 (18 more, once per training delay among the stages). Judged ('дрожание моментов'): the worst driven
+     joint's motor torque above 10 Hz (RMS, N m) and PD target above 5 Hz (RMS, rad) at most 1.5 x v0's, and no fall;
+     printed in a line of its own with the shares, the torque RMS over the motor peak and the mean |Δa|. Candidate 8
+     (exp-28691193718e4d0e @ 7221510144) 4.57 against 4.08 N m, 0.135 against 0.112 rad: passes. An arm_targets stage
+     also runs the carry pose with 1 kg per hand (3 runs, chatter.py prints it, not judged). ~2.3 s of a process a run.
+     1368 runs a stage, 1371 with the height command (1350 / 1353 before iteration 42, 1327 before iteration 27, 699
+     before iteration 24), and the reference's 18;
   3. --fresh: one check of the winner on cases step 2 did not see, in the bridge copy (Unitree +6 ms): other timing
      windows (side step at offsets 5-61, walks at 13; step 2 has 0 and 0-53), delay 4 and 8 ms, stop-start, a right
      step alone (19 runs, no pushes since iteration 20: step 2 covers them). Same limits; the 4 / 8 ms runs and
@@ -105,6 +114,7 @@ SIM = str(Path(__file__).resolve().parents[3])
 sys.path.insert(0, SIM)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bridge_kick as kick  # noqa: E402
+import chatter as ch  # noqa: E402
 import foot_overlap as feet  # noqa: E402
 import stand_turn as st  # noqa: E402
 import um_probe as um  # noqa: E402
@@ -206,13 +216,16 @@ def height_jobs(stage):
     return [st.case(plan=plan, stage=str(stage), **fields) for plan in (CROUCH_WALK,) + CROUCH_STANDS]
 
 
-def select_jobs(stage, height=None):
+def select_jobs(stage, height=None, arms=None):
     """Step 2 of one stage: [(kind, job)], kind 'run' (stand_turn.run case: the 7 physics variants, the bridge group's
     side steps again at ±0.5 m/s, then the side check and, with the height command, the height checks), 'push'
-    (bridge_kick.run job) or 'feet' (foot_overlap.run job, printed only). height: whether the stage has task_config
-    height_command (None: read it from the stage)."""
+    (bridge_kick.run job), 'feet' (foot_overlap.run job, printed only) or 'chatter' (chatter.run job; the reference's
+    runs are main's, once per delay). height: whether the stage has task_config height_command; arms: whether it has
+    arm_targets (chatter's carry scenario); None: read it from the stage."""
     if height is None:
         height = st.has_height(stage)
+    if arms is None:
+        arms = ch.has_arm_targets(str(stage))
     bridge = st.grid(str(stage), 'bridge')
     jobs = [('run', case) for case in bridge]
     jobs += [('run', dict(case, plan=SIDE05)) for case in bridge if case['plan'] == 'side']
@@ -222,7 +235,8 @@ def select_jobs(stage, height=None):
     jobs += [('run', case) for case in side_check_jobs(stage)]
     if height:
         jobs += [('run', case) for case in height_jobs(stage)]
-    return jobs + push_jobs(stage) + [('feet', job) for job in feet.jobs(stage)]
+    return (jobs + push_jobs(stage) + [('feet', job) for job in feet.jobs(stage)]
+            + [('chatter', job) for job in ch.jobs(str(stage), arms)])
 
 
 def fresh_jobs(stage):
@@ -488,12 +502,14 @@ def height_check(runs, turn):
     return dict(walk=walk, stands=stands, reasons=reasons)
 
 
-def select_summary(runs, push_results, height=False):
+def select_summary(runs, push_results, height=False, chatter=None):
     """Step 2 from the stage's stand_turn.run results (7 variants, the ±1 m/s side check, the height checks) and
     bridge_kick.run results (standing and walking, with the foot capsules and without). 'pushes' are the judged ones
     (since iteration 24: Unitree +6 ms with the capsules), 'pushes_sim2sim' the ones without them (the rule's numbers
     before). height: the stage has task_config height_command, so the height checks judge it ('height': their numbers
-    and their own reasons, which also end 'reasons'); without it 'height' is None and the rule is the one before."""
+    and their own reasons, which also end 'reasons'); without it 'height' is None and the rule is the one before.
+    chatter: chatter.summarize() of the stage's chatter runs against the reference's (iteration 42), judged by its
+    summary's ok, its reasons before the height checks' ('дрожание моментов: ...'); None: not run, nothing judged."""
     checked = [r for r in runs if r['case']['plan'] == SIDE_CHECK]
     crouched = [r for r in runs if r['case']['plan'] in st.HEIGHT_PLANS]
     runs = [r for r in runs if r['case']['plan'] != SIDE_CHECK and r['case']['plan'] not in st.HEIGHT_PLANS]
@@ -506,10 +522,12 @@ def select_summary(runs, push_results, height=False):
     crouch = height_check(crouched, turn) if height else None
     reasons = (judge(rows, labels, [name for name, _, _ in VARIANTS], DRIFT + DRIFT05, STOPS)
                + push_reasons(pushes['stand'], pushes['walk']) + side_reasons(side))
+    if chatter and not chatter['summary']['ok']:
+        reasons.append('дрожание моментов: ' + '; '.join(chatter['reasons']))
     if crouch:  # their own reasons, after the rest
         reasons += crouch['reasons']
     return dict(passes=not reasons, reasons=reasons, rows=rows, pushes=pushes, pushes_sim2sim=forecast, side1=side,
-                stand30=turn, height=crouch)
+                stand30=turn, height=crouch, chatter=chatter)
 
 
 def fresh_summary(runs):
@@ -650,6 +668,8 @@ def report(stage):
     print_pushes(stage['select'])
     if stage.get('feet'):
         print('  ' + feet.line(stage['feet']))
+    if stage['select'].get('chatter'):
+        print('  ' + ch.line(stage['select']['chatter']))
     verdict(stage['select'])
     if stage.get('fresh'):
         print_rows('шаг 3 — свежая проверка (Unitree +6 мс)', stage['fresh'], [(n, t) for n, t, _ in FRESH])
@@ -664,6 +684,8 @@ def cost(kind, job):
     """Rough run length in physics ticks, to start the long runs first."""
     if kind == 'feet':
         return feet.cost(job)
+    if kind == 'chatter':  # no FixStand, our reset
+        return job['seconds'] / st.TICK + 700
     if kind == 'push':
         plan, physics = st.PLANS['kstand' if job['plan'] == 'stand' else 'kwalk'], job['phys']
     else:
@@ -688,6 +710,8 @@ def work(item):
             um.Stepper = STEPPER
     elif kind == 'feet':  # sets and restores its own stepper and push plan
         result = feet.run(job)
+    elif kind == 'chatter':  # sets and restores its own recording of the motor torque
+        result = ch.run(job)
     else:
         result = st.run(job)
     return index, result, time.perf_counter() - t0
@@ -710,11 +734,15 @@ def main(argv=None):
     if not st.LOGS.is_dir():
         raise SystemExit(f'Нет логов связки (окна времени): {st.LOGS} — запущена ли WSL Ubuntu?')
     heights = [st.has_height(p) for p in paths]  # task_config height_command: the height checks of step 2
-    items = []  # (stage index, step, kind, job)
+    arms = [ch.has_arm_targets(str(p)) for p in paths]  # task_config arm_targets: chatter's carry scenario
+    delays = [ch.stage_delay(str(p)) for p in paths]  # the training delay, which chatter's reference runs at
+    items = []  # (stage index, step, kind, job); the chatter reference's: (None, 'reference', 'chatter', job)
     for i, p in enumerate(paths):
-        items += [(i, 'select', kind, job) for kind, job in select_jobs(p, heights[i])]
+        items += [(i, 'select', kind, job) for kind, job in select_jobs(p, heights[i], arms[i])]
         if args.fresh:
             items += [(i, 'fresh', kind, job) for kind, job in fresh_jobs(p)]
+    for delay in sorted(set(delays)):
+        items += [(None, 'reference', 'chatter', job) for job in ch.reference_jobs(delay)]
     order = sorted(range(len(items)), key=lambda k: -cost(items[k][2], items[k][3]))
     for key in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):  # one core per worker
         os.environ.setdefault(key, '1')
@@ -729,6 +757,8 @@ def main(argv=None):
             if done % 100 == 0 or done == len(items):
                 print('  %d из %d, %.0f с' % (done, len(items), time.time() - t0), flush=True)
     wall = time.time() - t0
+    reference = {delay: [results[k] for k, item in enumerate(items) if item[1] == 'reference'
+                         and item[3]['delay'] == delay] for delay in set(delays)}
     stages = []
     for i, p in enumerate(paths):
         def of(step, kind):
@@ -737,8 +767,9 @@ def main(argv=None):
         def spent(step):
             return sum(seconds[k] for k, item in enumerate(items) if item[:2] == (i, step))
 
+        chatter = ch.summarize(of('select', 'chatter'), reference[delays[i]])
         stage = dict(label=label(p), path=str(p), height_command=heights[i],
-                     select=select_summary(of('select', 'run'), of('select', 'push'), heights[i]),
+                     select=select_summary(of('select', 'run'), of('select', 'push'), heights[i], chatter),
                      feet=feet.summary(of('select', 'feet')),
                      runs={'select': sum(item[:2] == (i, 'select') for item in items)},
                      seconds={'select': spent('select')})
@@ -747,7 +778,7 @@ def main(argv=None):
             stage['runs']['fresh'] = sum(item[:2] == (i, 'fresh') for item in items)
             stage['seconds']['fresh'] = spent('fresh')
         report(stage)
-        stage['results'] = {step: {kind: of(step, kind) for kind in ('run', 'push', 'feet')}
+        stage['results'] = {step: {kind: of(step, kind) for kind in ('run', 'push', 'feet', 'chatter')}
                             for step in (('select', 'fresh') if args.fresh else ('select',))}
         stages.append(stage)
     print_height_table(stages)
@@ -766,9 +797,12 @@ def main(argv=None):
                                 drift=CROUCH_DRIFT_LIMIT, stand_turn=STAND_TURN_LIMIT),
                     pushes=dict(dirs=DIRS8, stand_mags=STAND_MAGS, stand_offsets=STAND_OFFSETS, walk_mags=WALK_MAGS,
                                 walk_offsets=WALK_OFFSETS, judged_mag=JUDGED_MAG, stand_falls=STAND_FALLS,
-                                cell_falls=CELL_FALLS, half=HALF, walk_falls=WALK_FALLS))
-        args.out.write_text(json.dumps(dict(rule=rule, workers=args.workers, seconds=wall, stages=stages), indent=1),
-                            encoding='utf-8')
+                                cell_falls=CELL_FALLS, half=HALF, walk_falls=WALK_FALLS),
+                    chatter=dict(reference=ch.REFERENCE, scenarios=ch.BASE, seeds=ch.SEEDS, seconds=ch.SECONDS,
+                                 gated=ch.GATED, factor=ch.GATE_FACTOR, gate=ch.gate_text()))
+        args.out.write_text(json.dumps(dict(rule=rule, workers=args.workers, seconds=wall, stages=stages,
+                                            chatter_reference={'%g' % d: runs for d, runs in reference.items()}),
+                                       indent=1), encoding='utf-8')
 
 
 if __name__ == '__main__':

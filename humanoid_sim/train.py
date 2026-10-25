@@ -63,9 +63,38 @@ def freeze_normalization(env, task_id, robot_id, task_config):
         env.obs_rms = FrozenMoments(env.obs_rms, fixed)
 
 
+def keeps_training_state(env):
+    """Whether a vectorized environment's tasks keep a training state (G1GetupEnv.keeps_training_state). has_attr
+    first: a subprocess environment dies on get_attr of a missing attribute; the batched Humanoid one answers None."""
+    return env.has_attr('keeps_training_state') and all(env.get_attr('keeps_training_state'))
+
+
+def vec_training_state(env):
+    """The environments' training state (G1GetupEnv.training_state: g1_getup's assist forces), merged world by world
+    into {key: [one value per environment]}; None for tasks without one."""
+    if not keeps_training_state(env):
+        return None
+    merged = {}
+    for state in env.env_method('training_state'):
+        for key, values in state.items():
+            merged.setdefault(key, []).extend(values)
+    return merged
+
+
+def restore_vec_training_state(env, stage):
+    """A resumed run's environments take the training state the stage saved (save_stage's training_state), spread
+    over however many there are now (each environment's restore_training_state); nothing without one."""
+    state = read_json(Path(stage) / 'metadata.json', {}).get('training_state')
+    if state and keeps_training_state(env):
+        for index in range(env.num_envs):
+            env.env_method('restore_training_state', state, index, env.num_envs, indices=[index])
+
+
 class StageCallback(BaseCallback):
-    def __init__(self, run_dir, every, target, duration_seconds=None, parent_stop=None):
+    def __init__(self, run_dir, every, target, duration_seconds=None, parent_stop=None, training_state=None):
         super().__init__()
+        # training_state(): the environments' state each stage keeps (save_stage), None: nothing (most tasks).
+        self.training_state = training_state
         self.run_dir = Path(run_dir)
         self.every = every
         self.target = target
@@ -97,7 +126,8 @@ class StageCallback(BaseCallback):
 
     def snapshot(self):
         self.status('saving')
-        stage = save_stage(self.run_dir, self.model, self.training_env)
+        stage = save_stage(self.run_dir, self.model, self.training_env,
+                           None if self.training_state is None else self.training_state())
         if not (stage / 'evaluation.json').exists():
             metrics = evaluate_stage(stage)
             write_json(stage / 'evaluation.json', metrics)
@@ -177,16 +207,23 @@ def train(args):
                 env.norm_reward = True
                 model = PPO.load(latest / 'policy.zip', env=env, device='cpu', **parameters)
                 model.set_random_seed(args.seed)
+                restore_vec_training_state(env, latest)  # g1_getup: the worlds' assist forces
             else:
                 env = VecNormalize(base, norm_obs=True, norm_reward=True, clip_obs=10, gamma=parameters['gamma'])
-                model = PPO('MlpPolicy', env, **parameters,
-                            policy_kwargs={'net_arch': [256, 256], 'log_std_init': -1},
-                            device='cpu', seed=args.seed, verbose=1)
+                policy, policy_kwargs = 'MlpPolicy', {'net_arch': [256, 256], 'log_std_init': -1}
+                if base.has_attr('asymmetric_critic') and all(base.get_attr('asymmetric_critic')):
+                    # g1_getup: the critic's extras (head height, assist force) are not the robot's to see
+                    from .policies import CriticExtrasPolicy
+                    policy = CriticExtrasPolicy
+                    policy_kwargs['actor_inputs'] = base.get_attr('actor_inputs')[0]
+                model = PPO(policy, env, **parameters, policy_kwargs=policy_kwargs, device='cpu', seed=args.seed,
+                            verbose=1)
             if not (config and config['backend'] == 'gpu'):  # the gpu backend's env is the Humanoid's Warp one
                 freeze_normalization(env, task_id, robot_id, (config or {}).get('task_config') or {})
             session_dir = run / f'session_{time.time_ns()}'
             model.set_logger(configure(str(session_dir), ['stdout', 'csv']))
-            callback = StageCallback(run, args.every, model.num_timesteps + args.steps, duration, getattr(args, 'parent_stop', None))
+            callback = StageCallback(run, args.every, model.num_timesteps + args.steps, duration,
+                                     getattr(args, 'parent_stop', None), training_state=lambda: vec_training_state(env))
             write_json(session_dir / 'config.json', {'environment': 'Humanoid-v5' if robot_id == 'humanoid' else task_id,
                        'robot_id': robot_id, 'task_id': task_id, 'algorithm': 'PPO',
                        'task_config': (config or {}).get('task_config') or {},

@@ -24,6 +24,8 @@ class TaskSpec:
     # (identity, normalized task_config) -> identity, for settings that change the policy contract
     # (G1: the action limit). None: the contract does not depend on the task config.
     config_identity: Callable[[dict, dict], dict] | None = None
+    # Reset options of core.evaluate_stage's episodes (g1_getup: no assist force); None: a plain reset.
+    evaluation_options: dict | None = None
 
 
 class TaskRegistry:

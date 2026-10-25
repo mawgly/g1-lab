@@ -460,6 +460,62 @@ def wrist_mode(lc, windows, fixstand):
     return out
 
 
+ARM_EVENT = re.compile(r'arm_command: (\S+) at policy step (\d+), (\d+) steps')
+ARM_FREE = re.compile(r'arm_command: free at policy step (\d+)')
+
+
+class ArmReplay:
+    """The arm_command term of patches/g1_ctrl-arms.patch (an arm_targets export) by policy step of the first Velocity
+    entry, from g1_ctrl.log's warn lines (a pose's or the release's step and its quintic's length): flag 1 from the
+    press, d from where it was to the pose's offsets in the quintic, after the release back to 0 and then zeros, as
+    the patch computes it, in float32."""
+
+    def __init__(self, params, log):
+        self.offsets = {pose['name']: np.float32(pose['offsets']) for pose in params['poses']}
+        self.size = int(params['size'])
+        self.events, last = {}, -1
+        text = log.read_text(encoding='utf-8', errors='replace') if log.exists() else ''
+        for line in text.splitlines():
+            m = ARM_EVENT.search(line)
+            if m is None:
+                continue
+            step = int(m.group(2))
+            if step < last:  # a later Velocity entry starts counting again: the replay covers the first one
+                break
+            self.events[step], last = (m.group(1), int(m.group(3))), step
+        self.slots = [np.zeros(self.size, np.float32)]  # by policy step; 0: the reset frame
+        self.state = dict(active=False, releasing=False, clock=0, move=1, start=None, end=None,
+                          shown=np.zeros(self.size - 1, np.float32))
+
+    def _advance(self, step):
+        s = self.state
+        event = self.events.get(step)
+        if event is not None:
+            name, move = event
+            s['start'] = s['shown'].copy() if s['active'] else np.zeros(self.size - 1, np.float32)
+            s['end'] = np.zeros(self.size - 1, np.float32) if name == 'release' else self.offsets[name]
+            s.update(move=move, clock=0, active=True, releasing=name == 'release')
+        obs = np.zeros(self.size, np.float32)
+        if not s['active']:
+            return obs
+        x = np.float32(min(1.0, np.float32(s['clock']) / np.float32(s['move'])))
+        q = x * x * x * (np.float32(10) - np.float32(15) * x + np.float32(6) * x * x)
+        s['shown'] = (s['start'] + q * (s['end'] - s['start'])).astype(np.float32)
+        if s['releasing'] and s['clock'] >= s['move']:
+            s.update(active=False, releasing=False)
+            s['shown'] = np.zeros(self.size - 1, np.float32)
+            return obs
+        s['clock'] = min(s['clock'] + 1, s['move'])
+        obs[0], obs[1:] = 1, s['shown']
+        return obs
+
+    def slot(self, step):
+        """The term at policy step `step` (0: the reset frame)."""
+        while len(self.slots) <= step:
+            self.slots.append(self._advance(len(self.slots)))
+        return self.slots[step]
+
+
 class Replay:
     """g1_ctrl's observation (deploy.yaml) and action processing around policy.onnx, in float32."""
 
@@ -489,6 +545,8 @@ class Replay:
         # upper-body slot's zeros.
         self.height = terms['height_command'].get('params') if 'height_command' in terms else None
         self.slot = len(terms['upper_body_command']['scale']) if 'upper_body_command' in terms else None
+        # patches/g1_ctrl-arms.patch's arm_command (an arm_targets export), from the poses g1_ctrl.log names
+        self.arm = ArmReplay(terms['arm_command']['params'], run / 'g1_ctrl.log') if 'arm_command' in terms else None
 
     def command(self, lx, ly, rx):
         """velocity_commands: (ly, -lx, -rx) clamped to the deploy ranges."""
@@ -505,7 +563,8 @@ class Replay:
         height = min(max(height, p['lowest']), p['nominal'])
         return np.float32([height - p['nominal']])
 
-    def frame(self, row, command, phase, last_action, ry=0.):
+    def frame(self, row, command, phase, last_action, ry=0., step=0):
+        """step: the policy step from the Velocity entry (0: the reset frame), for arm_command."""
         quat = np.float32(row[LS_QUAT])
         gait = np.float32([math.sin(float(np.float32(phase * 2)) * math.pi),
                            math.cos(float(np.float32(phase * 2)) * math.pi)])
@@ -520,6 +579,8 @@ class Replay:
             terms['height_command'] = self.height_term(command, ry)
         if self.slot is not None:
             terms['upper_body_command'] = np.zeros(self.slot, np.float32)
+        if self.arm is not None:
+            terms['arm_command'] = self.arm.slot(step)
         return terms
 
     def act(self, frames):
@@ -600,8 +661,8 @@ def latency(run, ls, lc, deploy, t_enter, t_leave, segments):
         lx, ly, rx = remote[r]
         return replay.command(float(lx), float(ly), float(rx))
 
-    def frame_at(r, phase, last):  # g1_ctrl's frame from lowstate r (the height command from its right stick)
-        return replay.frame(ls[r], cmd(r), phase, last, 0. if ry is None else float(ry[r, 0]))
+    def frame_at(r, phase, last, step):  # g1_ctrl's frame from lowstate r (the height from its right stick) at step
+        return replay.frame(ls[r], cmd(r), phase, last, 0. if ry is None else float(ry[r, 0]), step)
 
     # Step number on the policy thread's fixed grid (sleep_until += step_dt; a late step is followed by
     # quick catch-up steps, a step that ends within one FSM tick of the next is never published). The
@@ -638,8 +699,8 @@ def latency(run, ls, lc, deploy, t_enter, t_leave, segments):
                 for b in cands[-4:]:
                     if b < a:
                         continue
-                    f0 = frame_at(a, phases[0], raws[0])
-                    hist = [f0] * 4 + [frame_at(b, phases[1], raws[0])]
+                    f0 = frame_at(a, phases[0], raws[0], 0)
+                    hist = [f0] * 4 + [frame_at(b, phases[1], raws[0], 1)]
                     raw, pred = replay.act(hist)
                     err = float(np.max(np.abs(pred - target)))
                     if best is None or err < best[0]:
@@ -653,7 +714,7 @@ def latency(run, ls, lc, deploy, t_enter, t_leave, segments):
                 history = [nearest(frames, max(n, 0)) for n in range(j - 4, j)]
                 last = nearest(raws, j - 1)
                 for r in cands:
-                    f = frame_at(r, phases[j], last)
+                    f = frame_at(r, phases[j], last, j)
                     raw, pred = replay.act(history + [f])
                     err = float(np.max(np.abs(pred - target)))
                     if best is None or err < best[0] - 1e-9:

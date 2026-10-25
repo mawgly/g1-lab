@@ -127,7 +127,7 @@ def test_the_terms_lying_and_standing():
     assert {key: float(value[0]) for key, value in terms.items()} == {key: 0. for key in terms}
     assert {key: float(value[1]) for key, value in terms.items()} == dict(
         head=1., upright=.5, stand=1., stand_pose=.5, stand_still=0., effort=0., joint_speed=0., action_change=0.,
-        joint_limits=0.)
+        joint_limits=0., impact=0., sole_impact=0., stance_width=0.)
     # Head term linear between 0.15 and 1.20; upright only with the pelvis above 0.4.
     inputs.update(head=np.array([.15 + 1.05 / 2, 2.]), height=np.array([.39, .41]),
                   torso_rotation=np.stack([np.eye(3), np.eye(3)]))

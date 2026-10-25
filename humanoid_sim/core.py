@@ -76,7 +76,9 @@ def list_stages(run_dir):
                   if p.is_dir() and all((p / name).is_file() for name in ('policy.zip', 'normalize.pkl', 'metadata.json')))
 
 
-def save_stage(run_dir, model, normalizer):
+def save_stage(run_dir, model, normalizer, training_state=None):
+    """training_state: what the environments keep of the training beyond the weights and the normalization, per world
+    ({key: [one value per world]}, g1_getup's assist forces), stored in metadata.json for a resumed run; None: none."""
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     destination = run_dir / f'stage_{model.num_timesteps:012d}'
@@ -93,7 +95,8 @@ def save_stage(run_dir, model, normalizer):
     write_json(pending / 'metadata.json', {**identity, 'steps': model.num_timesteps,
                                           'task_config': config.get('task_config') or {},
                                           'environment': 'Humanoid-v5' if identity['robot_id'] == 'humanoid' else identity['task_id'],
-                                          'created_at': time.time(), 'algorithm': 'PPO'})
+                                          'created_at': time.time(), 'algorithm': 'PPO',
+                                          **({} if training_state is None else {'training_state': training_state})})
     pending.rename(destination)
     return destination
 
@@ -164,7 +167,10 @@ def evaluate_stage(stage, episodes=5, max_steps=1000, seed_start=60000):
     try:
         env = make_task(identity['task_id'], identity['robot_id'], options)
         for index in range(episodes):
-            obs, initial = env.reset(seed=seed_start + index)
+            if task.evaluation_options is None:
+                obs, initial = env.reset(seed=seed_start + index)
+            else:  # g1_getup: without the assist force
+                obs, initial = env.reset(seed=seed_start + index, options=dict(task.evaluation_options))
             total = 0.0
             for step in range(max_steps):
                 action = policy.predict(norm.normalize_obs(obs), deterministic=True)[0]

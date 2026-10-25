@@ -7,9 +7,10 @@
 # Each step logs to $ROOT/logs/setup-<step>.log. Docs: docs/sim2sim.md.
 # Unitree's code is changed only by the patches in patches/ (simulate: pelvis pushes, g1ctrl: the target held
 # until the first policy step, targets published clipped, Passive after a fall, the height command's observation
-# terms), applied once by their steps before the build.
+# terms, the getting-up state GetUp, the arm command's observation term), applied once by their steps before the build.
 # SIM2SIM_HEIGHT=off builds g1_ctrl without the height patch (reversed if the tree has it), as robot package 8 was
 # built: wsl.exe -d Ubuntu -u root -e env SIM2SIM_HEIGHT=off bash /mnt/c/.../setup.sh g1ctrl
+# SIM2SIM_JOBS=4 builds with 4 compiler processes instead of 16 (while training or tests use the CPU).
 set -u
 export LC_ALL=C  # compiler messages in English, plain quotes in the logs
 
@@ -17,7 +18,7 @@ ROOT=/home/mawgly/unitree
 OWNER=mawgly
 LOGS=$ROOT/logs
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JOBS=16
+JOBS=${SIM2SIM_JOBS:-16}
 
 # Pinned revisions (the ones checked on 22.10.2026).
 SDK2_SHA=d1abf001220d3e5f59e00a0c4aaa595e00089a4a
@@ -27,6 +28,10 @@ MUJOCO_VERSION=3.3.6  # unitree_mujoco/readme.md: ln -s ~/.mujoco/mujoco-3.3.6 m
 
 # Virtual gamepad: a FIFO the simulator reads as /dev/input/js0 (see gamepad.py).
 JOYSTICK_FIFO=/tmp/sim2sim_js0
+
+# g1_ctrl's patches in the order step_g1ctrl puts them on (height only without SIM2SIM_HEIGHT=off).
+G1CTRL_PATCHES=(g1_ctrl-policy-start.patch g1_ctrl-clip-race.patch g1_ctrl-fall-passive.patch g1_ctrl-height.patch
+  g1_ctrl-getup.patch g1_ctrl-arms.patch)
 
 step_apt() {
   export DEBIAN_FRONTEND=noninteractive
@@ -115,6 +120,13 @@ step_simulate() {
 }
 
 step_g1ctrl() {
+  # The patches stack in this order, a later one right next to an earlier one's lines (getup's members follow
+  # policy-start's, its checks replace fall-passive's), so once a later one is on, an earlier one no longer passes its
+  # own check: every one the tree has (this or the kept version) comes off from the last, then they go on in order.
+  local k
+  for (( k = ${#G1CTRL_PATCHES[@]} - 1; k >= 0; k-- )); do
+    remove_patch unitree_rl_mjlab "${G1CTRL_PATCHES[k]}" || return 1
+  done
   # The first Velocity lowcmd keeps the FixStand target until the policy's first step, instead of the
   # action term's zeros (docs/sim2sim.md «Гонка при входе в Velocity»).
   apply_patch unitree_rl_mjlab g1_ctrl-policy-start.patch || return 1
@@ -126,12 +138,20 @@ step_g1ctrl() {
   apply_patch unitree_rl_mjlab g1_ctrl-fall-passive.patch || return 1
   # The observation terms of a height export (task_config height_command / upper_body_slot, iteration 28):
   # height_command from the right stick down, upper_body_command zeros; other exports never name them.
-  # SIM2SIM_HEIGHT=off: the three patches only, as robot package 8.
-  if [ "${SIM2SIM_HEIGHT:-on}" = off ]; then
-    remove_patch unitree_rl_mjlab g1_ctrl-height.patch || return 1
-  else
+  # SIM2SIM_HEIGHT=off: without it (taken off above), as robot package 8.
+  if [ "${SIM2SIM_HEIGHT:-on}" != off ]; then
     apply_patch unitree_rl_mjlab g1_ctrl-height.patch || return 1
   fi
+  # Getting up after a fall (iteration 33): the tilt check of each RLBase state from config.yaml's fall_tilt
+  # (Velocity 1.0 rad, as the fall-passive patch had it for all), a state's timeout and max_joint_speed (one number or
+  # one per SDK motor), and the GetUp state (Passive LT + down -> GetUp, then RT + A -> Velocity, LT + up -> FixStand
+  # or LT + B -> Passive; 10 s, iteration 35's per-joint speeds), off in config.yaml's enabled list until a getting-up
+  # policy is in its policy_dir (run.sh --getup turns it on for a run). On top of the fall-passive patch.
+  apply_patch unitree_rl_mjlab g1_ctrl-getup.patch || return 1
+  # Arms on targets (iteration 40, task_config arm_targets): the observation term arm_command of such an export, its
+  # named poses from deploy.yaml chosen by LB + a button, a quintic to them (flag 1), LB + B home and then zeros (flag
+  # 0); other exports never name it. Its own lines in observations.h, so it goes on with or without the height patch.
+  apply_patch unitree_rl_mjlab g1_ctrl-arms.patch || return 1
   cd "$ROOT/unitree_rl_mjlab/deploy/robots/g1" && mkdir -p build && cd build &&
   cmake .. && make -j$JOBS && ls -la g1_ctrl
 }

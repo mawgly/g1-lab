@@ -8,7 +8,7 @@ unitree_mujoco/simulate/src/physics_joystick.h. The elastic band is driven with 
 the simulator window (keys from unitree_mujoco's user_key_cb: 9 on/off, 8 lower, 7 raise), see Keys.
 
 Usage: python gamepad.py <fifo> <window id> <events.csv> [--scenario <name>] [...]
-Every scenario starts the same way (Passive -> FixStand on the band -> Velocity -> band off -> stand).
+Every scenario but getup starts the same way (Passive -> FixStand on the band -> Velocity -> band off -> stand).
   walk       forward --walk m/s for --walk-seconds, then stand (the first sim2sim check)
   turn       turn stick +-yaw standing (5 s each) and while walking --walk m/s (10 s each)
   side       sideways +-side m/s, 10 s each
@@ -24,18 +24,35 @@ Every scenario starts the same way (Passive -> FixStand on the band -> Velocity 
   crouch     the height command (iteration 28; g1_ctrl with patches/g1_ctrl-height.patch and a height export):
              standing 0.70 m 8 s, 0.64 m 8 s, back to 0.78 m 4 s, then walking 0.5 and 1 m/s at 0.70 m, 10 s each,
              and stand at 0.78 m (the right stick down: c = 0.78 + 0.14 min(0, ry), at least 0.70 while walking)
+  arms       arm poses (iteration 40; g1_ctrl with patches/g1_ctrl-arms.patch and an arm_targets export, whose
+             deploy.yaml run.sh hands over as --deploy): standing, each named pose (--poses, default all in deploy.yaml
+             order) by its keys (LB + a button) held --pose-seconds, the release keys and PAUSE after each; then with
+             --arm-walk <pose> that pose, walking --walk m/s for --walk-seconds, stop, release, --after-seconds
+  getup      getting up (iteration 33; g1_ctrl with patches/g1_ctrl-getup.patch and run.sh --getup <export>): the
+             robot falls (--fall), lies --lie-seconds, then LT + down: GetUp for --getup-seconds (after its 10 s
+             timeout it goes back to Passive by itself); with --getup-velocity then RT + A: Velocity (the walking
+             export), standing --stand-seconds, walking --walk m/s for --walk-seconds and standing --after-seconds
+             (iteration 35); with --getup-fixstand LT + up: FixStand instead.
+             --fall band (the old way): in Passive the band off, the limp robot drops ~0.5 m; --fall-push
+             <direction>[:dv] pushes the pelvis right after the band is off (24.10: it landed on its back whatever
+             the push, once on its front without one). --fall stand: the usual start, then standing in Velocity
+             --fall-push pushes it (needed here; 24.10: forward from 1.5 m/s on its front, back or sideways as
+             pushed) and --fall-passive s after the push LT + B (Passive, limp), unless Velocity's tilt check went
+             there first; without --fall-passive only a fall gets it to Passive
 --ry holds the right stick's vertical axis (-1..1, down negative: a crouch) through the commanded part of the other
 scenarios (walk: while walking); segments with the stick down are named <name>@<height> (the standing height; the
 patch keeps a walk at 0.70 m or above).
 Every action is logged with time.monotonic_ns() (CLOCK_MONOTONIC, same clock as sim2sim_probe); a
 `seg` event (value name:vx:vy:wz) starts each commanded segment, which lasts until the next event; a
-`push` event (value direction:dv) follows each push key.
+`push` event (value direction:dv) follows each push key; an `arm` event (value the pose's name or release) each arm
+pose's keys.
 """
 
 import argparse
 import os
 import struct
 import time
+from pathlib import Path
 
 JS_EVENT_BUTTON = 0x01
 JS_EVENT_AXIS = 0x02
@@ -46,13 +63,23 @@ AXIS_SCALE = 32768  # physics_joystick.h: value / (1 << (joystick_bits - 1)), jo
 # LT 2 (pressed when > 0), rx 3, ry 4, RT 5, DX 6, DY 7 (up when < 0).
 BUTTON_A = 0
 BUTTON_B = 1
+BUTTON_X = 2
+BUTTON_Y = 3
+BUTTON_LB = 4
+BUTTON_RB = 5
 AXIS_LX = 0
 AXIS_LY = 1
 AXIS_LT = 2
 AXIS_RX = 3
 AXIS_RY = 4
 AXIS_RT = 5
+AXIS_DX = 6
 AXIS_DY = 7
+# The arm poses' keys in deploy.yaml (unitree_joystick_dsl names, g1_ctrl-arms.patch): '<modifier> + <key>', a
+# shoulder button held and a face button or d-pad direction pressed. D-pad: (axis, sign) of physics_joystick.h.
+ARM_MODIFIERS = {'LB': BUTTON_LB, 'RB': BUTTON_RB}
+ARM_BUTTONS = {'A': BUTTON_A, 'B': BUTTON_B, 'X': BUTTON_X, 'Y': BUTTON_Y}
+ARM_DPAD = {'up': (AXIS_DY, -1), 'down': (AXIS_DY, 1), 'left': (AXIS_DX, -1), 'right': (AXIS_DX, 1)}
 # Height command of g1_ctrl-height.patch: c = NOMINAL_HEIGHT + CROUCH_DEPTH * min(0, ry), the export's height_params
 # for crouch_min 0.64 (deploy.yaml observations.height_command.params).
 NOMINAL_HEIGHT = 0.78
@@ -83,6 +110,35 @@ def push_modifiers(dv):
 def push_dvs(text):
     """--push-dv: comma-separated dv of each series, m/s."""
     return [float(value) for value in text.split(',')]
+
+
+def fall_push(text):
+    """--fall-push: (direction, dv m/s) of '<direction>[:dv]', dv PUSH_BASE without it."""
+    direction, _, dv = text.partition(':')
+    return direction, float(dv) if dv else PUSH_BASE
+
+
+def arm_keys(expression):
+    """(modifier button, (kind, number, sign)) of an arm pose's keys '<LB|RB> + <A|B|X|Y|up|down|left|right>':
+    kind 'button' (sign 1) or 'axis' (a d-pad direction)."""
+    parts = [part.strip() for part in expression.split('+')]
+    if len(parts) != 2 or parts[0] not in ARM_MODIFIERS or (parts[1] not in ARM_BUTTONS and parts[1] not in ARM_DPAD):
+        raise ValueError(f'arm keys: <LB|RB> + <A|B|X|Y|up|down|left|right>, not {expression!r}')
+    if parts[1] in ARM_BUTTONS:
+        return ARM_MODIFIERS[parts[0]], ('button', ARM_BUTTONS[parts[1]], 1)
+    axis, sign = ARM_DPAD[parts[1]]
+    return ARM_MODIFIERS[parts[0]], ('axis', axis, sign)
+
+
+def arm_poses(path):
+    """(poses [(name, keys)], release keys) of a deploy.yaml's arm_command term (export_g1.arm_command_params)."""
+    import yaml
+    deploy = yaml.safe_load(Path(path).read_text(encoding='utf-8'))
+    term = (deploy.get('observations') or {}).get('arm_command')
+    if term is None:
+        raise SystemExit(f'gamepad.py: {path} has no arm_command term (not an arm_targets export)')
+    params = term['params']
+    return [(pose['name'], pose['keys']) for pose in params['poses']], params['release']
 
 
 def stick_for(height):
@@ -243,8 +299,8 @@ class Scenario:
         # FixStand -> Velocity: RT + A.on_pressed
         self.combo(AXIS_RT, lambda on: self.pad.button(BUTTON_A, on), name)
 
-    def run(self, args):
-        self.mark('start', args.scenario)
+    def start_on_floor(self, args):
+        """Every scenario's start: Passive -> FixStand on the band, lowered onto the floor, Velocity, band off."""
         time.sleep(args.passive_seconds)
         self.fixstand('fixstand')
         time.sleep(3.0)  # FixStand moves to the home pose over 2 s (ts: [0, 2])
@@ -260,6 +316,64 @@ class Scenario:
         time.sleep(args.band_seconds)
         self.key('9')  # band off
         self.mark('band_off')
+
+    def arm(self, expression, name):
+        """An arm pose's keys (arm_keys): the shoulder button held, the face button or d-pad direction pressed 0.3 s
+        (g1_ctrl-arms.patch takes the rising edge at the policy's 50 Hz), both let go; an `arm` event."""
+        modifier, (kind, number, sign) = arm_keys(expression)
+        press = ((lambda on: self.pad.button(number, on)) if kind == 'button'
+                 else (lambda on: self.pad.axis(number, sign * AXIS_MAX if on else 0)))
+        self.pad.button(modifier, True)
+        time.sleep(0.1)
+        press(True)
+        self.mark('arm', name)
+        time.sleep(0.3)
+        press(False)
+        time.sleep(0.1)
+        self.pad.button(modifier, False)
+
+    def arms(self, args):
+        """Standing, each pose of --poses by its keys, held --pose-seconds, then the release and PAUSE; with
+        --arm-walk that pose, walking --walk m/s for --walk-seconds, stop, release, --after-seconds."""
+        poses, release = arm_poses(args.deploy)
+        keys = dict(poses)
+        wanted = args.poses.split(',') if args.poses else [name for name, _ in poses]
+        unknown = [name for name in wanted + ([args.arm_walk] if args.arm_walk else []) if name not in keys]
+        if unknown:
+            raise SystemExit(f'gamepad.py: poses {unknown} not in {args.deploy} ({", ".join(keys)})')
+        self.mark('seg', 'stand:0:0:0')
+        time.sleep(args.stand_seconds)
+        for name in wanted:
+            self.arm(keys[name], name)
+            self.mark('seg', f'arm_{name}:0:0:0')
+            time.sleep(args.pose_seconds)
+            self.arm(release, 'release')
+            self.mark('seg', 'arm_release:0:0:0')
+            time.sleep(PAUSE)
+        if args.arm_walk:
+            self.arm(keys[args.arm_walk], args.arm_walk)
+            self.mark('seg', f'arm_{args.arm_walk}:0:0:0')
+            time.sleep(PAUSE)
+            self.stick(args.walk, 0., 0.)
+            self.mark('seg', f'walk_{args.arm_walk}:{args.walk:g}:0:0')
+            time.sleep(args.walk_seconds)
+            self.stick(0., 0., 0.)
+            self.mark('seg', f'stop_{args.arm_walk}:0:0:0')
+            time.sleep(PAUSE)
+            self.arm(release, 'release')
+            self.mark('seg', 'arm_release:0:0:0')
+            time.sleep(args.after_seconds)
+
+    def run(self, args):
+        self.mark('start', args.scenario)
+        if args.scenario == 'getup':
+            self.getup(args)
+            return
+        self.start_on_floor(args)
+        if args.scenario == 'arms':
+            self.arms(args)
+            self.mark('end')
+            return
         if args.scenario == 'walk':
             time.sleep(args.stand_seconds)
             # Forward: ly = -axis/32768, velocity_commands obs[0] = ly (no scaling, clamped to lin_vel_x)
@@ -304,6 +418,48 @@ class Scenario:
             self.mark('seg', 'stop:0:0:0')
             time.sleep(args.after_seconds)
 
+    def push(self, direction, dv):
+        """One push key of the unitree_mujoco push patch (PUSH_KEYS, modifiers for dv) and its `push` event."""
+        self.key(dict(PUSH_KEYS)[direction], push_modifiers(dv))
+        self.mark('push', f'{direction}:{dv:g}')
+
+    def getup(self, args):
+        """The robot falls (--fall) and lies (Passive: kp 0, kd 3); then Passive -> GetUp with LT + down.on_pressed
+        (patches/g1_ctrl-getup.patch's config.yaml) and GetUp for --getup-seconds; with --getup-velocity then GetUp ->
+        Velocity (RT + A.on_pressed, as from FixStand) and the stand / walk / stop segments, with --getup-fixstand
+        GetUp -> FixStand (LT + up.on_pressed)."""
+        if args.fall == 'stand':  # pushed over standing in Velocity
+            self.start_on_floor(args)
+            self.mark('seg', 'stand:0:0:0')
+            time.sleep(args.fall_stand_seconds)
+            self.push(*fall_push(args.fall_push))
+            if args.fall_passive is not None:
+                time.sleep(args.fall_passive)
+                # Velocity -> Passive (limp); nothing if its tilt check already went there (Passive has no LT + B)
+                self.combo(AXIS_LT, lambda on: self.pad.button(BUTTON_B, on), 'passive')
+        else:  # dropped from the band in Passive
+            time.sleep(args.passive_seconds)
+            self.key('9')  # band off: Passive lets the robot fall
+            self.mark('band_off')
+            if args.fall_push:
+                self.push(*fall_push(args.fall_push))
+        self.mark('lying')
+        time.sleep(args.lie_seconds)
+        self.combo(AXIS_LT, lambda on: self.pad.axis(AXIS_DY, AXIS_MAX if on else 0), 'getup')
+        time.sleep(args.getup_seconds)
+        if args.getup_velocity:
+            self.velocity('velocity_after_getup')
+            for name, vx, seconds in (('stand', 0., args.stand_seconds), ('walk', args.walk, args.walk_seconds),
+                                      ('stop', 0., args.after_seconds)):
+                self.stick(vx, 0., 0.)
+                self.mark('seg', f'{name}:{vx:g}:0:0')
+                time.sleep(seconds)
+            self.stick(0., 0., 0.)
+        elif args.getup_fixstand:
+            self.fixstand('fixstand')
+            time.sleep(3.0)
+        self.mark('end')
+
     def passive(self, args):
         """Velocity -> Passive (LT + B.on_pressed: kp 0, kd 3), then the way back: band on, FixStand, Velocity."""
         self.combo(AXIS_LT, lambda on: self.pad.button(BUTTON_B, on), 'passive')
@@ -328,7 +484,11 @@ def main():
     parser.add_argument('window')
     parser.add_argument('events')
     parser.add_argument('--scenario', choices=('walk', 'turn', 'side', 'sidestop', 'stopstart', 'passive', 'stand',
-                                               'push', 'crouch'), default='walk')
+                                               'push', 'crouch', 'getup', 'arms'), default='walk')
+    parser.add_argument('--deploy', help='arms: the export\'s deploy.yaml (its arm_command poses; run.sh gives it)')
+    parser.add_argument('--poses', help='arms: comma-separated pose names, in this order (default all)')
+    parser.add_argument('--pose-seconds', type=float, default=6.0, help='arms: seconds each pose is held')
+    parser.add_argument('--arm-walk', help='arms: then walk --walk m/s holding this pose')
     parser.add_argument('--ry', type=float, default=0.,
                         help='right stick vertical axis through the commanded segments, -1..1 (down negative: the '
                              'height command of g1_ctrl-height.patch, c = 0.78 + 0.14 min(0, ry))')
@@ -350,6 +510,22 @@ def main():
     parser.add_argument('--push-dv', help='push: comma-separated dv of each series instead of --push-strength, m/s '
                                           '(0.5-2.25 in steps of 0.25), e.g. 1.25,1.5')
     parser.add_argument('--push-pause', type=float, default=4.0, help='push: seconds after each push')
+    parser.add_argument('--lie-seconds', type=float, default=5.0, help='getup: seconds lying in Passive before GetUp')
+    parser.add_argument('--getup-seconds', type=float, default=12.0,
+                        help='getup: seconds after LT + down (before RT + A or LT + up)')
+    parser.add_argument('--getup-fixstand', action='store_true', help='getup: then LT + up, GetUp -> FixStand')
+    parser.add_argument('--getup-velocity', action='store_true',
+                        help='getup: then RT + A, GetUp -> Velocity: stand --stand-seconds, walk --walk m/s '
+                             '--walk-seconds, stand --after-seconds')
+    parser.add_argument('--fall', choices=('band', 'stand'), default='band',
+                        help='getup: dropped limp from the band in Passive, or pushed over standing in Velocity')
+    parser.add_argument('--fall-push', help='getup: <direction>[:dv] push (PUSH_KEYS directions, dv 0.5-2.25 m/s in '
+                                            'steps of 0.25, 0.5 without it); band: right after the band is off, '
+                                            'stand: after --fall-stand-seconds')
+    parser.add_argument('--fall-stand-seconds', type=float, default=2.0,
+                        help='getup --fall stand: seconds standing after the band before the push')
+    parser.add_argument('--fall-passive', type=float, default=None,
+                        help='getup --fall stand: LT + B (Passive) this many seconds after the push')
     parser.add_argument('--push-order', default=','.join(d for d, _ in PUSH_KEYS),
                         help='push: directions of each series, comma-separated (a fall ends what the series shows)')
     args = parser.parse_args()
@@ -365,6 +541,26 @@ def main():
             parser.error(f'--push-dv: numbers, not {args.push_dv!r}')
         if bad:
             parser.error(f'--push-dv: {bad} not in 0.5-2.25 m/s in steps of 0.25')
+    if args.fall_push:
+        try:
+            direction, dv = fall_push(args.fall_push)
+        except ValueError:
+            parser.error(f'--fall-push: <direction>[:dv], not {args.fall_push!r}')
+        if direction not in dict(PUSH_KEYS) or push_modifiers(dv) is None:
+            parser.error(f'--fall-push: {sorted(dict(PUSH_KEYS))}, dv 0.5-2.25 m/s in steps of 0.25, '
+                         f'not {args.fall_push!r}')
+    if args.fall == 'stand' and not args.fall_push:
+        parser.error('--fall stand needs --fall-push')
+    if args.getup_velocity and args.getup_fixstand:
+        parser.error('--getup-velocity or --getup-fixstand, not both')
+    if args.scenario == 'arms':
+        if not args.deploy:
+            parser.error('--scenario arms needs --deploy <deploy.yaml> (run.sh gives the export\'s)')
+        try:
+            for _, keys in arm_poses(args.deploy)[0] + [('release', arm_poses(args.deploy)[1])]:
+                arm_keys(keys)
+        except ValueError as error:
+            parser.error(str(error))
 
     pad = Gamepad(args.fifo)
     scenario = Scenario(pad, args.window, args.events)

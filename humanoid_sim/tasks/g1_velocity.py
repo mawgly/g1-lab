@@ -6,6 +6,7 @@ Observation, reward and command equations live in g1_tensor_math and are shared
 with the CUDA environment, so both backends train the same task.
 """
 import json
+from functools import lru_cache
 from pathlib import Path
 import gymnasium as gym
 from gymnasium import spaces
@@ -13,7 +14,7 @@ import mujoco
 import numpy as np
 import torch
 from .config import (ARM_PERTURB_RADIANS, ARM_PERTURB_RADIANS_RANGE, CRITIC_EXTRAS, CROUCH_HEIGHTS, FORCE_PUSH_RANGE,
-                     MOTOR_FRICTION_RANGE, g1_commands, g1_gait, g1_reward_weights)
+                     MOTOR_FRICTION_RANGE, g1_commands, g1_gait, g1_reward_weights, load_curve_setting)
 from . import g1_tensor_math as task
 
 ASSETS = Path(__file__).resolve().parents[2] / 'assets' / 'robots' / 'g1'
@@ -68,6 +69,20 @@ FOOT_COLLISION_BIT = 2
 HAND_CAPSULE_RADIUS = .035
 HAND_CAPSULE_CONTACT = dict(condim=1, priority=0)
 HAND_CAPSULES = {'left_wrist_yaw_link': (.07, 0., 0., .15, -.02, 0.), 'right_wrist_yaw_link': (.07, 0., 0., .15, .02, 0.)}
+# task_config arm_targets: the pose libraries of the arm targets (scripts/lab/arm_pose_library.py): absolute angles of
+# the ten free arm joints (names in `joints`), `poses` uniform over their ranges and `carry` the symmetric carry poses of
+# task.ARM_CARRY (its ranges in `carry_ranges`), each kept when no arm geom touches the body, the other arm or its own
+# arm, in the pose and halfway from home. Not under assets/robots/g1, so it is not part of the model revision.
+ARM_POSES = Path(__file__).resolve().parent / 'data' / 'g1_arm_poses.npz'
+
+
+@lru_cache(maxsize=4)
+def arm_pose_library(path=ARM_POSES):
+    """(joint names, free poses (L, 10), carry poses (C, 10), carry ranges (len(ARM_CARRY), 2)) of the arm pose
+    library, float64; read once, not to be changed in place."""
+    with np.load(path) as data:
+        return (tuple(str(name) for name in data['joints']), data['poses'].astype(np.float64),
+                data['carry'].astype(np.float64), data['carry_ranges'].astype(np.float64))
 
 # Real-robot motors (docs/g1-real-robot-plan.md). Joint -> Unitree motor as in mjlab g1_constants.py;
 # torque-speed curve (x1, x2 rad/s; y1, y2 N·m) and friction (static N·m, viscous N·m·s/rad) measured by
@@ -174,8 +189,19 @@ class G1VelocityEnv(gym.Env):
                  force_push=0., feet_flat_stance=False, foot_collision=False, side_heading_hold=True,
                  motor_friction=0., height_command=False, upper_body_slot=False,
                  arm_perturb_radians=ARM_PERTURB_RADIANS, arm_perturb_contact_mask=False, arm_blind=False,
-                 hand_collision=False):
+                 hand_collision=False, arm_targets=False, load_curve=None):
         self.real_robot = bool(real_robot)
+        # load_curve: the full-GPU trainer's block rule for the hand load ceiling (TensorG1Env.rollout_metrics); kept
+        # here for it, nothing on the CPU changes (this task keeps the ceiling it is given).
+        self.load_curve = load_curve_setting(load_curve)
+        if self.load_curve is not None and not arm_targets:
+            raise ValueError('load_curve requires arm_targets')
+        # arm_targets: training episodes draw an arm mode (task.ARM_MODES); with flag 1 the slot carries the arm targets,
+        # the arm action is a residual on them and the hands carry loads. Needs the slot, the locked wrists and the
+        # arms seen; real robot (the deploy layout), 29-DoF (checked below).
+        self.arm_targets = bool(arm_targets)
+        if self.arm_targets and (not real_robot or not upper_body_slot or not lock_wrists or arm_blind):
+            raise ValueError('arm_targets requires real_robot, upper_body_slot and lock_wrists, not arm_blind')
         # arm_blind: the policy's normalization holds the arm columns constant (fixed_normalization, arm_columns); the
         # observation itself is unchanged. The deploy layout's columns, so real robot only (the 29-DoF G1).
         self.arm_blind = bool(arm_blind)
@@ -370,6 +396,22 @@ class G1VelocityEnv(gym.Env):
         # (1,) tensor motor_torque gets (None while m is 1, the original expression).
         self.friction_scale = 1.
         self._friction_scale = None
+        # Hand loads (set_hand_load; arm_targets' flag-1 episodes): the hand bodies (wrist_yaw links, 29-DoF), their own
+        # mass and COM, every body's own subtree mass and which hand lies in its subtree (task.hand_subtree_mass), the
+        # loads now (kg, left and right; 0: the model's own numbers, untouched).
+        self.hand_bodies = None
+        self.hand_load = np.zeros(2)
+        if not self.legs_only:
+            self.hand_bodies = np.array([self.model.body(name).id for name in task.HAND_LOAD_BODIES])
+            self.hand_mass = self.model.body_mass[self.hand_bodies].copy()
+            self.hand_ipos = self.model.body_ipos[self.hand_bodies].copy()
+            self.subtree_mass = self.model.body_subtreemass.copy()
+            self.hand_above = np.zeros((self.model.nbody, 2))
+            for side, body in enumerate(self.hand_bodies):
+                while body >= 0:
+                    self.hand_above[body, side] = 1.
+                    body = self.model.body_parentid[body] if body else -1
+        self._setup_arm_targets(names)
         self.action_space = spaces.Box(-self.action_limit, self.action_limit, (self.model.nu,), dtype=np.float32)
         # Simulation profile: body angular+linear velocity, gravity, command, joint offsets/velocities,
         # previous action, gait clock. Real robot: the controller's layout without linear velocity, then the extra
@@ -394,6 +436,162 @@ class G1VelocityEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.steps = 0
         self.renderer = None
+
+    def _setup_arm_targets(self, names):
+        """task_config arm_targets: the joints it tracks (shoulders, elbows, wrist roll: the arm joints but the locked
+        wrists) and the posture joints without the arms (flag 1), the pose library as offsets from home, the carry
+        poses' joints, parts and mirror signs (symmetry.model_joint_mirror), and the episode state: the mode, the flag
+        (the arms follow the slot), whether the targets were set by hand (set_arm_targets: the generator stops), the
+        segment (start, end, clock, move, hold: task.arm_target_advance), this step's offsets d, the offsets of the step
+        before (the observed last action) and those the delay queue holds, the episode's load shares and the load
+        ceiling m_max (kg; the full-GPU trainer moves it, task.load_curve_update; here it is restored from a stage or
+        stays), and the arm process's own random stream. Without the setting only the empty state."""
+        self.track_joints = tuple(i for i in self.arm_joints if i not in self.wrist_joints)
+        self.arm_posture_joints = tuple(i for i in self.posture_joints if i not in self.arm_joints)
+        self.arm_mode, self.arm_flag, self.arm_fixed = task.ARM_FREE, False, False
+        self.arm_offset = np.zeros(self.model.nu)
+        self.previous_flag, self.previous_offset = False, np.zeros(self.model.nu)
+        self.delay_offsets = []
+        self.perturb_training = False
+        self.load_share = np.zeros(2)
+        self.load_max = 0.
+        self.arm_random = None
+        if not self.arm_targets:
+            return
+        if len(self.track_joints) != 10 or self.hand_bodies is None:
+            raise ValueError('arm_targets needs the arms of the 29-DoF G1')
+        joint_names, poses, carry, ranges = arm_pose_library()
+        columns = [names.index(name) for name in joint_names]
+        if sorted(columns) != list(self.track_joints):
+            raise ValueError('The arm pose library is not over the free arm joints')
+        if not np.array_equal(ranges, [row[1:] for row in task.ARM_CARRY]):
+            raise ValueError('The carry poses of the arm pose library are not those of task.ARM_CARRY: make it again')
+        self.arm_poses, self.arm_carry = (torch.from_numpy(self._arm_offsets(columns, rows)) for rows in (poses, carry))
+        self.arm_state = self._arm_still(np.zeros(self.model.nu))
+
+    def _arm_offsets(self, columns, poses):
+        """(L, nu) offsets from home of library poses (L, len(columns)) of the joints `columns`; 0 elsewhere."""
+        offsets = np.zeros((len(poses), self.model.nu))
+        offsets[:, columns] = poses - self.home[columns]
+        return offsets
+
+    def _arm_still(self, offsets):
+        """A segment holding offsets (nu,) from its first step: (start, end, clock, move, hold) of batch 1."""
+        held = _batch(offsets)
+        return held, held.clone(), torch.zeros(1, dtype=torch.long), torch.ones(1, dtype=torch.long), \
+            torch.zeros(1, dtype=torch.long)
+
+    def _arm_uniform(self, n):
+        return torch.from_numpy(self.arm_random.random(n))
+
+    def _arm_draws(self):
+        """The arm process's draws for task functions: (uniform, free poses, carry poses, joints, dt)."""
+        return self._arm_uniform, self.arm_poses, self.arm_carry, self.track_joints, self.dt
+
+    def _arm_episode(self, training):
+        """This episode's arm mode, targets and hand loads (arm_targets): a training reset draws the mode
+        (task.arm_mode_draw), with flag 1 the two hands' load shares, in the targets mode the first segment from home
+        (task.arm_segment_draw), all from the arm process's own stream; a reset with a command has free arms and no
+        load. Arm perturbation segments run only in a flag-0 training episode."""
+        self.arm_mode = int(task.arm_mode_draw(self._arm_uniform, 1)[0]) if training else task.ARM_FREE
+        self.arm_flag, self.arm_fixed = self.arm_mode != task.ARM_FREE, False
+        self.load_share = self.arm_random.random(2) if self.arm_flag else np.zeros(2)
+        self.arm_state = self._arm_still(np.zeros(self.model.nu))
+        if self.arm_mode == task.ARM_TARGET:
+            start = self.arm_state[0]
+            end, move, hold = task.arm_segment_draw(self._arm_uniform, start, *self._arm_draws()[1:])
+            self.arm_state = (start, end, torch.zeros(1, dtype=torch.long), move, hold)
+        self.arm_offset = task.arm_target_offset(*self.arm_state[:4])[0].numpy()
+        self.previous_flag, self.previous_offset = False, np.zeros(self.model.nu)
+        self.delay_offsets = [np.zeros(self.model.nu)] * len(self.delay_actions)
+        self.perturb_live = self.perturb_training and not self.arm_flag
+        self._apply_hand_load(self.load_share * self.load_max)
+
+    def _advance_arm_targets(self):
+        """One control step of this episode's targets, after the reward (task.arm_target_advance in the targets mode
+        unless set by hand; otherwise the clock alone, which carries a set_arm_targets transition), then this step's
+        offsets."""
+        if not self.arm_flag:
+            return
+        if self.arm_mode == task.ARM_TARGET and not self.arm_fixed:
+            self.arm_state = task.arm_target_advance(self.arm_state, torch.tensor([True]), *self._arm_draws())
+        else:
+            start, end, clock, move, hold = self.arm_state
+            self.arm_state = (start, end, clock + 1, move, hold)
+        self.arm_offset = task.arm_target_offset(*self.arm_state[:4])[0].numpy()
+
+    def _apply_hand_load(self, load):
+        """Loads (kg, left and right) at the palms (task.hand_load_mass, HAND_LOAD_POSITION) into the model: the hand
+        bodies' mass and COM and every body's subtree mass; 0 restores the model's own numbers exactly."""
+        load = np.asarray(load, dtype=np.float64).reshape(2)
+        mass, ipos = task.hand_load_mass(self.hand_mass, self.hand_ipos, load[None], task.HAND_LOAD_POSITION)
+        self.model.body_mass[self.hand_bodies] = mass[0]
+        self.model.body_ipos[self.hand_bodies] = ipos[0]
+        self.model.body_subtreemass[:] = task.hand_subtree_mass(self.subtree_mass, self.hand_above, load[None])[0]
+        self.hand_load = load.copy()
+
+    def set_arm_targets(self, q=None, flag=True, seconds=0.):
+        """Arm command of this episode from now on (tests, probes; task_config arm_targets), until the next reset: flag
+        1, the arms follow q ((nu,) absolute joint angles; its free arm joints, clipped to their ranges; None: home), in
+        a quintic over `seconds` from the current targets (0: at once); flag 0, free arms (the policy's own, the slot
+        zeros; arm perturbation as the episode had it). The generator stops; the hand loads stay (set_hand_load).
+        Re-read the observation as after set_command."""
+        if not self.arm_targets:
+            raise ValueError('arm targets need task_config arm_targets')
+        if isinstance(flag, (bool, np.bool_)):
+            flag = bool(flag)
+        elif isinstance(flag, (int, np.integer)) and flag in (0, 1):
+            flag = bool(flag)
+        else:
+            raise ValueError('flag must be 0 or 1')
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not np.isfinite(seconds) \
+                or seconds < 0:
+            raise ValueError('seconds must be a finite non-negative number')
+        target = self.home if q is None else np.asarray(q, dtype=float)
+        if target.shape != (self.model.nu,) or not np.isfinite(target).all():
+            raise ValueError('Expected finite (actuator_count,) arm targets')
+        end = np.zeros(self.model.nu)
+        if flag:
+            joints = list(self.track_joints)
+            low, high = self.model.jnt_range[self.joints[joints]].T
+            end[joints] = np.clip(target[joints], low, high) - self.home[joints]
+        self.arm_state = self._arm_still(end)
+        if flag and seconds > 0:
+            start = self.arm_offset if self.arm_flag else np.zeros(self.model.nu)
+            move = task.arm_move_steps(_batch(start), _batch(end), self.track_joints, self.dt, seconds=seconds)
+            self.arm_state = (_batch(start), _batch(end), torch.zeros(1, dtype=torch.long), move,
+                              torch.zeros(1, dtype=torch.long))
+        self.arm_mode, self.arm_flag, self.arm_fixed = task.ARM_TARGET if flag else task.ARM_FREE, flag, True
+        self.arm_offset = task.arm_target_offset(*self.arm_state[:4])[0].numpy()
+        if flag:  # no perturbation while the arms follow targets
+            self.perturb_live, self.perturb_steps = False, 0
+        else:
+            self.perturb_live = self.perturb_training
+
+    def set_hand_load(self, load):
+        """Loads (kg) on the hands from the next physics step until the next reset (tests, probes): one number for both
+        or (left, right), at the palms (HAND_LOAD_POSITION on the wrist_yaw links); also without arm_targets (29-DoF)."""
+        if self.hand_bodies is None:
+            raise ValueError('hand loads need the arms of the 29-DoF G1')
+        load = np.asarray(load, dtype=float)
+        if load.shape not in ((), (2,)) or not np.isfinite(load).all() or (load < 0).any():
+            raise ValueError('Expected one or two finite non-negative loads (kg)')
+        self._apply_hand_load(np.broadcast_to(load, (2,)))
+
+    @property
+    def keeps_training_state(self):
+        """Whether stages keep this task's training state (train.keeps_training_state): the load ceiling of arm_targets."""
+        return self.arm_targets
+
+    def training_state(self):
+        """What a stage keeps of this training beyond the weights (arm_targets): the hand load ceiling m_max."""
+        return {'load_max': [self.load_max]}
+
+    def restore_training_state(self, state, index=0, count=1):
+        """The hand load ceiling from a stage's training_state (their mean, within [0, LOAD_LIMIT]); nothing without
+        arm_targets or a saved ceiling."""
+        if self.arm_targets and 'load_max' in state:
+            self.load_max = saved_load(state)
 
     def set_command(self, command):
         command = np.asarray(command, dtype=float)
@@ -430,9 +628,10 @@ class G1VelocityEnv(gym.Env):
         """(positions, mean, variance) of the observation columns whose normalization is set, not estimated: every
         frame's entries of the extra terms (task.TERM_NORMALIZATION), then with arm_blind the arm columns (arm_columns)
         at variance task.ARM_BLIND_SCALE² with mean NaN: the statistics' own, kept as they are (−z·ARM_BLIND_SCALE
-        from warm_start.blind_arms; 0 in a fresh normalizer). None without either. warm_start.insert_terms writes the
-        set values into a stage's statistics, TensorNormalize and the CPU training path (train.FrozenMoments) keep all
-        of them frozen."""
+        from warm_start.blind_arms; 0 in a fresh normalizer), or with arm_targets at mean 0 and the variances of
+        task.ARM_TARGET_VARIANCE per term (warm_start.unblind_arms). None without any. warm_start.insert_terms writes
+        the set values into a stage's statistics, TensorNormalize and the CPU training path (train.FrozenMoments) keep
+        all of them frozen."""
         positions, mean, variance = [], [], []
         for name, _ in self.extra_terms:
             columns = task.term_positions(self.model.nu, self.history, self.extra_terms, name)
@@ -444,6 +643,12 @@ class G1VelocityEnv(gym.Env):
             positions += columns
             mean += [np.nan] * len(columns)
             variance += [task.ARM_BLIND_SCALE ** 2] * len(columns)
+        if self.arm_targets:  # arm_columns' order: term by term, every frame of each
+            columns = self.arm_columns
+            positions += columns
+            mean += [0.] * len(columns)
+            variance += [task.ARM_TARGET_VARIANCE[term] for term in task.ARM_BLIND_TERMS
+                         for _ in range(len(columns) // len(task.ARM_BLIND_TERMS))]
         if not positions:
             return None
         return np.array(positions, dtype=np.int64), np.array(mean), np.array(variance)
@@ -545,13 +750,20 @@ class G1VelocityEnv(gym.Env):
                                              self.side_heading_hold)
         self.observed_command = command[0].numpy().copy()
         velocity = _batch(self._velocity())
+        previous = _batch(self.previous_action)
+        if self.previous_flag:  # arm_targets: the last action as the ONNX graph output it, clip(a) + d/scale
+            previous = task.observed_action(previous, _batch(self.previous_offset), torch.from_numpy(self.scale),
+                                            torch.tensor([True]))
         parts = (velocity, rotation, command, _batch(self.data.qpos[self.qadr]), _batch(self.data.qvel[self.vadr]),
-                 _batch(self.home), _batch(self.previous_action), self._phase())
+                 _batch(self.home), previous, self._phase())
         observed = (task.deploy_observation(*parts, phase_stop=self.phase_stop) if self.real_robot
                     else task.observation(*parts))
-        if self.extra_terms:  # height_command [c − 0.78], upper_body_slot zeros
+        if self.extra_terms:  # height_command [c − 0.78], upper_body_slot zeros (arm_targets, flag 1: the arm command)
             height = torch.tensor([self.height], dtype=torch.float64) if self.height_command else None
-            observed = torch.cat((observed, task.command_terms(height, self.upper_body_slot, observed)), dim=1)
+            upper_body = (task.upper_body_command(torch.tensor([True]), _batch(self.arm_offset)) if self.arm_flag
+                          else None)
+            observed = torch.cat((observed, task.command_terms(height, self.upper_body_slot, observed, upper_body)),
+                                 dim=1)
         if self.history > 1:
             if history == 'fill' or self.frames is None:
                 self.frames = observed[:, None].repeat(1, self.history, 1)
@@ -566,6 +778,10 @@ class G1VelocityEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+        # arm_targets: the arm process's own stream, seeded with the reset's seed (never drawn from np_random, so the
+        # task's own draws stay the old ones).
+        if self.arm_targets and (seed is not None or self.arm_random is None):
+            self.arm_random = np.random.default_rng(None if seed is None else (seed, task.ARM_TARGET_STREAM))
         # options['phase_steps']: the gait clock starts that many control steps on (evaluation: half a cycle
         # starts on the other foot). Counted apart from self.steps, so the episode keeps its length. Without it,
         # random_phase draws the start for training resets (no command given), as the CUDA task does; resets with
@@ -595,7 +811,8 @@ class G1VelocityEnv(gym.Env):
         self.delay_lags = task.action_lags(torch.tensor([self.delay_steps]), self.frame_skip)[0].numpy()
         self.delay_actions = [np.zeros(self.model.nu)] * int(self.delay_lags[0])  # zero actions: the home pose
         # arm_perturb: training resets (no command given) run perturbation segments; every reset ends the current one.
-        self.perturb_live = bool(self.arm_perturb) and options.get('command') is None
+        # arm_targets: only with free arms (flag 0, _arm_episode).
+        self.perturb_live = self.perturb_training = bool(self.arm_perturb) and options.get('command') is None
         self.perturb_steps = 0
         self.perturb_action = np.zeros(self.model.nu)
         mujoco.mj_resetData(self.model, self.data)
@@ -610,6 +827,12 @@ class G1VelocityEnv(gym.Env):
         else:
             self.fixed_command = False
             self._sample_command()
+        # arm_targets: the episode's arm mode, targets and hand loads (its own stream); a load set_hand_load left from the
+        # episode before comes off.
+        if self.arm_targets:
+            self._arm_episode(options.get('command') is None)
+        elif self.hand_load.any():
+            self._apply_hand_load(np.zeros(2))
         mujoco.mj_forward(self.model, self.data)
         rotation = self.data.xmat[self.pelvis].reshape(3, 3)
         self.heading_target = float(np.arctan2(rotation[1, 0], rotation[0, 0]))
@@ -642,10 +865,12 @@ class G1VelocityEnv(gym.Env):
             self._draw_height()
         return self._observation('fill'), {'x_position': float(self.data.qpos[0])}
 
-    def _target(self, action):
+    def _target(self, action, offset=None):
         """PD target of a clipped action, within the joint ranges, the knees at knee_floor or above (task.pd_target
-        within target_low / target_high, as the CUDA task's PD)."""
-        return task.pd_target(torch.from_numpy(action), torch.from_numpy(self.home), torch.from_numpy(self.scale),
+        within target_low / target_high, as the CUDA task's PD); offset (nu,): task_config arm_targets' d, home moved
+        by it (home + d + scale·clip(a)); None: home itself."""
+        home = self.home if offset is None else self.home + offset
+        return task.pd_target(torch.from_numpy(action), torch.from_numpy(home), torch.from_numpy(self.scale),
                               torch.from_numpy(self.target_low), torch.from_numpy(self.target_high),
                               self.action_limit).numpy()
 
@@ -656,7 +881,8 @@ class G1VelocityEnv(gym.Env):
         replaces the policy's in everything after it (PD, delay queue, reward, observed previous action). Changes no
         state: step draws and counts off the segments around it. Probes running their own PD apply what step does
         through it, and bound its target by target_low / target_high: knee_floor acts there (_target), not on the
-        action, so the observed previous action keeps a knee action below the floor, as g1_ctrl's last_action."""
+        action, so the observed previous action keeps a knee action below the floor, as g1_ctrl's last_action. Under
+        arm_targets with flag 1 the target is _target(applied, arm_offset): home moved by this step's arm targets."""
         action = np.clip(np.asarray(action, dtype=float), -self.action_limit, self.action_limit)
         if self.perturb_steps:
             action = task.arm_perturb_apply(_batch(action), torch.tensor([self.perturb_steps]),
@@ -682,9 +908,16 @@ class G1VelocityEnv(gym.Env):
         self.arm_contacts_masked = self.arm_perturb_contact_mask and self.perturb_steps > 0
         if self.perturb_steps:
             self.perturb_steps -= 1
-        target = self._target(action)
-        # action_delay: substep j follows the target of the action delay_lags[j] steps old (all 0 without delay).
-        targets = [target, *(self._target(past) for past in self.delay_actions)]
+        # arm_targets, flag 1: the arm targets of this step move home (offset d); flag 0 and off: home itself.
+        offset = self.arm_offset.copy() if self.arm_flag else None
+        target = self._target(action) if offset is None else self._target(action, offset)
+        # action_delay: substep j follows the target of the action delay_lags[j] steps old (all 0 without delay); under
+        # arm_targets each with the offsets of its own step.
+        if self.arm_targets:
+            targets = [target, *(self._target(past, past_offset) if past_offset.any() else self._target(past)
+                                 for past, past_offset in zip(self.delay_actions, self.delay_offsets))]
+        else:
+            targets = [target, *(self._target(past) for past in self.delay_actions)]
         # force_push: a push may start at this step (task.force_push_draw); its force acts on the pelvis at each
         # substep it lasts, written into xfrc_applied before mj_step as the sim2sim push patch does, zeroed after.
         pushes = None
@@ -740,6 +973,22 @@ class G1VelocityEnv(gym.Env):
         if self.height_command:
             height_command = torch.tensor([self.height], dtype=torch.float64)
             stand_home = task.stand_target(_batch(self.home), height_command, self.crouch_joints)
+        # arm_targets: the flag of this step and, with flag 1, the arms' tracking of home + d after the step
+        # (task.arm_track; arm_press and the arms' posture are then off in reward_components); whether this step's
+        # targets hold (task.arm_holding) and, while the arm_error weight is non-zero, the arms' error for its term.
+        arms = {}
+        if self.arm_targets:
+            target_pose = _batch(self.home if offset is None else self.home + offset)
+            tracked = (task.arm_track(_batch(self.data.qpos[self.qadr]), target_pose, self.track_joints)
+                       if offset is not None else torch.zeros(1, dtype=torch.float64))
+            error = (task.arm_error(_batch(self.data.qpos[self.qadr]), target_pose, self.track_joints)
+                     if offset is not None else None)
+            hold = bool(task.arm_holding(*self.arm_state[:4])[0])
+            arms = dict(arm_flag=torch.tensor([offset is not None]), arm_track=tracked,
+                        arm_posture_joints=self.arm_posture_joints)
+            if self.reward_weights['arm_error']:
+                arms.update(arm_error=torch.zeros(1, dtype=torch.float64) if error is None else error,
+                            arm_hold=torch.tensor([hold]))
         # Rewarded for the command the policy observed when it chose this action.
         components, fell = task.reward_components(
             _batch(velocity), _batch(self.data.xmat[self.pelvis].reshape(3, 3)), _batch(self.data.qpos[2]),
@@ -755,21 +1004,32 @@ class G1VelocityEnv(gym.Env):
             yaw_drift_error=yaw_drift, requested_command=_batch(self.command.copy()),
             self_contact=None if self_force is None else task.self_contact_share(_batch(self_force)),
             arm_press=arm_press, feet_flat_stance=self.feet_flat_stance, height_command=height_command,
-            stand_home=stand_home)
+            stand_home=stand_home, **arms)
         components = {key: float(value[0]) for key, value in components.items()}
         fell = bool(fell[0])
         info = dict(x_position=float(self.data.qpos[0]), fell=fell,
                     command=self.observed_command.copy(), velocity=velocity[3:5].copy(), reward_components=components)
         if self.height_command:
             info['height_command'] = self.height
+        if self.arm_targets:  # the flag, the arms' mean |error| (rad) with flag 1, the hand loads (kg), the hold
+            info.update(arm_flag=offset is not None, hand_load=self.hand_load.copy(),
+                        arm_error=None if error is None else float(error[0]), arm_track=float(tracked[0]),
+                        arm_hold=offset is not None and hold)
         self.previous_action[:] = action
+        if self.arm_targets:  # the offsets this step followed, for the observed last action and the delay queue
+            self.previous_flag = offset is not None
+            self.previous_offset = np.zeros(self.model.nu) if offset is None else offset
         if self.delay_actions:
             self.delay_actions = [action, *self.delay_actions[:-1]]
+            if self.arm_targets:
+                self.delay_offsets = [self.previous_offset, *self.delay_offsets[:-1]]
         # The reward above belongs to the command the action was taken under.
         if not self.fixed_command and self.np_random.random() < self.dt / task.COMMAND_RESAMPLE_SECONDS:
             self._sample_command(resample=True)
             if self.height_command:  # a new height for the new command, after the command's draws
                 self._draw_height()
+        # arm_targets: the targets move on (their own stream), shown in the next observation.
+        self._advance_arm_targets()
         return self._observation('push'), sum(components.values()), fell, self.steps >= self.max_episode_steps, info
 
     def render(self):
@@ -787,3 +1047,12 @@ class G1VelocityEnv(gym.Env):
         if self.renderer is not None:
             self.renderer.close()
             self.renderer = None
+
+
+def saved_load(state):
+    """The hand load ceiling m_max (kg) in a stage's training_state (task_config arm_targets): the mean of its values
+    (one per world), checked finite and non-negative, within [0, LOAD_LIMIT] (the CUDA task's restore too)."""
+    values = np.asarray(state['load_max'], dtype=np.float64)
+    if values.ndim != 1 or not len(values) or not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError('Invalid saved hand load ceiling')
+    return float(min(values.mean(), task.LOAD_LIMIT))

@@ -16,7 +16,8 @@ def test_catalog_describes_task_fields_and_defaults():
                                          'arm_perturb_radians', 'arm_perturb_contact_mask', 'force_push',
                                          'motor_friction', 'lock_wrists', 'knee_floor', 'foot_collision',
                                          'hand_collision', 'height_command', 'upper_body_slot', 'arm_blind',
-                                         'action_limit', *G1_COMMANDS, *G1_GAIT, *G1_REWARD_WEIGHTS]
+                                         'arm_targets', 'load_curve', 'action_limit', *G1_COMMANDS, *G1_GAIT,
+                                         *G1_REWARD_WEIGHTS]
     assert fields[0]['type']=='bool' and fields[0]['default'] is False  # simulation profile by default
     assert fields[1]['type']=='bool' and fields[1]['default'] is False
     assert fields[2]['default']==1 and fields[2]['min']==1 and fields[2]['max']==10  # no history by default
@@ -43,12 +44,14 @@ def test_catalog_describes_task_fields_and_defaults():
     # No height command and no upper-body slot unless asked (the original observation layout).
     assert all(fields[k]['type']=='bool' and fields[k]['default'] is False for k in (21, 22))
     assert fields[23]['type']=='bool' and fields[23]['default'] is False  # the policy sees its arms unless asked
-    assert fields[24]['group'] is None and fields[24]['default']==1  # the original action contract by default
+    assert fields[24]['type']=='bool' and fields[24]['default'] is False  # the slot stays zeros unless asked
+    assert fields[25]['default'] is None  # the per-window load curve unless asked
+    assert fields[26]['group'] is None and fields[26]['default']==1  # the original action contract by default
     assert next(f for f in fields if f['key']=='action_change')['default']==.01
     assert next(f for f in fields if f['key']=='torso')['default']==2  # recommended for new experiments
-    weights=fields[25+len(G1_COMMANDS)+len(G1_GAIT):]
+    weights=fields[27+len(G1_COMMANDS)+len(G1_GAIT):]
     assert all(f['group']=='reward_weights' and f['min']==0 and f['max']==100 for f in weights)
-    assert [(f['group'],f['default']) for f in fields[25:25+len(G1_COMMANDS)]]==[('commands',v) for v in G1_COMMANDS.values()]
+    assert [(f['group'],f['default']) for f in fields[27:27+len(G1_COMMANDS)]]==[('commands',v) for v in G1_COMMANDS.values()]
     assert next(r for r in robots if r['robot_id']=='so101')['tasks'][0]['parameters']==[]
 
 
@@ -86,7 +89,7 @@ def test_task_config_rejects_unknown_nonfinite_and_wrong_task_parameters():
                                                   'force_push':0.,'feet_flat_stance':False,'foot_collision':False,
                                                   'side_heading_hold':True,'motor_friction':0.,
                                                   'height_command':False,'upper_body_slot':False,'arm_blind':False,
-                                                  'hand_collision':False}
+                                                  'hand_collision':False,'arm_targets':False,'load_curve':None}
     for history in (0, 2.5, 11):  # whole frames in [1, 10], and only for the real-robot profile
         with pytest.raises(ValueError):
             validate_config({**base,'task_config':{'real_robot':True,'history':history}})

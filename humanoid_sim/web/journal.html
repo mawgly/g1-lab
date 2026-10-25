@@ -398,6 +398,9 @@
       .j-role.engineer {
         background: #24676b;
       }
+      .j-role.reviewer {
+        background: #8a4a12;
+      }
       .j-decision {
         padding: 12px 14px;
         border-radius: 10px;
@@ -626,6 +629,19 @@
       table.j-checks .fail td.num {
         color: var(--bad);
       }
+      /* The skills check: a heading row per skill, the note of what held in the last column */
+      table.j-skills tr.j-skill th {
+        padding-top: 16px;
+        text-align: left;
+        font-weight: 800;
+        color: var(--ink);
+      }
+      table.j-skills td.j-note {
+        font-size: 13.5px;
+      }
+      table.j-skills .fail td.j-note {
+        color: var(--bad);
+      }
       @media (max-width: 640px) {
         table.j-checks thead {
           position: absolute;
@@ -646,7 +662,8 @@
           padding: 2px 0;
           border: 0;
         }
-        table.j-checks td:first-child {
+        table.j-checks td:first-child,
+        table.j-skills tr.j-skill th {
           grid-column: 1 / -1;
           font-weight: 700;
         }

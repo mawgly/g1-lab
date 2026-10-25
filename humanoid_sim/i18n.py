@@ -51,6 +51,22 @@ def numbers(value, lang):
                   lambda m: re.sub(r'[\u00a0\u202f ]', ',', m[0]), value)
 
 
+# Units: the international symbol, which the English and the Chinese pages use alike (the catalogs keep m/s, s,
+# N\u00b7m ... in Chinese too), and the Russian one.
+UNITS = {'m': '\u043c', 'cm': '\u0441\u043c', 'mm': '\u043c\u043c', 's': '\u0441', 'ms': '\u043c\u0441',
+         'rad': '\u0440\u0430\u0434', 'rad/s': '\u0440\u0430\u0434/\u0441', 'm/s': '\u043c/\u0441',
+         'N': '\u041d', 'N\u00b7m': '\u041d\u00b7\u043c', 'N\u00b7s': '\u041d\u00b7\u0441', 'kg': '\u043a\u0433',
+         'Hz': '\u0413\u0446', 'rad\u00b2': '\u0440\u0430\u0434\u00b2'}
+
+
+def unit(value, symbol, lang):
+    """A value with its unit, `symbol` a key of UNITS: \u00ab0,23\u20130,26 \u043c\u00bb in Russian,
+    \u00ab0.23\u20130.26 m\u00bb otherwise (the value already in the language's number form). A value made of
+    numbers and a unit then needs no catalog entry (an entry such as \u00ab{d} \u043c\u00bb would be hidden by
+    \u00ab{n} \u043c\u00bb of the same shape, see missing())."""
+    return f'{value} {UNITS[symbol] if lang == "ru" else symbol}'
+
+
 class Catalog:
     """Translations of one language: exact Russian keys, and the keys with placeholders as patterns."""
 
@@ -160,7 +176,10 @@ class Content:
 JOURNAL_FIELDS = {'roadmap': ('title', 'detail'), 'sections': ('title', 'text'), 'path': ('title', 'change', 'result'),
                   'races': ('title', 'text'), 'entries': ('title', 'text'), 'check': ('title',),
                   'items': ('label', 'value', 'target'), 'iterations': ('title', 'question', 'decision'),
-                  'messages': ('text',)}
+                  'messages': ('text',), 'skills': ('title',), 'against': ('title',),
+                  'skill_items': ('skill', 'label', 'target', 'value', 'reference', 'note')}
+# Rows whose values may be numbers alone, with Russian decimal commas (goal_check, scripts/lab/skills_check.py).
+NUMBER_ROWS = ('items', 'skill_items')
 
 
 def map_journal(journal, change):
@@ -181,6 +200,10 @@ def map_journal(journal, change):
     check = journal.get('check')
     if check:
         result['check'] = {**items([check], 'check')[0], 'items': items(check.get('items'), 'items')}
+    skills = journal.get('skills')
+    if skills:
+        result['skills'] = {**items([skills], 'skills')[0], 'items': items(skills.get('items'), 'skill_items'),
+                            'against': items([skills.get('against') or {}], 'against')[0]}
     result['entries'] = items(journal.get('entries'), 'entries')
     result['iterations'] = [{**it, 'messages': items(it.get('messages'), 'messages')}
                             for it in items(journal.get('iterations'), 'iterations')]
@@ -192,7 +215,7 @@ def localize_journal(journal, lang, content):
         return journal
 
     def change(text, kind, field):
-        if kind == 'items' and not CYRILLIC.search(text):
+        if kind in NUMBER_ROWS and not CYRILLIC.search(text):
             return numbers(text, lang)  # goal_check's values carry Russian decimal commas without any word
         return content.text(text, lang)
     return map_journal(journal, change)
@@ -240,9 +263,13 @@ def localize_frame(frame, lang, content):
 
 # --- What has to be translated: used by tests/test_i18n.py and the check below ----------------------------------
 
-# Modules whose Russian strings reach the browser (messages, labels, check rows, the report).
+# Modules whose Russian strings reach the browser (messages, labels, check rows, the report), and the candidate
+# passport's page (scripts/robot/passport.py, its render(): PASSPORT.<lang>.md in three languages); paths from here.
 SERVER_MODULES = ('webapp.py', 'lab.py', 'lab_api.py', 'lab_worker.py', 'reports.py', 'tasks/catalog.py',
-                  'tasks/config.py', 'goal_check.py:items')
+                  'tasks/config.py', 'goal_check.py:items', '../scripts/robot/passport.py:render',
+                  '../scripts/lab/skills_check.py:table', '../scripts/lab/skills_check.py:not_applicable',
+                  '../scripts/lab/skills_check.py:verdict', '../scripts/lab/skills_check.py:rows',
+                  '../scripts/lab/skills_check.py:getup_table')
 # The site (Home, Journal, Lab), the live 3D race and the arm's stage player. A listed file that does not exist
 # (yet) is skipped, so the check runs while a page is being written.
 WEB_SCRIPTS = ('site.js', 'journal.js', 'labtree.js', 'home.js', 'race.js', 'app.js', 'viewer3d.js')

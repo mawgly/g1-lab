@@ -32,6 +32,11 @@ def _g1_legs_tensor(**config):
     return _g1_tensor(legs_only=True, **config)
 
 
+def _g1_getup_tensor(**config):
+    from ..g1_getup_tensor_env import TensorG1GetupEnv
+    return TensorG1GetupEnv(**config)
+
+
 @lru_cache(maxsize=1)
 def backends():
     registry = BackendRegistry()
@@ -40,4 +45,5 @@ def backends():
     # remains CPU-only until the CUDA correctness/benchmark gates pass.
     registry.register('g1_29dof', 'g1_velocity', 'full_gpu', _g1_tensor)
     registry.register('g1_12dof', 'g1_velocity', 'full_gpu', _g1_legs_tensor)
+    registry.register('g1_29dof', 'g1_getup', 'full_gpu', _g1_getup_tensor)
     return registry

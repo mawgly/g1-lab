@@ -4,10 +4,12 @@ The research supervisor writes it at decisions; the browser tab only reads it. E
 <lab>/journal/: journal.json plus the images entries show (copied in, so the journal is self-contained).
 
     {"roadmap": [{"title", "status": done|active|next, "detail",
-                  "story": {"sections": [{"title", "text", "figure"?}],
-                            "path": [{"title", "change", "result", "verdict", "race"}],
+                  "story": {"sections": [{"title", "text", "figure"?, "clip"?, "poster"?}],
+                            "path": [{"title", "change", "result", "verdict", "race", "clip"?, "poster"?}],
                             "races": [{"title", "text", ...race}]} | null}],
      "check": {"at", "branch", "stage", "title", "items": [{"label", "value", "target", "ok"}]} | null,
+     "skills": {"at", "branch", "stage", "title", "against": {"branch", "stage", "title"}, "seconds", "runs",
+                "items": [{"skill", "label", "target", "value", "reference", "ok", "note"}]} (absent until the first),
      "entries": [{"id", "at", "title", "text", "image" | null,
                   "race": {"robot", "task", "scenario", "lanes": [{"experiment", "stage"}]} | null}],
      "iterations": [{"id", "at", "title", "question", "messages": [{"role", "text"}], "decision" | null}]}
@@ -28,7 +30,7 @@ ENTRY_ID = re.compile(r'^[a-z0-9-]{1,80}$')
 EMPTY = {'roadmap': [], 'check': None, 'entries': [], 'iterations': []}
 # Who speaks in «Совет лаборатории»: the lead (Claude) and the lab's agents (.claude/agents/lab-*.md).
 ROLES = {'lead': 'Руководитель', 'critic': 'Критик', 'scout': 'Разведчик', 'analyst': 'Аналитик',
-         'watch': 'Дежурный', 'chronicler': 'Летописец', 'engineer': 'Инженер'}
+         'watch': 'Дежурный', 'chronicler': 'Летописец', 'engineer': 'Инженер', 'reviewer': 'Ревизор'}
 
 
 def folder(root):
@@ -95,13 +97,14 @@ def _figure(item):
 
 
 def _story(story):
-    """A roadmap stage told in detail: text sections, the path through branches, before/after races."""
+    """A roadmap stage told in detail: text sections (each with an optional figure and clip), the path through
+    branches, before/after races. Clips and posters are file names already in the journal folder (add_media)."""
     if story is None:
         return None
     if not isinstance(story, dict):
         raise ValueError('Подробности этапа: объект')
     sections = [{'title': _text(s.get('title'), 'Раздел', 200), 'text': _text(s.get('text'), 'Текст раздела', 6000),
-                 **_figure(s)} for s in story.get('sections', [])]
+                 **_figure(s), **_clip(s)} for s in story.get('sections', [])]
     path = [{'title': _text(p.get('title'), 'Шаг пути', 200), 'change': _text(p.get('change'), 'Что меняли', 1000),
              'result': _text(p.get('result'), 'Что вышло', 1000), 'verdict': p.get('verdict'),
              'race': _race(p['race']) if p.get('race') else None, **_clip(p)} for p in story.get('path', [])]
@@ -147,6 +150,30 @@ def set_check(root, branch, stage, title, items, at=None):
     check = {'at': time.time() if at is None else float(at), 'branch': branch, 'stage': int(stage),
              'title': _text(title, 'Проверка', 300), 'items': rows}
     return _edit(root, lambda data: data.update(check=check))
+
+
+def set_skills(root, branch, stage, title, against, items, seconds=None, runs=None, at=None):
+    """The latest skills check (scripts/lab/skills_check.py), shown beside the goal check: against {branch, stage,
+    title}, the reference; items: [{skill, label, target, value, reference, ok: bool | None (н/п), note}] — one row
+    per measure; seconds, runs: how long it took and how many runs. Stored under 'skills' (absent until the first)."""
+    if not isinstance(items, list) or not items:
+        raise ValueError('Проверка навыков: нужен хотя бы один пункт')
+    if not isinstance(against, dict):
+        raise ValueError('Проверка навыков: эталон {branch, stage, title}')
+    rows = []
+    for item in items:
+        if not isinstance(item, dict) or item.get('ok') not in (True, False, None):
+            raise ValueError('Пункт проверки: ok — true, false или null')
+        rows.append({'skill': _text(item.get('skill'), 'Навык', 200), 'label': _text(item.get('label'), 'Мера', 300),
+                     **{key: str(item.get(key, '')) for key in ('target', 'value', 'reference', 'note')},
+                     'ok': item['ok']})
+    skills = {'at': time.time() if at is None else float(at), 'branch': branch, 'stage': int(stage),
+              'title': _text(title, 'Проверка', 300),
+              'against': {'branch': str(against.get('branch', '')), 'stage': int(against.get('stage') or 0),
+                          'title': _text(against.get('title'), 'Эталон', 300)},
+              'seconds': None if seconds is None else float(seconds), 'runs': None if runs is None else int(runs),
+              'items': rows}
+    return _edit(root, lambda data: data.update(skills=skills))
 
 
 def add_entry(root, entry_id, title, text, image=None, race=None, at=None, clip=None):

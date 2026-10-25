@@ -9,7 +9,8 @@ rotation maps pelvis local coordinates to world coordinates.
 import math
 import numpy as np
 import torch
-from .config import ARM_PERTURB_RADIANS, G1_COMMANDS, G1_GETUP_REWARD_WEIGHTS, G1_REWARD_WEIGHTS, backward_share
+from .config import (ARM_PERTURB_RADIANS, G1_COMMANDS, G1_GETUP_REWARD_WEIGHTS, G1_REWARD_WEIGHTS, GETUP_CRITIC_EXTRAS,
+                     GETUP_POSE_STD, backward_share)
 
 # Gait clock: each leg is in stance for the first 55% of its 0.8 s cycle, legs half a cycle apart.
 # Defaults of the task's `gait` setting; a stance share below 0.5 adds flight phases (running).
@@ -465,6 +466,225 @@ def lock_joints(action, locked):
     return action.masked_fill(locked, 0.)
 
 
+# task_config arm_targets (iteration 40, stage 3 "arms to targets"; the scout's FALCON / ULC scheme B, the critic's
+# lab-critic/it40 step0.py): the upper-body slot (UPPER_BODY_TERM) carries an arm command, flag 1 and the arm joints'
+# targets relative to home (offsets d: the waist and the locked wrists' entries 0), and the policy's arm action is a
+# residual on it: the arm PD target is clip(home + d + scale·clip(a, ±limit), joint range), home moved by d (pd_target
+# clips the action to the box, so the offset cannot ride on the action), and the observed last action is clip(a) +
+# d/scale, what an ONNX graph adding the slot's newest d/scale after its Clip outputs, as g1_ctrl's last_action. Each
+# training episode draws its mode from ARM_MODES: free arms (flag 0, the slot zeros: the old task, arm_perturb, arm_press
+# and posture as before), arms at home (flag 1, d = 0) or targets (flag 1, d from the generator below). Flag 1: the
+# arm_track term rewards the arms' tracking, posture leaves the arm joints out, arm_press is 0, no arm_perturb segment
+# runs (so self_contact counts the arms' contacts), and each hand carries a load (hand_load_mass, the load curve
+# load_curve_update). Resets with a command and set_command keep flag 0: evaluation is the old task.
+ARM_MODES = (.25, .15, .6)  # shares of training episodes: free arms, arms at home, arm targets
+ARM_FREE, ARM_HOME, ARM_TARGET = 0, 1, 2
+# Targets: each held ARM_HOLD_SECONDS (uniform), between them a quintic of T = max(ARM_MOVE_SECONDS, max|Δd| /
+# ARM_MOVE_SPEED) (ULC's quintic; its peak speed is 1.875·|Δd|/T, up to 2.8 rad/s). A new target is, with probability
+# ARM_CARRY_SHARE, a symmetric "carry in front" pose, else a pose of the free arm joints, each a row of its library
+# (scripts/lab/arm_pose_library.py, g1_velocity.ARM_POSES): the carry poses drawn per ARM_CARRY (the left arm's absolute
+# angles per joint part, uniform; the right arm its mirror by the joint axes, symmetry.model_joint_mirror), the others
+# uniform over the joint ranges, both kept only when no arm geom touches the body, the other arm or its own arm (the
+# hands' capsules included), in the pose and halfway from home. Unfiltered, the carry poses touched in 51 % (mostly hand
+# against hand: inward roll and yaw), the uniform ones in 70 %.
+ARM_HOLD_SECONDS = (1., 8.)
+ARM_MOVE_SECONDS = 1.
+ARM_MOVE_SPEED = 1.5  # rad/s
+ARM_CARRY_SHARE = .4
+ARM_CARRY = (('shoulder_pitch', -1.6, -.3), ('shoulder_roll', -.15, .15), ('shoulder_yaw', -.2, .2),
+             ('elbow', .6, 1.57), ('wrist_roll', -.3, .3))
+# arm_track reward weight: w·mean over the ten free arm joints (shoulders, elbows, wrist roll; the locked wrists out) of
+# exp(−e²/ARM_TRACK_STD²), e = q − (home + d) after the step (the critic: FALCON's exp(−Σe²/0.1) is flat at the start's
+# Σe² 0.18-1.4, a kernel per joint is not).
+ARM_TRACK_STD = .3
+# Hand loads (flag 1): a mass on each wrist_yaw_link at the palm, HAND_LOAD_POSITION in its frame (the middle of
+# Unitree's hand capsule, g1_velocity.HAND_CAPSULES), body_mass and body_ipos (and the ancestors' body_subtreemass,
+# which MuJoCo's and MJWarp's subtree COM divide by). Each episode draws a share u ~ U(0, 1) per hand; the load is u
+# times the curve's ceiling m_max, which LOAD_STEP moves after each rollout window: up while the flag-1 falls stay below
+# LOAD_RAISE_FALLS of the episodes and arm_track's mean at or above LOAD_RAISE_TRACK of its weight, down above
+# LOAD_LOWER_FALLS, within [0, LOAD_LIMIT] (kg).
+HAND_LOAD_BODIES = ('left_wrist_yaw_link', 'right_wrist_yaw_link')
+HAND_LOAD_POSITION = (.11, 0., 0.)
+LOAD_STEP, LOAD_LIMIT = .1, 2.
+LOAD_RAISE_FALLS, LOAD_LOWER_FALLS, LOAD_RAISE_TRACK = .01, .03, .6
+# The arm process (modes, targets, load shares) draws from a random stream of its own (CPU: numpy default_rng((seed,
+# ARM_TARGET_STREAM)); CUDA: a torch generator seeded seed + ARM_TARGET_STREAM), so the task's own stream, and with it a
+# flag-0 episode, is bit for bit the old one.
+ARM_TARGET_STREAM = 40_000_000
+# The arm columns (G1VelocityEnv.arm_columns: joint_pos_rel, joint_vel_rel and last_action of the arm joints, every
+# history frame) under arm_targets keep a fixed normalization, frozen as TERM_NORMALIZATION's: mean 0 (home, at rest, no
+# residual) and these variances per deploy term (angles 0.6², rad; speeds 2², rad/s; last actions 1.5², action units),
+# so a 1 rad arm pose reads 1.7σ, not the 5-9σ of the fossil statistics arm_blind froze (warm_start.unblind_arms).
+ARM_TARGET_VARIANCE = {4: .6 ** 2, 5: 2. ** 2, 6: 1.5 ** 2}
+
+
+def quintic(s):
+    """The quintic s³(10 − 15s + 6s²) of s clamped to [0, 1]: 0 → 1 with zero speed and acceleration at both ends."""
+    s = s.clamp(0., 1.)
+    return s ** 3 * (10 - 15 * s + 6 * s * s)
+
+
+def arm_hold_lengths(dt):
+    """Shortest and longest target hold in control steps (50 and 400 at dt 0.02), both drawn."""
+    return round(ARM_HOLD_SECONDS[0] / dt), round(ARM_HOLD_SECONDS[1] / dt)
+
+
+def arm_mode_draw(uniform, n):
+    """(n,) long episode modes (ARM_FREE, ARM_HOME, ARM_TARGET) in ARM_MODES' shares; one draw of n."""
+    u = uniform(n)
+    free, home = ARM_MODES[0], ARM_MODES[0] + ARM_MODES[1]
+    mode = torch.full((n,), ARM_TARGET, dtype=torch.long, device=u.device)
+    return torch.where(u < free, ARM_FREE, torch.where(u < home, ARM_HOME, mode))
+
+
+def arm_move_steps(start, end, joints, dt, seconds=None):
+    """(n,) long control steps of the quintic from offsets start to end (n, nu): T = max(ARM_MOVE_SECONDS, max over
+    `joints` of |end − start| / ARM_MOVE_SPEED), or `seconds` given (set_arm_targets), in whole steps, at least 1."""
+    if seconds is not None:
+        return torch.full((len(start),), max(1, round(seconds / dt)), dtype=torch.long, device=start.device)
+    delta = (end - start)[:, joints].abs().amax(dim=1)
+    return torch.round(delta.clamp(min=ARM_MOVE_SECONDS * ARM_MOVE_SPEED) / (ARM_MOVE_SPEED * dt)).long().clamp(min=1)
+
+
+def arm_pose_draw(uniform, n, poses, carry):
+    """(n, nu) offsets from home of fresh targets: with probability ARM_CARRY_SHARE a uniform row of carry ((C, nu)
+    offsets, the carry poses), else one of poses ((L, nu) offsets, the free poses); the same draw picks the row of
+    either. Two draws of n."""
+    pick, row = uniform(n), uniform(n)
+    carried = carry[(row * len(carry)).long().clamp(max=len(carry) - 1)]
+    free = poses[(row * len(poses)).long().clamp(max=len(poses) - 1)]
+    return torch.where((pick < ARM_CARRY_SHARE)[:, None], carried, free)
+
+
+def arm_segment_draw(uniform, start, poses, carry, joints, dt):
+    """A new target segment from offsets start (n, nu): (end, move, hold), end from arm_pose_draw, move its quintic's
+    steps (arm_move_steps over `joints`), hold uniform in arm_hold_lengths(dt); three draws of n."""
+    n = len(start)
+    end = arm_pose_draw(uniform, n, poses, carry).to(start.dtype)
+    return end, arm_move_steps(start, end, joints, dt), _whole(uniform, n, *arm_hold_lengths(dt))
+
+
+def arm_target_offset(start, end, clock, move):
+    """(n, nu) this control step's target offsets: start + quintic(clock / move)·(end − start), clock (n,) long steps
+    into the segment, move (n,) long its quintic's steps; end once the quintic is over (the hold)."""
+    s = clock.to(start.dtype) / move.to(start.dtype).clamp(min=1)
+    return start + quintic(s)[:, None] * (end - start)
+
+
+def arm_target_advance(state, live, uniform, poses, carry, joints, dt):
+    """One control step of the target process, after the step's reward: state = (start, end, clock, move, hold); clock
+    counts one step on; where live ((n,) bool: the targets mode, not set by hand) and the segment is over (clock ≥ move
+    + hold) a new one starts from its end at clock 0 (arm_segment_draw: always drawn, used where it starts)."""
+    start, end, clock, move, hold = state
+    clock = clock + 1
+    fresh, fresh_move, fresh_hold = arm_segment_draw(uniform, end, poses, carry, joints, dt)
+    new = live & (clock >= move + hold)
+    return (torch.where(new[:, None], end, start), torch.where(new[:, None], fresh, end), torch.where(new, 0, clock),
+            torch.where(new, fresh_move, move), torch.where(new, fresh_hold, hold))
+
+
+def upper_body_command(flag, offsets):
+    """(n, UPPER_BODY_SIZE) the slot's entries under task_config arm_targets: the flag (n,) as 0/1, then the offsets
+    (n, nu) of joints UPPER_BODY_FIRST.. (waist and arms, the waist and the locked wrists 0)."""
+    return torch.cat((flag.to(offsets.dtype)[:, None], offsets[:, UPPER_BODY_FIRST:]), dim=1)
+
+
+def observed_action(previous_action, offsets, scale, flag):
+    """The last action the observation shows under task_config arm_targets: clip(a) + d/scale where the flag (n,) is
+    set, the applied action itself where not (bit for bit; offsets (n, nu) the targets that step followed)."""
+    return torch.where(flag[:, None], previous_action + offsets.to(previous_action.dtype) / scale, previous_action)
+
+
+def arm_track(position, target, joints):
+    """(n,) mean over `joints` of exp(−(q − target)²/ARM_TRACK_STD²), the arm_track term before its weight: position
+    (n, nu) the angles after the step, target (n, nu) home + d of the step."""
+    return torch.exp(-(position - target)[:, joints].square() / ARM_TRACK_STD ** 2).mean(dim=1)
+
+
+def arm_error(position, target, joints):
+    """(n,) mean over `joints` of |q − target| (rad), for rollout/arm_error and the arm_error term."""
+    return (position - target)[:, joints].abs().mean(dim=1)
+
+
+# arm_error reward weight (iteration 43, the critic's lab-critic/it42b; working value 6): −w·arm_error (the mean |q −
+# (home + d)| over the ten free arm joints after the step, linear) with flag 1 while the targets hold (arm_holding), so
+# the quintic's unavoidable lag between two targets costs nothing. arm_track's kernel is flat in its tail: its pull back
+# is 2e/σ²·exp(−e²/σ²) per rad, 2.86 at e 0.21 but 0.24 at 0.6, and branch 42 (arm_track 6) learned the shoulder
+# pitch's gravity (sag +0.01 / +0.02 rad at 0 / 1 kg, stage 9282) while it spread its arms in roll by 0.3–0.6 rad
+# (carry and extended poses +0.57…+0.64), nearly for free; a linear term pulls as hard at 0.6 as at 0.1.
+def arm_holding(start, end, clock, move):
+    """(n,) bool: this control step's arm targets hold still, its segment's quintic over (clock ≥ move) or no move in
+    it (start = end: the arms at home, a target set at once); start, end (n, nu) offsets, clock, move (n,) steps."""
+    return (clock >= move) | (start == end).all(dim=1)
+
+
+def hand_load_mass(mass, ipos, load, position):
+    """(mass (n, 2), ipos (n, 2, 3)) of the two hand bodies carrying load (n, 2) kg each at position (3,) in their
+    frames: m0 + load and the mass-weighted COM (mass (2,), ipos (2, 3) the bodies' own); exactly theirs where the load
+    is 0. numpy or torch alike."""
+    xp = _module(load)
+    total = mass + load
+    com = (mass[..., None] * ipos + load[..., None] * _constant(position, load)) / total[..., None]
+    loaded = load > 0
+    return xp.where(loaded, total, mass), xp.where(loaded[..., None], com, ipos)
+
+
+def hand_subtree_mass(subtree, above, load):
+    """(n, nbody) body_subtreemass with the hand loads (n, 2): subtree (nbody,) the model's own, above (nbody, 2)
+    whether each hand body is in a body's subtree (1/0). numpy or torch alike."""
+    return subtree + load @ above.T
+
+
+def load_curve_update(level, steps, falls, track, episode_steps, raise_falls=LOAD_RAISE_FALLS,
+                      lower_falls=LOAD_LOWER_FALLS):
+    """The hand load ceiling m_max (kg) after a rollout window (or a block of them, task_config load_curve): steps, its
+    flag-1 world-steps; falls, flag-1 episodes ended by a fall in it; track, the mean unweighted arm_track over those
+    steps. The fall share is per episode of episode_steps (falls / (steps / episode_steps)): ended episodes alone would
+    be read by the batches of timeouts every episode length (worlds start together). LOAD_STEP down above lower_falls,
+    up below raise_falls with track at least LOAD_RAISE_TRACK, within [0, LOAD_LIMIT]; unchanged without flag-1 steps.
+    The default thresholds are LOAD_RAISE_FALLS and LOAD_LOWER_FALLS, the rule without load_curve."""
+    if not steps:
+        return level
+    share = falls * episode_steps / steps
+    if share > lower_falls:
+        level -= LOAD_STEP
+    elif share < raise_falls and track >= LOAD_RAISE_TRACK:
+        level += LOAD_STEP
+    return round(min(max(level, 0.), LOAD_LIMIT), 6)
+
+
+# task_config load_curve (iteration 40b; critic, lab-critic/it40b): the load curve decides once every `block` rollout
+# windows on their summed flag-1 counts, with its own thresholds. Per window (~74 flag-1 episodes) the old rule rose only
+# on 0 falls and fell from 3 (> 3 %), an equilibrium of ~2.1 % per episode, while flag 1 without a load already falls
+# ~2.4 % on the GPU: the ceiling stayed near 0 (a mean load of 0.07 kg per hand). With block 10 (~983 thousand steps,
+# ~737 flag-1 episodes) and 4 % / 6 % the decision rests on enough episodes to see a load's cost (training conditions on
+# the CPU: targets with 0.5 kg fall 6.7 %, with 1 kg 21 %).
+class LoadCurveBlock:
+    """The flag-1 counts of the rollout windows since the last decision (world-steps, falls, the sum of the unweighted
+    arm_track), and the decision once `block` windows are in (load_curve_update with the block's thresholds). Python
+    numbers, read once per window; not kept in a stage."""
+
+    def __init__(self, block, raise_falls, lower_falls):
+        self.block, self.raise_falls, self.lower_falls = int(block), float(raise_falls), float(lower_falls)
+        self.windows, self.steps, self.falls, self.track = 0, 0., 0., 0.
+
+    def add(self, steps, falls, track_sum):
+        """One window's flag-1 world-steps, falls and summed arm_track; True once the block is full."""
+        self.windows += 1
+        self.steps, self.falls, self.track = self.steps + steps, self.falls + falls, self.track + track_sum
+        return self.windows >= self.block
+
+    def decide(self, level, episode_steps):
+        """(the ceiling after the block, its fall share per episode of episode_steps or NaN without flag-1 steps); the
+        counts start again."""
+        steps, falls, track = self.steps, self.falls, self.track
+        self.windows, self.steps, self.falls, self.track = 0, 0., 0., 0.
+        share = falls * episode_steps / steps if steps else float('nan')
+        level = load_curve_update(level, steps, falls, track / steps if steps else float('nan'), episode_steps,
+                                  self.raise_falls, self.lower_falls)
+        return level, share
+
+
 # task_config force_push (domain randomisation, training only; iteration 20): pushes as a force on the pelvis, the way
 # the sim2sim push patch of unitree_mujoco gives them (scripts/sim2sim/patches/unitree_mujoco-push.patch): the
 # horizontal force M·Δv/T at the pelvis COM (M the robot's total mass, 35.112 kg on both G1 models, as in the patch),
@@ -608,12 +828,14 @@ def extra_terms(height_command=False, upper_body_slot=False):
         ((UPPER_BODY_TERM, UPPER_BODY_SIZE),) if upper_body_slot else ())
 
 
-def command_terms(height, upper_body_slot, like):
+def command_terms(height, upper_body_slot, like, upper_body=None):
     """The extra terms' frame entries, (n, k) in like's dtype and device: [c − BASE_HEIGHT] for height commands height
-    (n,) (None: no height term), then UPPER_BODY_SIZE zeros with upper_body_slot (always 0 in this contract)."""
+    (n,) (None: no height term), then with upper_body_slot the slot's UPPER_BODY_SIZE entries: upper_body (n,
+    UPPER_BODY_SIZE; task_config arm_targets' upper_body_command) or None, zeros (the reserved slot)."""
     parts = [] if height is None else [(height.to(like.dtype) - BASE_HEIGHT)[:, None]]
     if upper_body_slot:
-        parts.append(torch.zeros((len(like), UPPER_BODY_SIZE), dtype=like.dtype, device=like.device))
+        parts.append(torch.zeros((len(like), UPPER_BODY_SIZE), dtype=like.dtype, device=like.device)
+                     if upper_body is None else upper_body.to(like.dtype))
     return torch.cat(parts, dim=1) if parts else like[:, :0]
 
 
@@ -739,7 +961,8 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
                       heading_target=None, stance_fraction=STANCE_FRACTION, hip_joints=HIP_JOINTS, foot_speed=None,
                       foot_rotation=None, sole_height=None, sole_contact=None, yaw_drift_error=None,
                       requested_command=None, self_contact=None, arm_press=None, feet_flat_stance=False,
-                      height_command=None, stand_home=None):
+                      height_command=None, stand_home=None, arm_flag=None, arm_track=None, arm_posture_joints=None,
+                      arm_error=None, arm_hold=None):
     """foot_speed: (n, 2) horizontal speed of each foot over the control step (m/s), for the slip and clearance
     terms. foot_rotation: (n, 2, 3, 3) world <- body rotations of the FEET bodies, for the feet_flat term.
     sole_height: (n, 2) lowest sole point of each foot (m, see sole_height()), for the clearance term and for
@@ -758,8 +981,18 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
     height_command (task_config height_command): (n,) pelvis height commands c; the height term then measures h − c,
     the episode ends below fall_height(c) and the height_ceiling term charges a pelvis above a crouch command. None:
     BASE_HEIGHT, FALL_HEIGHT and no ceiling, the old expressions. stand_home: (n, joints) the leg pose of the
-    stand_pose term (stand_target of c); None: home."""
+    stand_pose term (stand_target of c); None: home.
+    arm_flag (task_config arm_targets): (n,) bool, the worlds whose arms follow the slot's targets (flag 1); there the
+    arm_track term counts arm_track ((n,), the unweighted tracking of the step, required with it), arm_press is 0 and
+    posture sums over arm_posture_joints (the posture joints without the arms). Flag 0 and None: those terms as before,
+    arm_track 0.
+    arm_error: (n,) the arms' mean |q − target| (arm_error()) and arm_hold (n,) bool, the worlds whose targets hold
+    (arm_holding), both with arm_flag, for the arm_error term, charged with flag 1 on a hold; None: the term is zero."""
     weights = G1_REWARD_WEIGHTS if weights is None else weights
+    if arm_flag is not None and (arm_track is None or arm_posture_joints is None):
+        raise ValueError('arm targets need the tracking term and the posture joints without the arms')
+    if arm_error is not None and (arm_flag is None or arm_hold is None):
+        raise ValueError('the arm_error term needs the arm flags and the holds')
     dtype = velocity.dtype
     if yaw_drift_error is not None and requested_command is None:
         raise ValueError('yaw_drift needs the requested command (before heading hold)')
@@ -846,8 +1079,18 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
         # (1.00 until the arm torque falls by ~75%), τ² saturates at the motor peak and the angle stays near home
         # while the body holds the arm; this error fell 13.3 → 7.7 → 3.4 → 0.7 rad² as a standing press eased.
         'arm_press': -weights['arm_press']*(torch.zeros_like(height) if arm_press is None
-                                            else arm_press.to(dtype)),
-        'posture': -weights['posture']*(position-home)[:, posture_joints].square().sum(dim=1),
+                                            else arm_press.to(dtype) if arm_flag is None
+                                            else torch.where(arm_flag, 0., arm_press.to(dtype))),
+        # Arms on the slot's targets (task_config arm_targets, flag 1): mean per-joint exp kernel of the tracking error.
+        'arm_track': weights['arm_track']*(torch.zeros_like(height) if arm_flag is None
+                                           else torch.where(arm_flag, arm_track.to(dtype), 0.)),
+        # The same arms' error, linear, while the targets hold (flag 1): arm_track's kernel hardly pulls beyond 0.5 rad.
+        'arm_error': -weights['arm_error']*(torch.zeros_like(height) if arm_error is None
+                                            else torch.where(arm_flag & arm_hold, arm_error.to(dtype), 0.)),
+        'posture': -weights['posture']*((position-home)[:, posture_joints].square().sum(dim=1) if arm_flag is None
+                                        else torch.where(arm_flag,
+                                                         (position-home)[:, arm_posture_joints].square().sum(dim=1),
+                                                         (position-home)[:, posture_joints].square().sum(dim=1))),
         'hips': -weights['hips']*(position-home)[:, hip_joints].square().sum(dim=1),
         'effort': -weights['effort']*torque.square().sum(dim=1),
         'action_change': -weights['action_change']*(action-previous_action).square().sum(dim=1),
@@ -872,8 +1115,8 @@ GETUP_UPRIGHT_PELVIS = .4
 # Standing (the bonus and its pose and stillness terms): head above GETUP_STAND_HEAD, torso tilt below GETUP_STAND_TILT,
 # pelvis above GETUP_STAND_PELVIS, both feet in contact (the lowest sole point below SOLE_CONTACT_HEIGHT).
 GETUP_STAND_HEAD, GETUP_STAND_TILT, GETUP_STAND_PELVIS = 1.15, math.radians(15.), .70
-# Pose term while standing: exp(−mean over the joints of (q − home)² / GETUP_POSE_STD²).
-GETUP_POSE_STD = .1
+# Pose term while standing: exp(−mean over the joints of (q − home)² / σ²), σ task_config stand_pose_std (iteration 36;
+# config.GETUP_POSE_STD 0.1 when missing, the original term).
 # Joint limit term: the leg joints (hip, knee, ankle) beyond GETUP_SOFT_LIMIT of their range, centred (the last 5 % at
 # each end, Unitree's soft_joint_pos_limit_factor 0.9; the knee's lower one is then 0.061, task_config knee_floor's),
 # linear in the excess (rad), as legged_gym's dof_pos_limits. Getting up uses the knee to 2.5-2.85 (stop 2.88) and the
@@ -887,6 +1130,15 @@ GETUP_ASSIST_GRAVITY, GETUP_ASSIST_HEAD, GETUP_ASSIST_SECONDS = -.8, 1., 2.
 # Success (evaluation, not the reward): up within GETUP_SUCCESS_WITHIN seconds (pelvis ≥ 0.70, head ≥ 1.20, tilt ≤ 15°,
 # both feet in contact), then GETUP_SUCCESS_HOLD seconds without leaving that pose (the feet may step).
 GETUP_SUCCESS_HEAD, GETUP_SUCCESS_WITHIN, GETUP_SUCCESS_HOLD = 1.20, 6., 3.
+# Episodes: 10 s (500 control steps, HoST's), ended early only by a non-finite state or a joint faster than
+# GETUP_MAX_JOINT_SPEED (rad/s); lying, sitting or fallen again is not an end, the time limit truncates.
+GETUP_EPISODE_SECONDS, GETUP_MAX_JOINT_SPEED = 10., 50.
+# Critic extras of g1_getup (config.GETUP_CRITIC_EXTRAS, 6), after the actor's 490 walking inputs: the walking ones
+# (pelvis linear velocity in its frame, pelvis height; critic_extras), then the head height and the world's assist force.
+# The command and gait phase terms of the walking layout (deploy_terms 2 and 3) read 0 in g1_getup (no command, the
+# phase stopped): their normalization is fixed at mean 0, variance 1 (G1GetupEnv.fixed_normalization), so a stray
+# command in deployment passes unscaled instead of being divided by a statistics' ~0 spread.
+GETUP_ZERO_TERMS = ((2, 3), (3, 2))  # (deploy term, size)
 
 
 def _module(value):
@@ -940,29 +1192,42 @@ def getup_success_pose(head, height, torso_rotation, sole_height=None):
 
 
 def getup_reward_components(head, height, torso_rotation, velocity, position, home, soft_low, soft_high, limit_joints,
-                            sole_height, torque, joint_velocity, action, previous_action, weights=None):
+                            sole_height, torque, joint_velocity, action, previous_action, weights=None, impact=None,
+                            stand_pose_std=GETUP_POSE_STD, sole_impact=None, stance_width=None):
     """The g1_getup reward terms, each (n,), and the standing state (getup_standing), (n,) bool.
     head: (n,) top of the head (head_height); height: (n,) pelvis height; torso_rotation: (n, 3, 3); velocity: (n, 6)
     pelvis object velocity as reward_components'; position, joint_velocity, torque: (n, joints) after the step (the
     torque the motors gave, ctrl); home, soft_low, soft_high: (joints,) (soft_limits of the joint ranges); limit_joints:
     the joints of the limit term (the legs); sole_height: (n, 2) lowest sole point per foot; action, previous_action:
-    (n, joints) this step's applied action and the one before. weights: config.G1_GETUP_REWARD_WEIGHTS' keys.
+    (n, joints) this step's applied action and the one before, or with task_config action_change_unbounded (iteration
+    37) the action before pd_bound (lock_joints of the box-clipped one) and its own one of the step before (zero at a
+    reset, as the applied one), so that a mean beyond pd_bound's clamp does not hide the policy's noise from the term.
+    weights: config.G1_GETUP_REWARD_WEIGHTS' keys.
+    impact: (n,) impact_penalty of this control step's floor contacts, for the impact term; None: the term is zero
+    (the environments compute it only while that weight is non-zero). stand_pose_std: σ of the pose term (rad, a
+    float; task_config stand_pose_std, GETUP_POSE_STD the original). sole_impact: (n,) impact_penalty of this control
+    step's sole sphere floor contacts per foot with threshold GETUP_SOLE_IMPACT_SPEED, for the sole_impact term
+    (iteration 44); None: the term is zero (computed only while that weight is non-zero). stance_width: (n,) W of
+    the function stance_width, for the stance_width term (after branch 46); None: the term is zero (likewise).
 
     head          w·clip((head − 0.15)/1.05, 0, 1)
     upright       w·(1 + cos tilt)/2·[pelvis > 0.4]
     stand         w·[standing]  (head > 1.15, tilt < 15°, pelvis > 0.70, both feet in contact)
-    stand_pose    w·[standing]·exp(−mean((q − home)²)/0.1²)
+    stand_pose    w·[standing]·exp(−mean((q − home)²)/σ²)  (σ stand_pose_std, 0.1 by default)
     stand_still   −w·[standing]·‖v‖²  (pelvis linear velocity, m²/s²)
     effort        −w·Στ²
     joint_speed   −w·Σq̇²
-    action_change −w·Σ(a − a_prev)²
-    joint_limits  −w·Σ over limit_joints of the excess beyond the soft limits (rad)"""
+    action_change −w·Σ(a − a_prev)²  (a applied, or before pd_bound with action_change_unbounded)
+    joint_limits  −w·Σ over limit_joints of the excess beyond the soft limits (rad)
+    impact        −w·Σ over the bodies of max(0, v − 1.5)²  (v: a body's floor approach speed, m/s; impact_penalty)
+    sole_impact   −w·Σ over the feet of max(0, v − 0.5)²  (v: a foot's sole floor approach speed, m/s)
+    stance_width  −w·[pelvis > 0.5, both feet in contact]·max(0, W − 0.30)  (W: the feet's width, m; stance_active)"""
     weights = G1_GETUP_REWARD_WEIGHTS if weights is None else weights
     xp = _module(head)
     standing = getup_standing(head, height, torso_rotation, sole_height)
     stand = _like(standing, head)
     upright = (1 + torso_rotation[:, 2, 2]) / 2 * _like(height > GETUP_UPRIGHT_PELVIS, head)
-    pose = xp.exp(-((position - home) ** 2).mean(-1) / GETUP_POSE_STD ** 2)
+    pose = xp.exp(-((position - home) ** 2).mean(-1) / stand_pose_std ** 2)
     joints = list(limit_joints)
     excess = (xp.clip(position[:, joints] - soft_high[joints], 0, None)
               + xp.clip(soft_low[joints] - position[:, joints], 0, None))
@@ -976,8 +1241,33 @@ def getup_reward_components(head, height, torso_rotation, velocity, position, ho
         'joint_speed': -weights['joint_speed'] * (joint_velocity ** 2).sum(-1),
         'action_change': -weights['action_change'] * ((action - previous_action) ** 2).sum(-1),
         'joint_limits': -weights['joint_limits'] * excess.sum(-1),
+        'impact': -weights['impact'] * (xp.zeros_like(head) if impact is None else _like(impact, head)),
+        'sole_impact': -weights['sole_impact'] * (xp.zeros_like(head) if sole_impact is None
+                                                  else _like(sole_impact, head)),
+        'stance_width': -weights['stance_width'] * (
+            xp.zeros_like(head) if stance_width is None else _like(stance_active(height, sole_height), head)
+            * xp.clip(_like(stance_width, head) - GETUP_STANCE_WIDTH, 0, None)),
     }
     return components, standing
+
+
+def getup_critic_extras(velocity, height, head, force):
+    """(n, GETUP_CRITIC_EXTRAS) critic-only inputs of g1_getup: pelvis linear velocity (velocity (n, 6) as
+    reward_components', its last three), pelvis height (n,), head height (n,), assist force (n,)."""
+    parts = (velocity[:, 3:6], height[:, None], head[:, None], force[:, None])
+    if isinstance(velocity, torch.Tensor):
+        extras = torch.cat([part.to(velocity.dtype) for part in parts], dim=1)
+    else:
+        extras = np.concatenate([np.asarray(part, dtype=velocity.dtype) for part in parts], axis=1)
+    assert extras.shape[1] == GETUP_CRITIC_EXTRAS
+    return extras
+
+
+def zero_term_columns(joints, history, extra=()):
+    """Positions in the history observation of GETUP_ZERO_TERMS' entries (the command and the gait phase), every frame;
+    extra as deploy_terms."""
+    return [position for term, size in GETUP_ZERO_TERMS
+            for position in joint_positions(joints, history, extra, (term,), range(size))]
 
 
 def assist_force(rotation, force):
@@ -997,10 +1287,164 @@ def assist_update(force, head_mean):
 
 def assist_resample(forces, n):
     """(n,) assist forces for n worlds from saved ones (a stage's training_state): as they are for as many worlds, else
-    their sorted values at evenly spread quantiles, so the distribution carries over to another number of worlds."""
+    their sorted values at evenly spread quantiles, so the distribution carries over to another number of worlds. The
+    same for task_config pd_bound's per-world bounds c (both fall with the worlds' episodes up, so sorted alike they
+    stay paired)."""
     if len(forces) == n:
         return forces
     index = ((np.arange(n) + .5) * len(forces) / n).astype(np.int64)
     if isinstance(forces, torch.Tensor):
         return torch.sort(forces).values[torch.as_tensor(index, device=forces.device)]
     return np.sort(forces)[index]
+
+
+# task_config pd_bound (g1_getup, iteration 34; HoST's β, where the PD target is the current angle + β·action; the
+# critic's lab-critic/it34): a hard bound on the PD error. Each motor target (but the locked wrists') stays within
+# e = c·y1/kp of the joint angle the policy observed, the newest frame's joint_pos_rel (on CUDA with its sensor noise
+# and encoder bias), so the active torque kp·|target − q| is at most c times the motor's peak y1 (g1_velocity.MOTORS),
+# and through kd a speed limit follows. Why: root 2 (exp-4baf085b246b4a35) gets up with a jump from the knees: joints
+# past 25 rad/s (g1_ctrl's GetUp goes Passive there) in 20-52 of 56 starts, arm and thigh hits of ~1 kN, full torque
+# 20 ms after the start. The rule applied at inference on its stage 140 at c = 0.8: up 51 / 44 / 37 of 56 (ours /
+# 20 ms delay / feet 0.3) and joints past 25 rad/s in 5 / 3 / 11 instead of 20 / 21 / 17. A curriculum per world: c
+# starts at the setting's first number and goes PD_BOUND_STEP down at a reset by assist_update's rule (the head above
+# 1 m over the last 2 s of the episode), to its second (pd_bound_update); stages keep the worlds' c, evaluation and
+# export use the lowest. The bounded action goes everywhere the applied one does, the action_change term included,
+# unless task_config action_change_unbounded (iteration 37; config.py) gives that term the action before the bound.
+PD_BOUND_STEP = .02
+JOINT_POSITION_TERM = 4  # deploy_terms' joint_pos_rel
+
+
+def newest_frame_columns(joints, history, extra=(), term=JOINT_POSITION_TERM):
+    """Positions in the history observation of the newest frame's entries of deploy term `term` (deploy_terms' number,
+    joint_pos_rel by default), in entry order; extra as deploy_terms. pd_bound's observed angles (relative to home)."""
+    start, end = deploy_terms(joints, extra)[term]
+    return history_index(joints, history, extra)[history - 1][start:end]
+
+
+def pd_bound(action, position, fraction, peak, kp, scale, free):
+    """The applied action under task_config pd_bound: on the free joints the action clamped so that its PD target
+    home + scale·a lies within e = fraction·peak/kp of the observed angle home + position,
+    a′ = min(max(a, (position − e)/scale), (position + e)/scale); the other joints as they are.
+    action, position: (n, joints), the action after the box clip and the newest observed joint_pos_rel; fraction: (n,)
+    each world's c; peak (the motor model's y1), kp, scale: (joints,); free: (joints,) bool, every joint but the locked
+    wrists (lock_joints zeroes them after this). Every free joint's range lies inside its action box, so a′ stays within
+    the box. pd_target then clips the target to the joint ranges and the knee floor as before. numpy or torch alike."""
+    xp = _module(action)
+    error = fraction[:, None] * (peak / kp)
+    low, high = (position - error) / scale, (position + error) / scale
+    return xp.where(free, xp.minimum(xp.maximum(action, low), high), action)
+
+
+def pd_bound_update(fraction, head_mean, lowest):
+    """(n,) PD error bounds c after a reset (task_config pd_bound's curriculum): PD_BOUND_STEP lower where the mean head
+    height over the last GETUP_ASSIST_SECONDS of the episode (head_mean (n,); NaN: the episode was shorter) was above
+    GETUP_ASSIST_HEAD, as assist_update steps the assist down; never below `lowest`, and `lowest` itself from within
+    half a step of it (float steps from 1.0 do not land on 0.6 exactly)."""
+    xp = _module(fraction)
+    stepped = fraction - PD_BOUND_STEP
+    stepped = xp.where(stepped < lowest + PD_BOUND_STEP / 2, xp.full_like(stepped, lowest), stepped)
+    return xp.where(head_mean > GETUP_ASSIST_HEAD, stepped, fraction)
+
+
+# impact reward weight (g1_getup, iteration 35; the critic's lab-critic/it35, impact35.py): a charge on the speed at
+# which a body other than the feet hits the floor. Branch 34 (exp-15f0753be2ea4aa4, pd_bound) gets up well, but its
+# hands slap the floor at 2.7-5 m/s (73-100 touches above 2 m/s in 56 get-ups) with only 170-220 N at the peak, which a
+# force threshold does not see (a soft contact of 1-2 substeps), and the locked wrists, swung passively to 29-33 rad/s,
+# hit their stops. Its thighs land at 1.1-1.2 m/s, as in the fall itself, and stay uncharged below GETUP_IMPACT_SPEED.
+# Per body: the largest approach speed of its floor contacts over the control step's physics substeps (any geom but the
+# sole spheres; the feet land on those), each read after its substep from the state the substep started with, so the
+# speed before the hit: v = −n·(lin + ang × (p − c)), from the body's cvel ([ang, lin] about c, the subtree_com of its
+# root), the contact point p and the normal n turned to point from the floor to the robot.
+GETUP_IMPACT_SPEED = 1.5  # m/s
+
+
+def _cross(a, b):
+    return torch.linalg.cross(a, b, dim=-1) if isinstance(a, torch.Tensor) else np.cross(a, b)
+
+
+def impact_contacts(geom, floor, impact_geoms):
+    """Which contacts the impact term reads: (k,) bool for k contacts with geom ids `geom` (k, 2), those between the
+    floor (geom id `floor`) and a geom where impact_geoms ((ngeom,) bool: the robot's but the sole spheres; for
+    sole_impact the sole spheres, for both terms at once their union) holds; (k,) the other geom of each contact (the
+    robot's for those; any otherwise); (k,) +1 where the floor is the contact's first geom, −1 where it is the second
+    (the contact normal points from the first to the second). numpy (the CPU task's data.contact) or torch (the CUDA
+    task's contact slots) alike."""
+    xp = _module(geom)
+    first = geom[:, 0] == floor
+    other = xp.where(first, geom[:, 1], geom[:, 0])
+    selected = (first | (geom[:, 1] == floor)) & impact_geoms[other]
+    return selected, other, xp.where(first, 1, -1)
+
+
+def approach_speed(normal, sign, position, velocity, com):
+    """(k,) speed (m/s, positive closing) at which each contact's point on the robot body approaches the floor:
+    −sign·n·(lin + ang × (p − c)). normal: (k, 3) the contact normal (contact frame's first row, from its first geom to
+    its second); sign: impact_contacts' (+1: the floor first); position: (k, 3) contact point p; velocity: (k, 6) the
+    robot body's cvel (rotation then translation, about c, world axes); com: (k, 3) c, the subtree_com of the body's
+    root. The point velocity is the one mj_jac at p gives (impact35.py's)."""
+    point = velocity[:, 3:6] + _cross(velocity[:, 0:3], position - com)
+    return -_like(sign, normal) * (normal * point).sum(-1)
+
+
+def impact_penalty(speed, threshold=GETUP_IMPACT_SPEED):
+    """(n,) Σ over the bodies of max(0, v − threshold)², the impact term without its weight: speed (n, bodies) each
+    body's largest approach speed over the control step's substeps (0 without a floor contact). The sole_impact term
+    is the same over the two feet with threshold GETUP_SOLE_IMPACT_SPEED."""
+    xp = _module(speed)
+    return (xp.clip(speed - threshold, 0, None) ** 2).sum(-1)
+
+
+def impact_hit(speed, threshold=GETUP_IMPACT_SPEED):
+    """(n,) bool, whether any body approached the floor faster than threshold (speed as impact_penalty's): the
+    world-steps rollout/impact_hit (rollout/sole_impact_hit with GETUP_SOLE_IMPACT_SPEED) counts."""
+    return (speed > threshold).any(-1)
+
+
+# sole_impact reward weight (g1_getup, iteration 44; the critic's lab-critic/it44g, rise44.py, noise44.py,
+# dither44.py): impact's charge on the sole spheres, the contacts impact leaves out, with its own threshold. Candidate
+# 823 (exp-f19f12fb1eff4ef3) gets up with a jump: no floor contact for 40 ms or more in 18 of 20 rises, the feet touch
+# down at 2.3 m/s (median) with up to 904 N on one foot (the robot weighs 344 N), and they land 0.60 m apart, where
+# static friction then holds them (0.45 m after 1-4 s against candidate 8's 0.27) though the hips pull inwards with
+# 15-16 N·m. Per foot: the largest approach speed of its sole spheres' floor contacts over the control step's physics
+# substeps (approach_speed, as impact's), −w·Σ over the two feet of max(0, v − GETUP_SOLE_IMPACT_SPEED)²
+# (impact_penalty with that threshold). A foot set down at up to 0.5 m/s costs nothing.
+GETUP_SOLE_IMPACT_SPEED = .5  # m/s
+# rollout/flight (full GPU, while sole_impact is weighted) and scripts/lab/probes/getup_stance.py: an airborne stretch,
+# no robot-floor contact at all, counts as a flight from this long on (the critic's rise44.py).
+GETUP_FLIGHT_SECONDS = .04
+
+
+# stance_width reward weight (g1_getup, after branch 46; the critic's lab-critic/it44g, width44.py): a charge on a wide
+# stance. Branch 46 (exp-e9a0735be3e0418a, sole_impact 1) lands softer (the largest sole force 904 → 493 N), yet its
+# feet still stand ~0.43 m apart after getting up (candidate 8 0.27). −w·[on the feet]·max(0, W − GETUP_STANCE_WIDTH),
+# W the left − right foot (ankle_roll origins) across the pelvis heading (stance_width; getup_stance.py's width), on
+# the feet: the pelvis above GETUP_STANCE_PELVIS and both soles below SOLE_CONTACT_HEIGHT, with nothing asked of the
+# head or the tilt, so the landing counts too (stance_active).
+GETUP_STANCE_WIDTH = .30  # m
+GETUP_STANCE_PELVIS = .5  # m
+# The pelvis heading of stance_width is the yaw of its x axis while that axis's horizontal length is at least this;
+# below it (the pelvis pitched past 84°: lying on the back or the front) the yaw of its y axis turned −90° about z,
+# whose horizontal length is then at least √(1 − 0.1²). The x axis's yaw there comes from two near-zero numbers, and
+# float32 (CUDA) and float64 (CPU) gave opposite widths for the same lying world.
+GETUP_STANCE_HEADING = .1
+
+
+def stance_width(feet_position, pelvis_rotation):
+    """(n,) W, the left − right foot across the pelvis heading (m; positive with the left foot on the left):
+    feet_position (n, 2, 3) world positions of the ankle_roll origins (FEET order), pelvis_rotation (n, 3, 3) world <-
+    pelvis, whose heading is the yaw of its x axis (getup_stance.py's), or of its y axis turned −90° where the x axis
+    is within GETUP_STANCE_HEADING of vertical. numpy or torch alike."""
+    xp = _module(feet_position)
+    forward_x, forward_y = pelvis_rotation[:, 0, 0], pelvis_rotation[:, 1, 0]
+    steep = forward_x ** 2 + forward_y ** 2 < GETUP_STANCE_HEADING ** 2
+    forward_x = xp.where(steep, pelvis_rotation[:, 1, 1], forward_x)  # the y axis (R01, R11) turned −90°
+    forward_y = xp.where(steep, -pelvis_rotation[:, 0, 1], forward_y)
+    yaw = xp.arctan2(forward_y, forward_x)
+    apart = feet_position[:, 0, :2] - feet_position[:, 1, :2]
+    return -xp.sin(yaw) * apart[:, 0] + xp.cos(yaw) * apart[:, 1]
+
+
+def stance_active(height, sole_height):
+    """(n,) bool, where the stance_width term counts: the pelvis (height (n,)) above GETUP_STANCE_PELVIS and both soles
+    (sole_height (n, 2)) below SOLE_CONTACT_HEIGHT."""
+    return (height > GETUP_STANCE_PELVIS) & (sole_height < SOLE_CONTACT_HEIGHT).all(-1)

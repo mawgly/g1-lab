@@ -40,6 +40,29 @@ action below the floor. So knee_floor adds nothing to the graph.
 
 The check runs the stage's CPU environment (stand, 0.5 and 1 m/s, turns) and compares onnxruntime with
 policy.predict on the same observations, and g1_ctrl's motor target from deploy.yaml with the environment's PD target.
+
+A g1_getup stage (getting up after a fall, iteration 33) goes out through the same connector, 490 -> 29: its robot and
+observation layout are the walking candidates' (config.G1_GETUP_PROFILE), so the graph is built as above with that
+profile's settings, for g1_ctrl's GetUp state (scripts/sim2sim/patches/g1_ctrl-getup.patch: its own policy_dir). It
+has no velocity command: deploy.yaml's command ranges are [0, 0], so g1_ctrl's velocity_commands reads 0 whatever the
+stick does and the gait phase stays stopped, as in training; the ONNX properties (task_id, getup) and a deploy.yaml
+comment say what it is. Its check samples observations lying, from the start bank's held-out rows, and also checks
+the zero ranges. Stand trim, symmetrisation and narrowed command ranges are walking options and are refused. With
+task_config pd_bound (iteration 34) the graph bounds the action after the ±action_limit clip, before the wrist zeros,
+exactly as the environment (g1_tensor_math.pd_bound: Max / Min against (jp ∓ e)/scale, jp the newest frame's
+joint_pos_rel columns of the raw input, e = c·y1/kp at the setting's lowest c), so g1_ctrl needs nothing; the export is
+refused until every world of the stage (training_state) is down at that c. The ONNX properties and a deploy.yaml
+comment give c and e.
+
+task_config arm_targets (iteration 40): the arm actions are a residual on the upper-body slot's arm targets, so the
+graph ends by adding the newest frame's slot offsets d over the action scale to the outputs of joints 12-28 (after the
+clip and the wrist zeros; the waist's and the locked wrists' d are 0): g1_ctrl's target scale·(clip(a) + d/scale) +
+offset is the environment's home + d + scale·clip(a), and its last_action, the ONNX output, the environment's observed
+last action. With flag 0 the slot is zeros and the graph acts as before. In deploy.yaml the slot term is arm_command
+(scripts/sim2sim/patches/g1_ctrl-arms.patch): NAMED_ARM_POSES with their joystick keys, the quintic's speed and shortest
+time; the patch moves d to a pose when its keys are pressed, back home on ARM_RELEASE, then flag 0. The check takes half
+of each command's observations under arm targets drawn from the stage's pose libraries; ExportedPolicy gives the
+environment the residual back (the graph's output less d/scale).
 """
 import argparse
 import copy
@@ -70,6 +93,31 @@ TRIM_SEEDS = (73000, 73001, 73002)
 TRIM_WINDOW = (100, 300)
 TRIM_LIMIT = .052
 TRIM_FILE = 'stand_trim.json'
+# g1_getup (iteration 33): its command ranges (none: g1_ctrl's velocity_commands clamps the stick into [0, 0]) and the
+# start classes its check takes lying observations from (the start bank's held-out rows).
+GETUP_TASK = 'g1_getup'
+ZERO_RANGES = {'lin_vel_x': [0., 0.], 'lin_vel_y': [0., 0.], 'ang_vel_z': [0., 0.]}
+GETUP_CHECK_CLASSES = ('back', 'front', 'side', 'fall', 'sit')
+# task_config arm_targets: the slot's term name in deploy.yaml (registered by scripts/sim2sim/patches/g1_ctrl-arms.patch;
+# g1_ctrl-height.patch's upper_body_command stays the zeros of the other exports) and the arm poses g1_ctrl offers: name,
+# joystick keys (unitree_joystick_dsl expressions, held: the patch takes their rising edge at the policy's 50 Hz; LB is
+# free in Velocity, whose transitions are LT + B and RB + A; the right stick is the height), and the left arm's absolute
+# angles per joint part (the rest at home, the right arm its mirror by the joint axes). 'home' is flag 1 with d 0 (the
+# training's arms-at-home mode), the carry poses lie within task.ARM_CARRY, 'arms_side' is a free pose; none touches
+# the body, nor halfway from home (tests/test_g1_arm_targets.py, the pose libraries' rule). ARM_RELEASE moves the arms
+# home, then the term reads zeros (flag 0, free arms). ARM_CHECK_HOLD: control steps between check() targets.
+ARM_COMMAND_TERM = 'arm_command'
+NAMED_ARM_POSES = (
+    ('home', 'LB + Y', {}),
+    ('carry_low', 'LB + down', dict(shoulder_pitch=-.5, shoulder_roll=0., shoulder_yaw=0., elbow=1.3, wrist_roll=0.)),
+    ('carry_mid', 'LB + left', dict(shoulder_pitch=-.9, shoulder_roll=0., shoulder_yaw=0., elbow=1.45, wrist_roll=0.)),
+    # The critic's step-0 pose but the roll: at roll 0 the bent forearms point inward and the hands overlap by 7 cm.
+    ('extended', 'LB + up', dict(shoulder_pitch=-1.57, shoulder_roll=.15, shoulder_yaw=0., elbow=1.57, wrist_roll=0.)),
+    ('carry_wide', 'LB + right', dict(shoulder_pitch=-.9, shoulder_roll=.15, shoulder_yaw=0., elbow=1.2, wrist_roll=0.)),
+    ('arms_side', 'LB + X', dict(shoulder_pitch=0., shoulder_roll=1.2, shoulder_yaw=0., elbow=.4, wrist_roll=0.)),
+)
+ARM_RELEASE = 'LB + B'
+ARM_CHECK_HOLD = 60
 
 
 class DeployedPolicy(torch.nn.Module):
@@ -77,16 +125,28 @@ class DeployedPolicy(torch.nn.Module):
     bool, the joints whose output is 0 after the clip (lock_wrists), or None (no such step in the graph).
     trim: (actions,) stand trim b in action units, subtracted (then clipped to the box again) while the norm of
     obs[command[0]:command[1]], the newest frame's command, is below task.PHASE_STOP_NORM; mirror: (obs index, obs
-    sign, action index, action sign) of symmetry.Mirror over the actor inputs, for ½(π(o) + M_a·π(M_o·o)). None:
-    no such step in the graph."""
+    sign, action index, action sign) of symmetry.Mirror over the actor inputs, for ½(π(o) + M_a·π(M_o·o)); bound:
+    ((start, end) of the newest joint_pos_rel in the input, c, peak, kp, scale, free) of task_config pd_bound, the
+    action bounded around those angles after the clip (task.pd_bound), before the wrist zeros; arm: ((start, end) of the
+    newest slot frame's offsets d in the input, the first joint they belong to, the action scale of those joints) of
+    task_config arm_targets, d/scale added to those outputs last. None: no such step in the graph."""
 
-    def __init__(self, mean, std, clip_obs, actor, action_limit, locked=None, trim=None, command=None, mirror=None):
+    def __init__(self, mean, std, clip_obs, actor, action_limit, locked=None, trim=None, command=None, mirror=None,
+                 bound=None, arm=None):
         super().__init__()
+        self.arm_inputs = None if arm is None else (int(arm[0][0]), int(arm[0][1]))
+        self.arm_first = None if arm is None else int(arm[1])
+        self.register_buffer('arm_scale', None if arm is None else torch.as_tensor(arm[2], dtype=torch.float32))
         self.register_buffer('mean', torch.as_tensor(mean, dtype=torch.float32))
         self.register_buffer('std', torch.as_tensor(std, dtype=torch.float32))
         self.clip_obs, self.action_limit = float(clip_obs), float(action_limit)
         self.actor = actor
         self.register_buffer('locked', None if locked is None else torch.as_tensor(locked, dtype=torch.bool))
+        self.bound_inputs = None if bound is None else (int(bound[0][0]), int(bound[0][1]))
+        for name, dtype, value in zip(('bound_fraction', 'bound_peak', 'bound_kp', 'bound_scale', 'bound_free'),
+                                      (torch.float32,) * 4 + (torch.bool,),
+                                      (None,) * 5 if bound is None else ([bound[1]], *bound[2:])):
+            self.register_buffer(name, None if value is None else torch.as_tensor(value, dtype=dtype))
         if (trim is None) != (command is None):
             raise ValueError('Подстройке стоя нужны и b, и положение команды во входе')
         self.register_buffer('trim', None if trim is None else torch.as_tensor(trim, dtype=torch.float32))
@@ -105,6 +165,9 @@ class DeployedPolicy(torch.nn.Module):
         if self.mirror_obs is not None:  # symmetric: the mean with the mirrored action for the mirrored observation
             mirrored = self.policy_action(obs[:, self.mirror_obs] * self.mirror_obs_sign)
             action = .5 * (action + mirrored[:, self.mirror_action] * self.mirror_action_sign)
+        if self.bound_fraction is not None:  # pd_bound: around the newest observed angles, as the environment
+            action = task.pd_bound(action, obs[:, self.bound_inputs[0]:self.bound_inputs[1]], self.bound_fraction,
+                                   self.bound_peak, self.bound_kp, self.bound_scale, self.bound_free)
         if self.locked is not None:
             action = task.lock_joints(action, self.locked)
         if self.trim is not None:  # the norm as phase_stop's (and g1_ctrl's gait_phase) reads it
@@ -112,12 +175,18 @@ class DeployedPolicy(torch.nn.Module):
             standing = torch.sqrt((command * command).sum(dim=1, keepdim=True)) < task.PHASE_STOP_NORM
             action = torch.where(standing, torch.clamp(action - self.trim, -self.action_limit, self.action_limit),
                                  action)
+        if self.arm_inputs is not None:  # arm_targets: the residual on the slot's targets, as g1_ctrl's last_action
+            offsets = obs[:, self.arm_inputs[0]:self.arm_inputs[1]] / self.arm_scale
+            action = torch.cat((action[:, :self.arm_first], action[:, self.arm_first:] + offsets), dim=1)
         return action
 
 
 def applied_action(action, config, raw):
     """The action the environment `raw` applies after its clip, for a (actions,) clipped policy output: with
-    lock_wrists, the wrist pitch and yaw entries at 0 (g1_tensor_math.lock_joints, as the environment)."""
+    lock_wrists, the wrist pitch and yaw entries at 0 (g1_tensor_math.lock_joints, as the environment); with a g1_getup
+    stage's pd_bound, raw's own applied action (bounded around its observed angles at its c, then the wrists)."""
+    if config.get('pd_bound') is not None:
+        return raw.applied_action(action)
     if not config.get('lock_wrists'):
         return action
     return task.lock_joints(torch.from_numpy(np.asarray(action))[None], raw.wrist_mask)[0].numpy()
@@ -200,7 +269,8 @@ def stand_trim(stage_dir, seeds=TRIM_SEEDS, window=TRIM_WINDOW, limit_rad=TRIM_L
                       b_rad=(trim * scale).tolist(), unclipped=half.tolist(), clipped_joints=clipped)
 
 
-def deployed_policy(model, norm, actor_inputs, action_limit, locked=None, trim=None, command=None, mirror=None):
+def deployed_policy(model, norm, actor_inputs, action_limit, locked=None, trim=None, command=None, mirror=None,
+                    bound=None, arm=None):
     policy = model.policy
     if not isinstance(policy.action_dist, DiagGaussianDistribution) or policy.squash_output:
         raise ValueError('Ожидалась политика PPO с гауссовым распределением без сжатия')
@@ -223,7 +293,7 @@ def deployed_policy(model, norm, actor_inputs, action_limit, locked=None, trim=N
     rms = norm.obs_rms
     std = np.sqrt(rms.var[:actor_inputs] + norm.epsilon)
     return DeployedPolicy(rms.mean[:actor_inputs], std, norm.clip_obs, torch.nn.Sequential(*layers),
-                          action_limit, locked, trim, command, mirror).eval()
+                          action_limit, locked, trim, command, mirror, bound, arm).eval()
 
 
 def write_onnx(module, path, actor_inputs, actions, properties):
@@ -246,10 +316,48 @@ def write_onnx(module, path, actor_inputs, actions, properties):
     onnx.save(graph, str(path))
 
 
+def export_config(stage, identity):
+    """The settings the graph and deploy.yaml follow, as a walking task_config: a g1_velocity stage's own; for a
+    g1_getup stage its fixed robot and connector (config.G1_GETUP_PROFILE, spelled out by g1_config) with getup true
+    (no command: command_ranges gives ZERO_RANGES) and the stage's own pd_bound."""
+    if identity['task_id'] == GETUP_TASK:
+        from .tasks.config import G1_GETUP_PROFILE, g1_config
+        return {**g1_config(G1_GETUP_PROFILE), 'getup': True, 'pd_bound': stage_task_config(stage)['pd_bound']}
+    return stage_task_config(stage)
+
+
+# pd_bound export: the stage's worlds count as down at the lowest c within this (float32 steps of the CUDA task).
+PD_BOUND_TOLERANCE = 1e-6
+
+
+def pd_bound_inputs(raw, config, metadata):
+    """The graph's pd_bound step for a g1_getup stage with the setting (DeployedPolicy's bound: the newest
+    joint_pos_rel's [start, end) in the actor's input, the lowest c, the motors' peaks, kp, scale and the free joints),
+    or None without it. Refused (ValueError) unless every world of the stage's training_state is down at that c: the
+    graph applies it, the policy may not have learned under it yet."""
+    if config.get('pd_bound') is None:
+        return None
+    lowest = config['pd_bound'][1]
+    saved = np.asarray(((metadata.get('training_state') or {}).get('pd_bound')) or [], dtype=float)
+    down = int((saved <= lowest + PD_BOUND_TOLERANCE).sum())
+    if not len(saved) or down < len(saved):
+        raise ValueError(f'Граница ошибки ПД (pd_bound) этапа ещё не дошла до минимума {lowest:g}: дошли {down} '
+                         f'миров из {len(saved)}. Выгружайте этап, где дошли все')
+    positions = task.newest_frame_columns(raw.model.nu, config['history'], raw.extra_sizes)
+    if positions != list(range(positions[0], positions[0] + len(positions))):
+        raise ValueError('Углы суставов во входе актёра лежат не подряд')
+    return ((positions[0], positions[-1] + 1), lowest, raw.peak, raw.kp, raw.scale, raw.bound_free)
+
+
 def command_ranges(config, narrowed=None):
     """deploy.yaml's commands.base_velocity.ranges (lin_vel_x, lin_vel_y, ang_vel_z; g1_ctrl clamps the stick to
     them): the stage's training ranges, or narrowed = (x_min, x_max, y, yaw) for [x_min, x_max], ±y, ±yaw, each
-    within the training range and with 0 inside (a centred stick must still mean stand)."""
+    within the training range and with 0 inside (a centred stick must still mean stand). A g1_getup stage
+    (export_config's getup) has no command: [0, 0] each, nothing to narrow."""
+    if config.get('getup'):
+        if narrowed is not None:
+            raise ValueError('У политики вставания нет команд движения: сужать нечего')
+        return {name: list(pair) for name, pair in ZERO_RANGES.items()}
     commands = config['commands']
     training = {'lin_vel_x': [commands['min_speed'], commands['max_speed']],
                 'lin_vel_y': [-commands['lateral_speed'], commands['lateral_speed']],
@@ -277,11 +385,15 @@ def deploy_config(raw, config, narrowed=None):
     if not (raw.model.jnt_limited[raw.joints].all() and (ranges[:, 0] < ranges[:, 1]).all()):
         raise ValueError('У суставов модели нет пределов для clip')
     sizes = [end - start for start, end in task.deploy_terms(nu, raw.extra_sizes)]
-    names = (*TERMS, *(name for name, _ in raw.extra_terms))
+    # arm_targets: the slot is g1_ctrl-arms.patch's arm_command (the poses), not g1_ctrl-height.patch's zeros
+    slot = ARM_COMMAND_TERM if config.get('arm_targets') else task.UPPER_BODY_TERM
+    names = (*TERMS, *(slot if name == task.UPPER_BODY_TERM else name for name, _ in raw.extra_terms))
     params = {'velocity_commands': {'command_name': 'base_velocity'},
               'gait_phase': {'period': float(config['gait']['period'])}}
     if config.get('height_command'):  # g1_ctrl-height.patch: c from the right stick (height_params)
         params[task.HEIGHT_TERM] = height_params(config)
+    if config.get('arm_targets'):
+        params[ARM_COMMAND_TERM] = arm_command_params(raw)
     return {
         'joint_ids_map': list(range(nu)),  # the model's actuators are in the SDK order, as controller.json
         'step_dt': float(raw.dt),
@@ -311,6 +423,59 @@ def height_params(config):
             'walking_norm': float(task.PHASE_STOP_NORM)}
 
 
+def arm_command_inputs(raw):
+    """[start, end) of the newest frame's slot offsets d (the upper-body slot without its flag: joints
+    UPPER_BODY_FIRST.., task_config arm_targets) in the actor's input of the environment `raw`."""
+    positions = task.term_positions(raw.model.nu, raw.history, raw.extra_terms, task.UPPER_BODY_TERM)
+    newest = positions[-task.UPPER_BODY_SIZE + 1:]
+    if newest != list(range(newest[0], newest[0] + len(newest))):
+        raise ValueError('Цели рук во входе актёра лежат не подряд')
+    return newest[0], newest[-1] + 1
+
+
+def named_arm_poses(raw):
+    """NAMED_ARM_POSES as [(name, keys, q)]: q (nu,) absolute joint angles, home but the arm joints the pose names (the
+    left arm's parts, the right arm its mirror by symmetry.model_joint_mirror). Refused outside a joint's range."""
+    from .symmetry import model_joint_mirror
+    names = [raw.model.joint(j).name for j in raw.joints]
+    permutation, signs = model_joint_mirror(raw.model, raw.joints, raw.qadr, raw.home)
+    low, high = raw.model.jnt_range[raw.joints].T
+    out = []
+    for name, keys, parts in NAMED_ARM_POSES:
+        q = raw.home.copy()
+        for part, value in parts.items():
+            left = names.index(f'left_{part}_joint')
+            right = int(np.flatnonzero(permutation == left)[0])  # mirrored[right] = signs[right]·value[left]
+            q[left], q[right] = value, signs[right] * value
+        if ((q < low) | (q > high)).any():
+            raise ValueError(f'Поза рук {name} выходит за пределы суставов')
+        out.append((name, keys, q))
+    return out
+
+
+def arm_command_params(raw):
+    """deploy.yaml params of the arm_command term (scripts/sim2sim/patches/g1_ctrl-arms.patch): the slot's size and
+    first joint, the quintic's speed (rad/s) and shortest time (s) as the training's (task.ARM_MOVE_SPEED,
+    ARM_MOVE_SECONDS), the release keys, and per named pose its keys and offsets d of joints UPPER_BODY_FIRST.. (rad
+    from default_joint_pos; the waist's and the locked wrists' 0)."""
+    poses = [dict(name=name, keys=keys, offsets=[round(float(v), 6) + 0. for v in (q - raw.home)[task.UPPER_BODY_FIRST:]])
+             for name, keys, q in named_arm_poses(raw)]  # + 0.: no -0.0
+    return {'size': task.UPPER_BODY_SIZE, 'first_joint': task.UPPER_BODY_FIRST, 'speed': float(task.ARM_MOVE_SPEED),
+            'min_seconds': float(task.ARM_MOVE_SECONDS), 'release': ARM_RELEASE, 'poses': poses}
+
+
+def arm_comment(inputs):
+    """deploy.yaml comment lines about task_config arm_targets."""
+    return '\n'.join([
+        f'arm_targets: the arm actions are a residual on the arm command: policy.onnx adds obs[{inputs[0]}:{inputs[1]}] '
+        f'(the newest arm_command',
+        f'offsets d, joints {task.UPPER_BODY_FIRST}-28) / scale to its outputs, so the target is default + d + '
+        f'scale*a; arm_command is scripts/sim2sim/patches/g1_ctrl-arms.patch:',
+        f'a pose\'s keys move d there in a quintic of max({task.ARM_MOVE_SECONDS:g} s, |dd| / '
+        f'{task.ARM_MOVE_SPEED:g} rad/s) (flag 1), {ARM_RELEASE} moves it home, then flag 0 (zeros, free arms): '
+        + ', '.join(f'{name} {keys}' for name, keys, _ in NAMED_ARM_POSES)])
+
+
 def write_yaml(value, path, header):
     """header: comment text, one '# ' line per line of it."""
     import yaml
@@ -336,6 +501,20 @@ def trim_comment(trim, command):
         *(f'  {row}{"," if k < len(rows) - 1 else ""}' for k, row in enumerate(rows))])
 
 
+def pd_bound_comment(bound, raw):
+    """deploy.yaml comment lines about the PD error bound baked into policy.onnx (task_config pd_bound)."""
+    (start, end), fraction = bound[0], bound[1]
+    values = [f'{e:.4f}' if free else '-' for e, free in zip(fraction * raw.peak / raw.kp, raw.bound_free)]
+    rows = [', '.join(values[k:k + 10]) for k in range(0, len(values), 10)]
+    return '\n'.join([
+        f'pd_bound: policy.onnx bounds each action so that its target scale*a + offset lies within e = '
+        f'{fraction:g}*y1/kp',
+        f'of the joint angle offset + obs[{start}:{end}] (the newest joint_pos_rel): the active torque is at most '
+        f'{fraction:g} of the motor peak;',
+        'nothing to set in g1_ctrl. e, rad, joint order (- the locked wrists):',
+        *(f'  {row}{"," if k < len(rows) - 1 else ""}' for k, row in enumerate(rows))])
+
+
 def resolve_stage(path):
     """A stage dir as given, or an experiment dir's latest stage."""
     path = Path(path)
@@ -356,11 +535,14 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
     stage, out_dir = Path(stage_dir), Path(out_dir)
     metadata = read_json(stage / 'metadata.json')
     identity = checkpoint_identity(metadata)
-    if (identity['robot_id'], identity['task_id']) != ('g1_29dof', 'g1_velocity'):
-        raise ValueError('Выгрузка в g1_ctrl — только для G1 29 DoF (g1_velocity)')
-    config = stage_task_config(stage)
+    if identity['robot_id'] != 'g1_29dof' or identity['task_id'] not in ('g1_velocity', GETUP_TASK):
+        raise ValueError('Выгрузка в g1_ctrl — только для G1 29 DoF (g1_velocity, g1_getup)')
+    getup = identity['task_id'] == GETUP_TASK
+    config = export_config(stage, identity)
     if not config['real_robot']:
         raise ValueError('Выгрузка в g1_ctrl — только для профиля real_robot (наблюдения как в deploy.yaml)')
+    if getup and (trim is not None or symmetric or commands is not None):
+        raise ValueError('Подстройка стоя, симметризация и сужение команд — только для ходьбы, не для вставания')
     if trim is not None and symmetric:
         raise ValueError('Подстройка стоя и симметризация вместе не выгружаются: выберите одно')
     narrowed = None if commands is None else command_ranges(config, commands)  # refused before anything is written
@@ -386,8 +568,14 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
             if obs_index[:actor_inputs].max() >= actor_inputs:
                 raise ValueError('Зеркало входа актёра задевает входы критика')
             mirror = (obs_index[:actor_inputs], obs_sign[:actor_inputs], action_index, action_sign)
+        bound = pd_bound_inputs(raw, config, metadata)  # refused before anything is written
+        arm = None
+        if config.get('arm_targets'):  # the newest slot offsets over the scale, added to the arm outputs last
+            arm = (arm_command_inputs(raw), task.UPPER_BODY_FIRST, raw.scale[task.UPPER_BODY_FIRST:])
+            poses = arm_command_params(raw)  # refused before anything is written (a pose beyond a joint's range)
         module = deployed_policy(model, norm, actor_inputs, config['action_limit'],
-                                 raw.wrist_mask.numpy() if config['lock_wrists'] else None, trim, command, mirror)
+                                 raw.wrist_mask.numpy() if config['lock_wrists'] else None, trim, command, mirror,
+                                 bound, arm)
         out_dir.mkdir(parents=True, exist_ok=True)
         onnx_path, yaml_path, trim_path = out_dir / 'policy.onnx', out_dir / 'deploy.yaml', out_dir / TRIM_FILE
         properties = {
@@ -405,8 +593,26 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
             properties['arm_blind'] = 'true'
         for name, _ in raw.extra_terms:  # observation terms g1_ctrl knows only with g1_ctrl-height.patch
             properties[name] = 'true'
+        if arm is not None:  # arm_targets: where the graph reads d, its scale, the poses deploy.yaml offers
+            properties.update(arm_targets='true', arm_command_inputs=json.dumps(list(arm[0])),
+                              arm_command_first=json.dumps(arm[1]),
+                              arm_command_scale=json.dumps([float(v) for v in arm[2]]),
+                              arm_poses=json.dumps([pose['name'] for pose in poses['poses']]))
+        if getup:  # the getting-up policy, for g1_ctrl's GetUp state; the graph is built as a walking one
+            properties.update(task_id=identity['task_id'], getup='true')
+        if bound is not None:  # pd_bound: c, e per joint (rad of PD target) and the angles' inputs
+            error = bound[1] * raw.peak / raw.kp
+            properties.update(pd_bound=json.dumps(bound[1]), pd_bound_rad=json.dumps(
+                [float(e) if free else None for e, free in zip(error, raw.bound_free)]),
+                pd_bound_inputs=json.dumps(list(bound[0])))
         write_onnx(module, onnx_path, actor_inputs, actions, properties)
         header = f'humanoid_sim.export_g1: {stage.resolve()} ({metadata.get("steps")} steps)'
+        if getup:
+            header += ('\ng1_getup: a getting-up policy (task g1_getup) for g1_ctrl\'s GetUp state '
+                       '(scripts/sim2sim/patches/g1_ctrl-getup.patch, its own policy_dir);\nno velocity command: '
+                       'the command ranges are [0, 0], so velocity_commands reads 0 and the gait phase stays stopped')
+        if bound is not None:
+            header += '\n' + pd_bound_comment(bound, raw)
         if trim is not None:
             header += '\n' + trim_comment(trim, command)
         if symmetric:
@@ -421,10 +627,15 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
             header += ('\narm_blind: the arm joints\' joint_pos_rel, joint_vel_rel and last_action (every frame) are '
                        'normalized to constants inside policy.onnx\n(the policy does not see its arms); nothing to set '
                        'in g1_ctrl')
-        if raw.extra_terms:
+        if raw.extra_terms and arm is None:
             header += ('\n' + ', '.join(name for name, _ in raw.extra_terms) + ': observation terms of '
                        'scripts/sim2sim/patches/g1_ctrl-height.patch (stock g1_ctrl refuses them); height_command '
                        '= c - 0.78 from the right stick down, upper_body_command = zeros')
+        if arm is not None:
+            header += ('\n' + ('height_command: scripts/sim2sim/patches/g1_ctrl-height.patch (c - 0.78 from the right '
+                               'stick down); ' if config.get('height_command') else '')
+                       + 'arm_command: scripts/sim2sim/patches/g1_ctrl-arms.patch (stock g1_ctrl refuses it)\n'
+                       + arm_comment(arm[0]))
         if narrowed is not None:
             training = command_ranges(config)
             header += '\ncommand ranges narrowed (--command-ranges) from the training ones:' + ''.join(
@@ -446,9 +657,13 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
     if not config.get('phase_stop'):
         notes.append('В task_config этапа нет phase_stop: true — на роботе g1_ctrl обнуляет фазу шага при норме '
                         'команды < 0,1, а политика училась с фазой, которая тикает всегда.')
-    if raw.extra_terms:
+    if raw.extra_terms and not config.get('arm_targets'):
         notes.append('Во входе термы ' + ', '.join(name for name, _ in raw.extra_terms) + ': штатный g1_ctrl их не '
                      'знает, нужен патч scripts/sim2sim/patches/g1_ctrl-height.patch (высота — правый стик вниз).')
+    if config.get('arm_targets'):
+        height = ' и g1_ctrl-height.patch (терм height_command)' if config.get('height_command') else ''
+        notes.append('Руки по целям: во входе терм arm_command — нужен патч scripts/sim2sim/patches/'
+                     f'g1_ctrl-arms.patch{height}; позы рук — LB + кнопка, отпустить — {ARM_RELEASE}.')
     return {'stage': stage, 'onnx': onnx_path, 'deploy': yaml_path, 'actor_inputs': actor_inputs,
             'actions': actions, 'history': config['history'], 'warnings': notes,
             'trim': None if trim is None else trim_path, 'symmetric': symmetric,
@@ -477,12 +692,17 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
     actions). On the same samples, g1_ctrl's motor target for the ONNX action (deploy_target, the deploy.yaml next to
     policy.onnx) against the environment's PD target for the action it applies (_target: joint ranges, knee_floor).
     With task_config height_command the second half of each command's samples comes under a crouch command (the
-    stage's crouch_min, standing or walking, set mid-episode as the stick would)."""
+    stage's crouch_min, standing or walking, set mid-episode as the stick would); with arm_targets under arm targets
+    too (flag 1), a new one every ARM_CHECK_HOLD steps drawn from the stage's pose libraries (task.arm_pose_draw) and
+    reached in the training's quintic (set_arm_targets): the graph's output is then the policy's action plus the
+    newest slot offsets over the scale, g1_ctrl's target the environment's for home + d."""
     import onnxruntime
     import yaml
     from .tasks.catalog import make_task
     stage = Path(stage_dir)
     identity = checkpoint_identity(read_json(stage / 'metadata.json'))
+    if identity['task_id'] == GETUP_TASK:
+        return check_getup(stage, onnx_path, samples, stride, seed_start)
     config = stage_task_config(stage)
     properties = onnx_properties(onnx_path)
     deploy_path = Path(onnx_path).with_name('deploy.yaml')
@@ -494,7 +714,7 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
     per_command = math.ceil(samples / len(CHECK_COMMANDS))
     session = onnxruntime.InferenceSession(str(onnx_path), providers=['CPUExecutionProvider'])
     model, norm = load_stage(stage)
-    worst, worst_target, count, resets, crouched = 0., 0., 0, 0, 0
+    worst, worst_target, count, resets, crouched, armed = 0., 0., 0, 0, 0, 0
     try:
         for number, command_now in enumerate(CHECK_COMMANDS):
             env = make_task(identity['task_id'], identity['robot_id'],
@@ -504,33 +724,111 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
             mirror = mirror_maps(env) if properties.get('symmetric') == 'true' else None
             moving = bool(task.command_moving(torch.tensor([command_now]))[0])
             crouch = config['commands']['crouch_min'][int(moving)] if config.get('height_command') else None
+            arms = arm_command_inputs(raw) if config.get('arm_targets') else None
+            rng = np.random.default_rng(seed_start + number)
+            pose = None  # arm_targets: (absolute q, seconds) of the current check target
             options = {'command': list(command_now)}
+            half = (per_command // 2) * stride
             try:
                 obs, _ = env.reset(seed=seed_start + number, options=options)
                 for step in range(per_command * stride):
-                    if crouch is not None and step == (per_command // 2) * stride:  # the stick goes down
+                    if crouch is not None and step == half:  # the stick goes down
                         options['height'] = crouch
                         raw.set_height(crouch)
+                        obs = raw._observation()
+                    if arms is not None and step >= half and (step - half) % ARM_CHECK_HOLD == 0:  # a new target
+                        start = torch.from_numpy(raw.arm_offset.copy())[None]
+                        end, move, _ = task.arm_segment_draw(lambda n: torch.from_numpy(rng.random(n)), start,
+                                                             raw.arm_poses, raw.arm_carry, raw.track_joints, raw.dt)
+                        pose = (raw.home + end[0].numpy(), int(move[0]) * raw.dt)
+                        raw.set_arm_targets(pose[0], 1, seconds=pose[1])
                         obs = raw._observation()
                     expected = reference_action(model, norm, obs, config, raw, trim, command, mirror)
                     if step % stride == 0 and count < samples:
                         got = session.run(['actions'], {'obs': obs[None, :actor_inputs].astype(np.float32)})[0][0]
-                        worst = max(worst, float(np.abs(got - expected).max()))
-                        target = raw._target(raw.applied_action(expected))  # what env.step's PD follows
+                        output, offset = expected, None  # what the graph returns, the targets the environment adds
+                        if arms is not None:
+                            output = expected.copy()
+                            output[task.UPPER_BODY_FIRST:] += (obs[arms[0]:arms[1]].astype(np.float64)
+                                                               / raw.scale[task.UPPER_BODY_FIRST:])
+                            offset = raw.arm_offset.copy() if raw.arm_flag else None
+                            armed += raw.arm_flag
+                        worst = max(worst, float(np.abs(got - output).max()))
+                        applied = raw.applied_action(expected)
+                        target = raw._target(applied) if offset is None else raw._target(applied, offset)
                         worst_target = max(worst_target, float(np.abs(deploy_target(got, deploy) - target).max()))
                         count += 1
                         crouched += raw.height_command and raw.height < task.BASE_HEIGHT
                     obs, _, terminated, truncated, _ = env.step(expected)
-                    if terminated or truncated:  # a fall: go on under the same command (and height)
+                    if terminated or truncated:  # a fall: go on under the same command (and height, arm target)
                         resets += 1
                         obs, _ = env.reset(seed=seed_start + 1000 * resets + number, options=options)
+                        if pose is not None:
+                            raw.set_arm_targets(pose[0], 1, seconds=pose[1])
+                            obs = raw._observation()
             finally:
                 env.close()
     finally:
         norm.close()
     return {'samples': count, 'max_abs_diff': worst, 'max_target_diff': worst_target, 'tolerance': TOLERANCE,
-            'resets': resets, 'crouched': int(crouched),
-            'ok': count == samples and worst < TOLERANCE and worst_target < TOLERANCE}
+            'resets': resets, 'crouched': int(crouched), 'arm_targets': int(armed),
+            'ok': (count == samples and worst < TOLERANCE and worst_target < TOLERANCE
+                   and (not config.get('arm_targets') or armed > 0))}
+
+
+def check_getup(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
+    """check() for a g1_getup export, on observations lying: onnxruntime(policy.onnx) against the stage's
+    policy.predict (reference_action: clipped, wrists locked) and g1_ctrl's motor target from deploy.yaml against the
+    environment's PD target, every `stride`-th step of episodes of the stage's CPU environment from the start bank's
+    held-out rows of GETUP_CHECK_CLASSES (lying on the back, front or side, fallen, sitting; no assist, delay 0, motor
+    friction 1, with pd_bound the lowest bound: the action the environment applies there), driven by the expected
+    actions. Also: deploy.yaml's command ranges must be ZERO_RANGES (zero_commands), so g1_ctrl gives this policy no
+    velocity command."""
+    import onnxruntime
+    import yaml
+    from .tasks.catalog import make_task
+    stage = Path(stage_dir)
+    identity = checkpoint_identity(read_json(stage / 'metadata.json'))
+    config = export_config(stage, identity)
+    deploy_path = Path(onnx_path).with_name('deploy.yaml')
+    if not deploy_path.is_file():
+        raise ValueError(f'Рядом с policy.onnx нет deploy.yaml: {deploy_path}')
+    deploy = yaml.safe_load(deploy_path.read_text(encoding='utf-8'))
+    ranges = deploy['commands']['base_velocity']['ranges']
+    zero = all([float(v) for v in ranges.get(name) or ()] == pair for name, pair in ZERO_RANGES.items())
+    session = onnxruntime.InferenceSession(str(onnx_path), providers=['CPUExecutionProvider'])
+    model, norm = load_stage(stage)
+    env = None
+    worst, worst_target, count = 0., 0., 0
+    try:
+        env = make_task(GETUP_TASK, identity['robot_id'], stage_task_config(stage))
+        raw = env.unwrapped
+        bank = raw.bank
+        rows = [int(row) for kind in GETUP_CHECK_CLASSES for row in np.flatnonzero(
+            bank['holdout'] & (bank['start_class'] == bank['classes'].index(kind)))]
+        per_start = math.ceil(samples / len(rows))
+        options = dict(assist_force=0., action_delay_steps=0, motor_friction_scale=1., pd_bound='min')
+        for number, row in enumerate(rows):
+            obs, _ = env.reset(seed=seed_start + number, options=dict(options, start=row))
+            for step in range(per_start * stride):
+                expected = reference_action(model, norm, obs, config, raw)
+                if step % stride == 0 and count < samples:
+                    got = session.run(['actions'], {'obs': obs[None, :raw.actor_inputs].astype(np.float32)})[0][0]
+                    worst = max(worst, float(np.abs(got - expected).max()))
+                    target = raw._target(raw.applied_action(expected))  # what env.step's PD follows
+                    worst_target = max(worst_target, float(np.abs(deploy_target(got, deploy) - target).max()))
+                    count += 1
+                obs, _, terminated, truncated, _ = env.step(expected)
+                if terminated or truncated:  # a joint past 50 rad/s: on from the same start
+                    obs, _ = env.reset(seed=seed_start + 1000 + number, options=dict(options, start=row))
+    finally:
+        if env is not None:
+            env.close()
+        norm.close()
+    return {'samples': count, 'max_abs_diff': worst, 'max_target_diff': worst_target, 'tolerance': TOLERANCE,
+            'resets': 0, 'crouched': 0, 'zero_commands': zero, 'starts': len(rows),
+            'pd_bound': None if config.get('pd_bound') is None else config['pd_bound'][1],
+            'ok': count == samples and worst < TOLERANCE and worst_target < TOLERANCE and zero}
 
 
 def is_export(path):
@@ -564,6 +862,12 @@ class ExportedPolicy:
         self.steps = int(properties['steps'])
         self.trim = np.array(json.loads(properties['stand_trim'])) if 'stand_trim' in properties else None
         self.symmetric = properties.get('symmetric') == 'true'
+        # arm_targets: the graph adds the slot's d/scale (g1_ctrl's last_action); the environment adds d itself, so
+        # predict gives it the residual back.
+        self.arm = None
+        if properties.get('arm_targets') == 'true':
+            self.arm = (json.loads(properties['arm_command_inputs']), json.loads(properties['arm_command_first']),
+                        np.array(json.loads(properties['arm_command_scale']), dtype=np.float32))
         options = onnxruntime.SessionOptions()  # one observation at a time; probes run many of these in parallel
         options.intra_op_num_threads = options.inter_op_num_threads = 1
         self.session = onnxruntime.InferenceSession(str(path), options, providers=['CPUExecutionProvider'])
@@ -574,11 +878,15 @@ class ExportedPolicy:
 
     def predict(self, obs, deterministic=True):
         """(actions, None) for one observation (obs,) or a batch (n, obs); the graph takes [1, A], so row by row.
-        The graph has no noise: deterministic is always so."""
+        The graph has no noise: deterministic is always so. With arm_targets the graph's output less the newest slot
+        offsets over the scale: the residual the stage's environment applies on its own targets."""
         obs = np.asarray(obs, dtype=np.float32)
         rows = obs.reshape(-1, obs.shape[-1])[:, :self.actor_inputs]
         actions = np.concatenate([self.session.run(['actions'], {'obs': np.ascontiguousarray(row[None])})[0]
                                   for row in rows])
+        if self.arm is not None:
+            (start, end), first, scale = self.arm
+            actions[:, first:] -= rows[:, start:end] / scale
         return actions.reshape(*obs.shape[:-1], actions.shape[-1]), None
 
     def close(self):
@@ -632,6 +940,13 @@ def main(argv=None):
         verdict = check(stage, result['onnx'], samples=args.samples)
         same = ' (с той же подстройкой стоя)' if trim is not None else ' (симметризованным)' if args.symmetric else ''
         crouched = f' (в приседе {verdict["crouched"]})' if verdict['crouched'] else ''
+        if verdict.get('arm_targets'):
+            crouched += f' (с целями рук {verdict["arm_targets"]})'
+        if 'zero_commands' in verdict:  # g1_getup: observations lying, and no velocity command in deploy.yaml
+            crouched = (f' лёжа (стартов из отложенного банка {verdict["starts"]}); диапазоны команд '
+                        f'{"[0, 0]" if verdict["zero_commands"] else "НЕ НУЛЕВЫЕ"}')
+            if verdict['pd_bound'] is not None:
+                crouched += f'; граница ошибки ПД c = {verdict["pd_bound"]:g} (в графе и в среде)'
         print(f'Сверка с policy.predict{same}: {verdict["samples"]} наблюдений{crouched}, max |разница| = '
               f'{verdict["max_abs_diff"]:.2e}, цели моторов по deploy.yaml {verdict["max_target_diff"]:.2e} '
               f'(порог {verdict["tolerance"]:g}) — {"совпадает" if verdict["ok"] else "НЕ СОВПАДАЕТ"}')

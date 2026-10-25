@@ -20,6 +20,9 @@ FSM phases come from lowcmd motor 0's kp (Passive 0, FixStand 100, Velocity depl
             bursts as a stand-in for steps); with a command they are printed for reference, tilt against 15 deg.
             Motor temperature and error flags if the probe recorded them (the robot build, docs/robot-first-run.md).
   Passive   how it went limp after Velocity (leg speed, tilt): information only.
+g1_ctrl's output: every patch's info lines at least once, the GetUp state's own (g1_ctrl-getup.patch) only when the log
+shows the state built (config.yaml turns it on only for the getting-up session). The getting-up session itself is not
+judged: GetUp has Velocity's kp, so its stretch counts as part of a Velocity phase.
 Verdicts use the protocol's thresholds; `СТОП` means: do not go on to the next step of the protocol.
 """
 
@@ -73,6 +76,12 @@ BURST_SPEED, BURST_WINDOW_S, BURST_MAX = 1.0, 10.0, 1  # leg speed bursts withou
 ENTRY_SKIP_S = 1.0  # the Velocity entry transient (in the hoist up to 3 rad/s) is left out of the bursts
 COMMAND_ZERO = 0.1  # command norm under which g1_ctrl's gait phase stops (phase_stop): a stand command
 COMMAND_SHARE = 0.05  # a phase with a command longer than this share is a walking one
+# g1_ctrl-getup.patch: its info lines but the tilt check's (TILT_MARK, which Velocity prints too) are the GetUp state's
+# own (tilt check off, timeout, joint speeds), printed only when config.yaml turns the state on (install_policy.sh
+# getup); g1_ctrl logs GETUP_BUILT as it builds the state.
+GETUP_PATCH = 'g1_ctrl-getup.patch'
+TILT_MARK = '(sim2sim fall-passive patch)'
+GETUP_BUILT = 'Initializing State_GetUp'
 
 
 def md5(path):
@@ -382,15 +391,25 @@ def patch_log_lines(patches):
     return out
 
 
+def getup_only(entry):
+    """A line of GETUP_PATCH that only the GetUp state prints (its own checks), not the tilt check Velocity prints."""
+    return entry['patch'] == GETUP_PATCH and TILT_MARK not in entry['text']
+
+
 def log_check(log, patches, velocity_entries):
+    """The patches' info lines in g1_ctrl's output, each required (found at least once) but the GetUp state's own
+    (getup_only), which g1_ctrl prints only when config.yaml turns GetUp on: those are required once the log shows the
+    state built (GETUP_BUILT), as in the getting-up session; with GetUp off (records A-D) they are not."""
     if log is None or not log.exists():
         return dict(log=None)
     text = log.read_text(encoding='utf-8', errors='replace')
-    found = [dict(patch=e['patch'], kind=e['kind'], text=e['text'], found=len(re.findall(e['regex'], text)))
+    getup = GETUP_BUILT in text
+    found = [dict(patch=e['patch'], kind=e['kind'], text=e['text'], found=len(re.findall(e['regex'], text)),
+                  required=e['kind'] == 'info' and (getup or not getup_only(e)))
              for e in patch_log_lines(patches)]
     lines = [x for x in found if x['kind'] == 'info']
     return dict(log=str(log), lines=lines, events=[x for x in found if x['kind'] == 'warn'],
-                ok=bool(lines) and all(x['found'] > 0 for x in lines),
+                ok=bool(lines) and all(x['found'] > 0 for x in lines if x['required']), getup=getup,
                 policy_dirs=re.findall(r'Policy directory: (\S+)', text), velocity_entries_lowcmd=velocity_entries)
 
 
@@ -405,7 +424,9 @@ def print_report(report):
     if log.get('log'):
         print(f"Лог g1_ctrl {log['log']}: строки патчей {ok(log['ok'])}")
         for x in log['lines']:
-            print(f"  {x['patch']}: «{x['text']}» — найдено {x['found']}")
+            print(f"  {x['patch']}: «{x['text']}» — найдено {x['found']}"
+                  + ('' if x['required'] else f' (строка состояния GetUp: нужна, только когда оно включено, а «'
+                                              f'{GETUP_BUILT}» в логе нет)'))
         for x in log['events']:
             if x['found']:
                 print(f"  СОБЫТИЕ {x['patch']}: «{x['text']}» — {x['found']} раз")
