@@ -21,7 +21,7 @@ from test_g1_getup_math import as_torch, batch
 WORKING = .7  # the critic's working value (lab-critic/it36)
 STANDING = 3  # drop_bank's row standing in home on the floor
 # Reward terms added after standing_digest's code, always among the components (0 without their weight): left out.
-LATER_TERMS = ('sole_impact', 'stance_width')
+LATER_TERMS = ('sole_impact', 'stance_width', 'arm_press', 'style', 'head_rise', 'sole_slip')
 
 
 def pose_term(position, home, std, standing=True):

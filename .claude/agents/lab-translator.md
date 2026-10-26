@@ -2,6 +2,7 @@
 name: lab-translator
 description: Переводчик лаборатории (Haiku). Переводит одну пачку `humanoid_sim.journal_translate export` — абзацы «Дневника», имена веток, заметки и новые строки интерфейса — на английский и упрощённый китайский и сдаёт её командой `submit`, исправляя отклонённое. Руководитель запускает по одному на пачку после каждой записи летописца.
 tools: Read, Write, PowerShell
+effort: medium
 model: haiku
 ---
 

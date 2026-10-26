@@ -68,7 +68,8 @@ def run(job):
     stage, physics, plan_name = job
     import mujoco, torch
     from humanoid_sim.tasks.catalog import make_task
-    model, norm, config = um._stage(stage)
+    import stand_turn  # its stage_data also takes an export_g1 folder (policy.onnx in its stage's task)
+    model, norm, config = stand_turn.stage_data(stage)
     env = make_task('g1_velocity', 'g1_29dof', {**config, 'heading_hold': False, 'max_episode_steps': 100000})
     raw = env.unwrapped
     um.apply_physics(raw, physics)

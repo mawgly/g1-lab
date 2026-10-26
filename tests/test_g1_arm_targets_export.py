@@ -113,6 +113,49 @@ def test_export_adds_the_slot_targets_to_the_arm_outputs_and_names_the_poses(tmp
     assert 'g1_ctrl-arms.patch' in text.split('joint_ids_map')[0]
 
 
+def test_symmetric_walk_mirrors_the_residual_and_adds_the_slot_targets_after_it(tmp_path):
+    """--symmetric-walk with flag 1: walking, the graph returns the mirrored mean of the policy's residual (the slot in
+    the mirrored input mirrored by symmetry.Mirror) plus the input's own d/scale, so the residuals of a mirrored input
+    are the mirrored residuals; standing, the plain graph's output; check() passes with arm targets."""
+    from humanoid_sim.export_g1 import mirror_maps
+    stage = arm_stage(tmp_path, gain=50.)
+    plain, walk = export(stage, tmp_path / 'plain'), export(stage, tmp_path / 'walk', symmetric_walk=True)
+    run = lambda path, rows: np.concatenate([onnxruntime.InferenceSession(str(path), providers=[
+        'CPUExecutionProvider']).run(['actions'], {'obs': row[None, :585]})[0] for row in rows])
+    policy, norm = load_stage(stage)
+    try:
+        raw = norm.venv.envs[0].unwrapped
+        start, end = arm_command_inputs(raw)
+        command = (42, 45)
+        mirror = mirror_maps(norm.venv.envs[0])
+        obs_index, obs_sign, action_index, action_sign = mirror
+        rng = np.random.default_rng(3)
+        obs = rng.normal(0, 1, (12, 589)).astype(np.float32)
+        obs[:, start - 1] = 1.
+        obs[:, start:end] = rng.uniform(-1., 1., (12, 17))
+        obs[:, start:start + 3] = 0.
+        for j in WRISTS:
+            obs[:, start + j - 12] = 0.
+        obs[:, command[0]:command[1]] = [[.5, 0., 0.], [0., .3, 0.], [0., 0., .5], [0., 0., 0.]] * 3
+        standing = np.linalg.norm(obs[:, command[0]:command[1]], axis=1) < .1
+        got = run(walk['onnx'], obs)
+        assert np.array_equal(got[standing], run(plain['onnx'], obs)[standing])
+        config = {'action_limit': 10., 'lock_wrists': True}
+        residual = np.stack([reference_action(policy, norm, row, config, raw, command=command, mirror=mirror,
+                                              walk_only=True) for row in obs])
+        np.testing.assert_allclose(got, residual + np.pad(obs[:, start:end] / raw.scale[12:], ((0, 0), (12, 0))),
+                                   atol=1e-4, rtol=0)
+        flipped = obs[:, obs_index] * obs_sign
+        own = got - np.pad(obs[:, start:end] / raw.scale[12:], ((0, 0), (12, 0)))
+        theirs = run(walk['onnx'], flipped) - np.pad(flipped[:, start:end] / raw.scale[12:], ((0, 0), (12, 0)))
+        np.testing.assert_allclose(theirs[~standing], own[~standing][:, action_index] * action_sign, atol=1e-5,
+                                   rtol=0)
+    finally:
+        norm.close()
+    verdict = check(stage, walk['onnx'], samples=20, stride=2)
+    assert verdict['ok'] and verdict['arm_targets'] == 10 and verdict['walking'] >= 10, verdict
+
+
 def test_named_poses_lie_within_the_joints_and_the_carry_ranges_are_mirrored_and_touch_nothing():
     """The named poses: within the joint ranges, the carry ones within task.ARM_CARRY, left and right mirror images,
     none touching the body, the other arm or its own arm, in the pose or halfway from home (the libraries' rule,

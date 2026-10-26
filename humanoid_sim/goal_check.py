@@ -83,20 +83,21 @@ def foot_summary(runs):
                 stance_tilt_deg=max(tilts) if len(tilts) == len(FEET) else None, by_foot=by_foot)
 
 
-def walks(stage, seeds=2, seconds=10., seed_start=73000, acting=None, turns=TURNS, straight=STRAIGHT):
+def walks(stage, seeds=2, seconds=10., seed_start=73000, acting=None, turns=TURNS, straight=STRAIGHT, config=None):
     """Deterministic CPU walks at fixed commands, heading hold off, measured after the first 2 s.
 
     turn: {(speed, yaw): mean yaw rate}; drift: {(speed, start): [yaw rate per seed]} without a turn command;
     pelvis: the lowest pelvis height on the walks started at phase 0; feet: foot_summary of the straight walks.
     acting: (policy, norm) that act instead of the stage's own (export_g1.ExportedPolicy as both). turns, straight:
     the (forward, yaw) turn commands and the straight speeds walked (the goal's by default; scripts/lab/skills_check.py
-    walks other turns alone)."""
+    walks other turns alone). config: the task_config to walk in instead of the stage's (with acting: Unitree v0)."""
     from .tasks.catalog import make_task
     identity = checkpoint_identity(read_json(Path(stage) / 'metadata.json'))
     dt = identity['control_dt']
     policy, norm = acting or load_stage(stage)
     limit = math.ceil(seconds / dt)
-    config = {**stage_task_config(stage), 'heading_hold': False, 'max_episode_steps': limit}
+    config = {**(stage_task_config(stage) if config is None else config), 'heading_hold': False,
+              'max_episode_steps': limit}
     runs = [(speed, yaw, 'left') for speed, yaw in turns] + [(speed, 0., start) for speed in straight
                                                              for start in STARTS]
     result = dict(turn={}, drift={}, pelvis=math.inf)

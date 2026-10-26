@@ -329,6 +329,28 @@ def test_english_and_chinese_pages_have_no_russian_but_document_names(modules, t
         assert left == [], (lang, left)
 
 
+def test_symmetric_walk_package(modules, tmp_path):
+    """Package n8s (26.10): the export's name carries export_g1's suffix (…-7221510144-symwalk), its table
+    (SIM2SIM_TABLE_N8S) keeps the wording of the rows the passport reads; no bridge pushes, so those stay empty."""
+    passport, package = modules
+    folder = make_package(tmp_path / 'g1-n8s-test', package)
+    info = json.loads((folder / 'package.json').read_text(encoding='utf-8'))
+    info['candidates'][0] = dict(info['candidates'][0], **{k: package.N8S[k] for k in ('label', 'title', 'export',
+                                                                                         'reference', 'about')})
+    (folder / 'package.json').write_text(json.dumps(info, ensure_ascii=False), encoding='utf-8')
+    rows = '\n'.join('| ' + ' | '.join(row) + ' |' for row in package.PACKAGES['n8s']['table'])
+    (folder / 'REFERENCE.md').write_text('## Связка Unitree в симуляции (sim2sim)\n\n| Что | №8 симм. (7221sym) | №7 (6368) '
+                                         f'|\n|---|---|---|\n{rows}\n\n## Источники\n', encoding='utf-8')
+    data, text, empty = page(passport, folder, make_lab(tmp_path / 'lab'))
+    assert (data['candidate']['branch'], data['candidate']['steps']) == (BRANCH, STEPS)
+    assert row(text, 'Скорость при команде 0,5 м/с')[1] == '0,46 м/с'
+    assert row(text, 'Скорость при команде 1 м/с')[1] == '1,01 м/с'
+    assert row(text, 'Увод курса без команды поворота, 0,5 м/с')[1] == '0,000…+0,001 рад/с; курс за 10 с −0,8…−0,4°'
+    assert row(text, 'Прогонов в связке; падений')[1] == '14; 0'
+    assert row(text, 'Торможение: путь за 3 с после стопа с 0,5 м/с')[1] == '0,22–0,23 м'
+    assert 'Толчки, связка: стоя' in empty and 'Скорость при команде 0,5 м/с' not in empty
+
+
 @pytest.mark.skipif(not (REAL / 'package.json').is_file(), reason='the lab package №8 is not on this machine')
 def test_real_package_8(modules, tmp_path):
     passport, _ = modules

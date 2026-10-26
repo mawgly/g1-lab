@@ -1,7 +1,7 @@
 """A G1 real-robot stage for Unitree's g1_ctrl (unitree_rl_mjlab deploy): policy.onnx and deploy.yaml.
 
     .venv\\Scripts\\python.exe -m humanoid_sim.export_g1 <stage dir | experiment dir> --out <folder> [--stand-trim]
-        [--command-ranges X_MIN X_MAX Y YAW]
+        [--symmetric-walk] [--command-ranges X_MIN X_MAX Y YAW]
 
 policy.onnx takes `obs` [1, A] (A = the actor's inputs: the deploy terms with their history, no critic extras) and
 returns `actions` [1, 29], float32, static shapes, opset 17. Inside: the stage's VecNormalize ((x - mean) /
@@ -24,6 +24,13 @@ policy's mean asymmetry π(o) − M_a·π(M_o·o) standing, within ±TRIM_LIMIT 
 same b always on spoils the 1 m/s drift (critic: −0.003 → +0.024). b goes to stand_trim.json, deploy.yaml (comment)
 and the ONNX properties; g1_ctrl sees an ordinary policy. --symmetric (experiments only) exports ½(π(o) +
 M_a·π(M_o·o)) instead, which also stops the turn but breaks the foot choice against a push standing (7 of 8 falls).
+--symmetric-walk (iteration 50, the critic's lab-critic/it45r: a constant yaw bias lives in clean states, which the
+mirror loss does not reach) takes that mean only while walking or turning: Where(‖command‖ < 0.1, π(o), ½(π(o) +
+M_a·π(M_o·o))), the same command and threshold as the stand trim (turning on the spot is walking), the second pass on
+the mirrored raw input (Gather and signs before the normalization, the same actor, the output mirrored), then the
+wrist zeros, the stand trim on the standing branch (with --stand-trim) and the arm slot's d/scale (the policy's
+residual is mirrored, the targets are not: symmetry.Mirror maps the slot). Standing the graph's output is the plain
+graph's bit for bit; properties symmetric_walk and a deploy.yaml comment, nothing for g1_ctrl.
 ExportedPolicy runs an export folder in the CPU environment of its stage, so goal_check --export and the probes judge
 exactly what goes to the robot.
 
@@ -129,11 +136,14 @@ class DeployedPolicy(torch.nn.Module):
     ((start, end) of the newest joint_pos_rel in the input, c, peak, kp, scale, free) of task_config pd_bound, the
     action bounded around those angles after the clip (task.pd_bound), before the wrist zeros; arm: ((start, end) of the
     newest slot frame's offsets d in the input, the first joint they belong to, the action scale of those joints) of
-    task_config arm_targets, d/scale added to those outputs last. None: no such step in the graph."""
+    task_config arm_targets, d/scale added to those outputs last. None: no such step in the graph. walk_only (with
+    mirror and command, --symmetric-walk): the mirrored mean only while the newest command's norm is at least
+    task.PHASE_STOP_NORM, the policy's own action below it."""
 
     def __init__(self, mean, std, clip_obs, actor, action_limit, locked=None, trim=None, command=None, mirror=None,
-                 bound=None, arm=None):
+                 bound=None, arm=None, walk_only=False):
         super().__init__()
+        self.walk_only = bool(walk_only)
         self.arm_inputs = None if arm is None else (int(arm[0][0]), int(arm[0][1]))
         self.arm_first = None if arm is None else int(arm[1])
         self.register_buffer('arm_scale', None if arm is None else torch.as_tensor(arm[2], dtype=torch.float32))
@@ -147,8 +157,10 @@ class DeployedPolicy(torch.nn.Module):
                                       (torch.float32,) * 4 + (torch.bool,),
                                       (None,) * 5 if bound is None else ([bound[1]], *bound[2:])):
             self.register_buffer(name, None if value is None else torch.as_tensor(value, dtype=dtype))
-        if (trim is None) != (command is None):
+        if (trim is None) != (command is None) and not (walk_only and command is not None):
             raise ValueError('Подстройке стоя нужны и b, и положение команды во входе')
+        if walk_only and (mirror is None or command is None):
+            raise ValueError('Симметризации на ходу нужны зеркало и положение команды во входе')
         self.register_buffer('trim', None if trim is None else torch.as_tensor(trim, dtype=torch.float32))
         self.command = None if command is None else (int(command[0]), int(command[1]))
         for name, dtype, value in zip(('mirror_obs', 'mirror_obs_sign', 'mirror_action', 'mirror_action_sign'),
@@ -160,21 +172,26 @@ class DeployedPolicy(torch.nn.Module):
         normalized = torch.clamp((obs - self.mean) / self.std, -self.clip_obs, self.clip_obs)
         return torch.clamp(self.actor(normalized), -self.action_limit, self.action_limit)
 
+    def standing(self, obs):
+        """(n, 1) bool: the newest frame's command has norm below task.PHASE_STOP_NORM (phase_stop's rule)."""
+        command = obs[:, self.command[0]:self.command[1]]
+        return torch.sqrt((command * command).sum(dim=1, keepdim=True)) < task.PHASE_STOP_NORM
+
     def forward(self, obs):
         action = self.policy_action(obs)
         if self.mirror_obs is not None:  # symmetric: the mean with the mirrored action for the mirrored observation
             mirrored = self.policy_action(obs[:, self.mirror_obs] * self.mirror_obs_sign)
-            action = .5 * (action + mirrored[:, self.mirror_action] * self.mirror_action_sign)
+            mean = .5 * (action + mirrored[:, self.mirror_action] * self.mirror_action_sign)
+            # symmetric_walk: the mean only while walking or turning; standing, the policy's own action
+            action = torch.where(self.standing(obs), action, mean) if self.walk_only else mean
         if self.bound_fraction is not None:  # pd_bound: around the newest observed angles, as the environment
             action = task.pd_bound(action, obs[:, self.bound_inputs[0]:self.bound_inputs[1]], self.bound_fraction,
                                    self.bound_peak, self.bound_kp, self.bound_scale, self.bound_free)
         if self.locked is not None:
             action = task.lock_joints(action, self.locked)
         if self.trim is not None:  # the norm as phase_stop's (and g1_ctrl's gait_phase) reads it
-            command = obs[:, self.command[0]:self.command[1]]
-            standing = torch.sqrt((command * command).sum(dim=1, keepdim=True)) < task.PHASE_STOP_NORM
-            action = torch.where(standing, torch.clamp(action - self.trim, -self.action_limit, self.action_limit),
-                                 action)
+            action = torch.where(self.standing(obs),
+                                 torch.clamp(action - self.trim, -self.action_limit, self.action_limit), action)
         if self.arm_inputs is not None:  # arm_targets: the residual on the slot's targets, as g1_ctrl's last_action
             offsets = obs[:, self.arm_inputs[0]:self.arm_inputs[1]] / self.arm_scale
             action = torch.cat((action[:, :self.arm_first], action[:, self.arm_first:] + offsets), dim=1)
@@ -210,19 +227,20 @@ def mirror_maps(env):
     return tuple(t.numpy() for t in (mirror.obs_index, mirror.obs_sign, mirror.action_index, mirror.action_sign))
 
 
-def reference_action(model, norm, obs, config, raw, trim=None, command=None, mirror=None):
+def reference_action(model, norm, obs, config, raw, trim=None, command=None, mirror=None, walk_only=False):
     """What policy.onnx returns for one observation, built from the stage itself: policy.predict(normalize_obs(obs))
-    clipped to ±action_limit (with mirror: averaged with the mirrored action of the mirrored observation), applied
-    as the environment applies it (applied_action), then with trim the stand trim while the command is below the
-    threshold."""
+    clipped to ±action_limit (with mirror: averaged with the mirrored action of the mirrored observation; walk_only:
+    only while the command at command is at or above the threshold), applied as the environment applies it
+    (applied_action), then with trim the stand trim while the command is below the threshold."""
     limit = config['action_limit']
     act = lambda o: np.clip(model.predict(norm.normalize_obs(o), deterministic=True)[0], -limit, limit)
     action = act(obs)
-    if mirror is not None:
+    standing = command is not None and np.linalg.norm(obs[command[0]:command[1]]) < task.PHASE_STOP_NORM
+    if mirror is not None and not (walk_only and standing):
         obs_index, obs_sign, action_index, action_sign = mirror
         action = .5 * (action + act(obs[obs_index] * obs_sign)[action_index] * action_sign)
     action = applied_action(action, config, raw)
-    if trim is not None and np.linalg.norm(obs[command[0]:command[1]]) < task.PHASE_STOP_NORM:
+    if trim is not None and standing:
         action = np.clip(action - trim, -limit, limit)
     return action
 
@@ -270,7 +288,7 @@ def stand_trim(stage_dir, seeds=TRIM_SEEDS, window=TRIM_WINDOW, limit_rad=TRIM_L
 
 
 def deployed_policy(model, norm, actor_inputs, action_limit, locked=None, trim=None, command=None, mirror=None,
-                    bound=None, arm=None):
+                    bound=None, arm=None, walk_only=False):
     policy = model.policy
     if not isinstance(policy.action_dist, DiagGaussianDistribution) or policy.squash_output:
         raise ValueError('Ожидалась политика PPO с гауссовым распределением без сжатия')
@@ -293,7 +311,7 @@ def deployed_policy(model, norm, actor_inputs, action_limit, locked=None, trim=N
     rms = norm.obs_rms
     std = np.sqrt(rms.var[:actor_inputs] + norm.epsilon)
     return DeployedPolicy(rms.mean[:actor_inputs], std, norm.clip_obs, torch.nn.Sequential(*layers),
-                          action_limit, locked, trim, command, mirror, bound, arm).eval()
+                          action_limit, locked, trim, command, mirror, bound, arm, walk_only).eval()
 
 
 def write_onnx(module, path, actor_inputs, actions, properties):
@@ -319,10 +337,13 @@ def write_onnx(module, path, actor_inputs, actions, properties):
 def export_config(stage, identity):
     """The settings the graph and deploy.yaml follow, as a walking task_config: a g1_velocity stage's own; for a
     g1_getup stage its fixed robot and connector (config.G1_GETUP_PROFILE, spelled out by g1_config) with getup true
-    (no command: command_ranges gives ZERO_RANGES) and the stage's own pd_bound."""
+    (no command: command_ranges gives ZERO_RANGES) and the stage's own pd_bound and hip_roll_out (deploy.yaml's clip
+    comes from the stage's environment either way: its target_low / target_high)."""
     if identity['task_id'] == GETUP_TASK:
         from .tasks.config import G1_GETUP_PROFILE, g1_config
-        return {**g1_config(G1_GETUP_PROFILE), 'getup': True, 'pd_bound': stage_task_config(stage)['pd_bound']}
+        own = stage_task_config(stage)
+        return {**g1_config(G1_GETUP_PROFILE), 'getup': True, 'pd_bound': own['pd_bound'],
+                'hip_roll_out': own.get('hip_roll_out')}
     return stage_task_config(stage)
 
 
@@ -526,12 +547,14 @@ def resolve_stage(path):
     return stages[-1]
 
 
-def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, commands=None):
+def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, commands=None, symmetric_walk=False):
     """Writes policy.onnx and deploy.yaml for stage_dir into out_dir; returns paths, sizes and warnings.
     trim: (actions,) stand trim b in action units (stand_trim; its info dict goes into stand_trim.json too), baked
-    into the graph; symmetric: export ½(π(o) + M_a·π(M_o·o)) instead of π (experiments). Without either the graph is
-    the plain one. commands: (x_min, x_max, y, yaw), deploy.yaml's command ranges narrowed within the training ones
-    (command_ranges; noted in its header), or None for the training ranges; the graph is the same either way."""
+    into the graph; symmetric: export ½(π(o) + M_a·π(M_o·o)) instead of π (experiments); symmetric_walk: that mean
+    only while the newest command's norm is at least task.PHASE_STOP_NORM (walking or turning), π(o) below it (with
+    trim the standing branch is trimmed; not with symmetric). Without any of them the graph is the plain one.
+    commands: (x_min, x_max, y, yaw), deploy.yaml's command ranges narrowed within the training ones (command_ranges;
+    noted in its header), or None for the training ranges; the graph is the same either way."""
     stage, out_dir = Path(stage_dir), Path(out_dir)
     metadata = read_json(stage / 'metadata.json')
     identity = checkpoint_identity(metadata)
@@ -541,10 +564,12 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
     config = export_config(stage, identity)
     if not config['real_robot']:
         raise ValueError('Выгрузка в g1_ctrl — только для профиля real_robot (наблюдения как в deploy.yaml)')
-    if getup and (trim is not None or symmetric or commands is not None):
+    if getup and (trim is not None or symmetric or symmetric_walk or commands is not None):
         raise ValueError('Подстройка стоя, симметризация и сужение команд — только для ходьбы, не для вставания')
     if trim is not None and symmetric:
         raise ValueError('Подстройка стоя и симметризация вместе не выгружаются: выберите одно')
+    if symmetric and symmetric_walk:
+        raise ValueError('Симметризация целиком и на ходу вместе не выгружаются: выберите одно')
     narrowed = None if commands is None else command_ranges(config, commands)  # refused before anything is written
     model, norm = load_stage(stage)
     try:
@@ -561,9 +586,10 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
             trim = np.asarray(trim, dtype=float)
             if trim.shape != (actions,) or not np.isfinite(trim).all():
                 raise ValueError('Подстройка стоя: нужно по одному конечному числу на сустав')
+        if trim is not None or symmetric_walk:
             command = command_inputs(actions, config['history'], raw.extra_sizes)
         mirror = None
-        if symmetric:  # the actor's inputs mirror among themselves (history frames), never into the critic extras
+        if symmetric or symmetric_walk:  # the actor's inputs mirror among themselves, never into the critic extras
             obs_index, obs_sign, action_index, action_sign = mirror_maps(env)
             if obs_index[:actor_inputs].max() >= actor_inputs:
                 raise ValueError('Зеркало входа актёра задевает входы критика')
@@ -575,7 +601,7 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
             poses = arm_command_params(raw)  # refused before anything is written (a pose beyond a joint's range)
         module = deployed_policy(model, norm, actor_inputs, config['action_limit'],
                                  raw.wrist_mask.numpy() if config['lock_wrists'] else None, trim, command, mirror,
-                                 bound, arm)
+                                 bound, arm, symmetric_walk)
         out_dir.mkdir(parents=True, exist_ok=True)
         onnx_path, yaml_path, trim_path = out_dir / 'policy.onnx', out_dir / 'deploy.yaml', out_dir / TRIM_FILE
         properties = {
@@ -585,6 +611,9 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
             properties.update(stand_trim=json.dumps([float(v) for v in trim]), stand_trim_command=json.dumps(command))
         if symmetric:
             properties['symmetric'] = 'true'
+        if symmetric_walk:  # where the graph reads the command and the threshold that switches the mirrored mean on
+            properties.update(symmetric_walk='true', symmetric_walk_command=json.dumps(command),
+                              symmetric_walk_threshold=json.dumps(task.PHASE_STOP_NORM))
         if config.get('foot_collision'):  # training physics only: the graph and deploy.yaml are the same
             properties.update(foot_collision='true', model_revision=identity['model_revision'])
         if config.get('hand_collision'):  # likewise
@@ -600,6 +629,9 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
                               arm_poses=json.dumps([pose['name'] for pose in poses['poses']]))
         if getup:  # the getting-up policy, for g1_ctrl's GetUp state; the graph is built as a walking one
             properties.update(task_id=identity['task_id'], getup='true')
+        roll = config.get('hip_roll_out') if getup else None
+        if roll is not None:  # g1_getup hip_roll_out: deploy.yaml's clip (target_low / target_high), the graph the same
+            properties['hip_roll_out'] = json.dumps(roll)
         if bound is not None:  # pd_bound: c, e per joint (rad of PD target) and the angles' inputs
             error = bound[1] * raw.peak / raw.kp
             properties.update(pd_bound=json.dumps(bound[1]), pd_bound_rad=json.dumps(
@@ -613,10 +645,20 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
                        'the command ranges are [0, 0], so velocity_commands reads 0 and the gait phase stays stopped')
         if bound is not None:
             header += '\n' + pd_bound_comment(bound, raw)
+        if roll is not None:
+            names = [raw.model.joint(raw.joints[j]).name for j in raw.hip_roll_joints]
+            header += (f'\nhip_roll_out: the hip roll targets stop {roll:g} rad outwards (' + ', '.join(
+                f"{name} {'high' if sign > 0 else 'low'} clip {sign * roll:g}"
+                for name, sign in zip(names, raw.hip_roll_signs)) + "); g1_ctrl's clip does it, the graph is the same")
         if trim is not None:
             header += '\n' + trim_comment(trim, command)
         if symmetric:
             header += '\nsymmetric: policy.onnx returns (pi(o) + M_a pi(M_o o)) / 2 (experiments only)'
+        if symmetric_walk:
+            below = 'pi(o) itself' + (' less the stand trim' if trim is not None else '')
+            header += (f'\nsymmetric_walk: while the norm of obs[{command[0]}:{command[1]}] (the newest '
+                       f'velocity_commands, turning included) is {task.PHASE_STOP_NORM:g} or more,\npolicy.onnx '
+                       f'returns (pi(o) + M_a pi(M_o o)) / 2, below it {below}; nothing to set in g1_ctrl')
         if config.get('foot_collision'):
             header += ('\nfoot_collision: trained with the feet colliding with each other (Unitree\'s foot capsules); '
                        'nothing to set in g1_ctrl')
@@ -666,7 +708,7 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
                      f'g1_ctrl-arms.patch{height}; позы рук — LB + кнопка, отпустить — {ARM_RELEASE}.')
     return {'stage': stage, 'onnx': onnx_path, 'deploy': yaml_path, 'actor_inputs': actor_inputs,
             'actions': actions, 'history': config['history'], 'warnings': notes,
-            'trim': None if trim is None else trim_path, 'symmetric': symmetric,
+            'trim': None if trim is None else trim_path, 'symmetric': symmetric, 'symmetric_walk': symmetric_walk,
             'commands': command_ranges(config, commands)}
 
 
@@ -695,7 +737,9 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
     stage's crouch_min, standing or walking, set mid-episode as the stick would); with arm_targets under arm targets
     too (flag 1), a new one every ARM_CHECK_HOLD steps drawn from the stage's pose libraries (task.arm_pose_draw) and
     reached in the training's quintic (set_arm_targets): the graph's output is then the policy's action plus the
-    newest slot offsets over the scale, g1_ctrl's target the environment's for home + d."""
+    newest slot offsets over the scale, g1_ctrl's target the environment's for home + d. With symmetric_walk the
+    reference is the mirrored mean while the newest command's norm is at or above the threshold (walking), and at
+    least half of the samples, not all, must be such ('walking')."""
     import onnxruntime
     import yaml
     from .tasks.catalog import make_task
@@ -711,17 +755,20 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
     deploy = yaml.safe_load(deploy_path.read_text(encoding='utf-8'))
     trim = np.array(json.loads(properties['stand_trim'])) if 'stand_trim' in properties else None
     command = json.loads(properties['stand_trim_command']) if trim is not None else None
+    walk_only = properties.get('symmetric_walk') == 'true'
+    if walk_only:
+        command = json.loads(properties['symmetric_walk_command'])
     per_command = math.ceil(samples / len(CHECK_COMMANDS))
     session = onnxruntime.InferenceSession(str(onnx_path), providers=['CPUExecutionProvider'])
     model, norm = load_stage(stage)
-    worst, worst_target, count, resets, crouched, armed = 0., 0., 0, 0, 0, 0
+    worst, worst_target, count, resets, crouched, armed, walking = 0., 0., 0, 0, 0, 0, 0
     try:
         for number, command_now in enumerate(CHECK_COMMANDS):
             env = make_task(identity['task_id'], identity['robot_id'],
                             {**config, 'max_episode_steps': per_command * stride + 1})
             raw = env.unwrapped
             actor_inputs = raw.actor_inputs
-            mirror = mirror_maps(env) if properties.get('symmetric') == 'true' else None
+            mirror = mirror_maps(env) if properties.get('symmetric') == 'true' or walk_only else None
             moving = bool(task.command_moving(torch.tensor([command_now]))[0])
             crouch = config['commands']['crouch_min'][int(moving)] if config.get('height_command') else None
             arms = arm_command_inputs(raw) if config.get('arm_targets') else None
@@ -743,8 +790,10 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
                         pose = (raw.home + end[0].numpy(), int(move[0]) * raw.dt)
                         raw.set_arm_targets(pose[0], 1, seconds=pose[1])
                         obs = raw._observation()
-                    expected = reference_action(model, norm, obs, config, raw, trim, command, mirror)
+                    expected = reference_action(model, norm, obs, config, raw, trim, command, mirror, walk_only)
                     if step % stride == 0 and count < samples:
+                        walking += bool(np.linalg.norm(obs[command[0]:command[1]]) >= task.PHASE_STOP_NORM
+                                        if command is not None else moving)
                         got = session.run(['actions'], {'obs': obs[None, :actor_inputs].astype(np.float32)})[0][0]
                         output, offset = expected, None  # what the graph returns, the targets the environment adds
                         if arms is not None:
@@ -771,9 +820,10 @@ def check(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
     finally:
         norm.close()
     return {'samples': count, 'max_abs_diff': worst, 'max_target_diff': worst_target, 'tolerance': TOLERANCE,
-            'resets': resets, 'crouched': int(crouched), 'arm_targets': int(armed),
+            'resets': resets, 'crouched': int(crouched), 'arm_targets': int(armed), 'walking': int(walking),
             'ok': (count == samples and worst < TOLERANCE and worst_target < TOLERANCE
-                   and (not config.get('arm_targets') or armed > 0))}
+                   and (not config.get('arm_targets') or armed > 0)
+                   and (not walk_only or 2 * walking >= count > walking))}
 
 
 def check_getup(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
@@ -862,6 +912,7 @@ class ExportedPolicy:
         self.steps = int(properties['steps'])
         self.trim = np.array(json.loads(properties['stand_trim'])) if 'stand_trim' in properties else None
         self.symmetric = properties.get('symmetric') == 'true'
+        self.symmetric_walk = properties.get('symmetric_walk') == 'true'
         # arm_targets: the graph adds the slot's d/scale (g1_ctrl's last_action); the environment adds d itself, so
         # predict gives it the residual back.
         self.arm = None
@@ -913,14 +964,19 @@ def main(argv=None):
                               'несимметрии политики стоя, не больше 0,052 рад на сустав)')
     variant.add_argument('--symmetric', action='store_true',
                          help='только для опытов: ½(π(o) + M·π(M·o)) — ломает выбор ноги при толчке стоя')
+    parser.add_argument('--symmetric-walk', action='store_true',
+                        help='½(π(o) + M·π(M·o)) только на ходу (норма команды с поворотом ≥ 0,1), стоя — π(o); '
+                             'можно вместе с --stand-trim, нельзя с --symmetric')
     parser.add_argument('--command-ranges', type=float, nargs=4, metavar=('X_MIN', 'X_MAX', 'Y', 'YAW'),
                         help='сузить диапазоны команд в deploy.yaml (g1_ctrl зажимает в них стик): вперёд '
                              'X_MIN…X_MAX м/с, вбок ±Y м/с, поворот ±YAW рад/с, только внутри диапазонов обучения '
                              'этапа (до проб на полу — как этап 1: -0.5 1 0.5 1)')
     args = parser.parse_args(argv)
+    if args.symmetric and args.symmetric_walk:
+        parser.error('--symmetric и --symmetric-walk вместе нельзя: выберите одно')
     stage = resolve_stage(args.stage)
     trim, info = stand_trim(stage) if args.stand_trim else (None, None)
-    result = export(stage, args.out, trim, info, args.symmetric, args.command_ranges)
+    result = export(stage, args.out, trim, info, args.symmetric, args.command_ranges, args.symmetric_walk)
     print(f'Этап: {stage}')
     print(f'policy.onnx: {result["onnx"]} (вход obs [1, {result["actor_inputs"]}], выход actions '
           f'[1, {result["actions"]}])')
@@ -934,11 +990,16 @@ def main(argv=None):
               f'({info["joints"][worst]}), обрезаны до ±{info["limit_rad"]:g} рад: {clipped}')
     if args.symmetric:
         print('Симметризованная политика ½(π(o) + M·π(M·o)) — только для опытов')
+    if args.symmetric_walk:
+        print('Симметризация на ходу: ½(π(o) + M·π(M·o)) при норме команды ≥ 0,1, стоя — π(o)'
+              + (' с подстройкой стоя' if trim is not None else ''))
     for warning in result['warnings']:
         print(f'Внимание: {warning}')
     if args.samples > 0:
         verdict = check(stage, result['onnx'], samples=args.samples)
         same = ' (с той же подстройкой стоя)' if trim is not None else ' (симметризованным)' if args.symmetric else ''
+        if args.symmetric_walk:
+            same += f' (симметризованным на ходу: на ходу {verdict["walking"]} из {verdict["samples"]})'
         crouched = f' (в приседе {verdict["crouched"]})' if verdict['crouched'] else ''
         if verdict.get('arm_targets'):
             crouched += f' (с целями рук {verdict["arm_targets"]})'

@@ -4,7 +4,7 @@ important events, GitHub once a week and a release for each new robot candidate,
   publish.py site [--dry-run]       site_export -> scan -> upload to ihc:www/g1lab.ru (leftovers removed) -> check
   publish.py github [--dry-run]     the lab's HEAD (git archive) -> the clean copy ../g1-lab-public -> scan -> CPU
                                     tests there -> one commit (GitHub noreply author) -> push to mawgly/g1-lab
-  publish.py release <export dir> --tag candidate-N --title "..." --notes <english notes.md> [--dry-run]
+  publish.py release <export dir> --tag candidate-N[.M] --title "..." --notes <english notes.md> [--dry-run]
                                     github first, then a release with policy.onnx + deploy.yaml zipped and the
                                     safety warning around the notes (numbers in the notes come from the lab)
 
@@ -256,8 +256,8 @@ def github(dry_run):
 
 def release(export, tag, title, notes, dry_run):
     export, notes = Path(export), Path(notes)
-    if not re.fullmatch(r'candidate-\d+', tag):
-        raise Refused('тег — candidate-<номер>')
+    if not re.fullmatch(r'candidate-\d+(\.\d+)?', tag):
+        raise Refused('тег — candidate-<номер>[.<версия>]')
     for name in ('policy.onnx', 'deploy.yaml'):
         if not (export / name).is_file():
             raise Refused(f'в {export} нет {name}')

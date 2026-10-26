@@ -177,7 +177,7 @@ JOURNAL_FIELDS = {'roadmap': ('title', 'detail'), 'sections': ('title', 'text'),
                   'races': ('title', 'text'), 'entries': ('title', 'text'), 'check': ('title',),
                   'items': ('label', 'value', 'target'), 'iterations': ('title', 'question', 'decision'),
                   'messages': ('text',), 'skills': ('title',), 'against': ('title',),
-                  'skill_items': ('skill', 'label', 'target', 'value', 'reference', 'note')}
+                  'skill_items': ('skill', 'label', 'target', 'value', 'reference', 'note', 'v0')}
 # Rows whose values may be numbers alone, with Russian decimal commas (goal_check, scripts/lab/skills_check.py).
 NUMBER_ROWS = ('items', 'skill_items')
 

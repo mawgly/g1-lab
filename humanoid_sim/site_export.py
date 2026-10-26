@@ -10,9 +10,11 @@ pages load (followed through their imports, vendor/ only if a page needs it) and
 data/ holds, for ru, en and zh, what the server answers the browser: the journal (journal.load +
 i18n.localize_journal, as /api/lab/journal) and the branch tree (Laboratory.entries and notes, the benchmarks +
 i18n.localize_snapshot, as /api/lab, plus `robots`: /api/lab/robots' names and race flags) without what runs the
-lab: queue, worker, jobs, hardware, process ids, the settings forms.
+lab: queue, worker, jobs, hardware, process ids, the settings forms; and the home page's data (humanoid_sim.home,
+written by scripts/site/home_update.py; {"empty": true} before its first run), as /api/lab/home.
 media/ holds the journal pictures, clips and figures that data names and the home page's site-<lang>-<name> clips
-(data-clip in a page), nothing else from the journal folder. No live race: the pages show pre-rendered clips.
+(data-clip in a page, and the clips the home data names), nothing else from the journal folder. No live race: the
+pages show pre-rendered clips.
 """
 import argparse
 import json
@@ -22,7 +24,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from . import i18n, journal
+from . import home, i18n, journal
 from .core import DEFAULT_RUN, ROOT, read_json
 from .lab import Laboratory
 
@@ -162,17 +164,21 @@ def export(out, run_dir=DEFAULT_RUN, zip_file=None):
     lab = Laboratory(run_dir)
     content = i18n.Content(lab.root)
     saved, snapshot, robots = journal.load(lab.root), lab_snapshot(lab), catalog()
+    front = home.load(lab.root)
     names = set()
     for lang in i18n.LANGUAGES:
         localized = _scrub(i18n.localize_journal(saved, lang, content))
         names |= media_names(localized)
         _write_json(out / 'data' / f'journal.{lang}.json', localized)
+        _write_json(out / 'data' / f'home.{lang}.json',
+                    {'empty': True} if front is None else _scrub(home.localize(front, lang, content)))
         tree = i18n.localize_snapshot(snapshot, lang, content)
         tree = {key: value for key, value in tree.items() if key not in CONTROL}
         _write_json(out / 'data' / f'lab.{lang}.json',
                     _scrub({**tree, 'robots': robot_names(robots, lang), 'exported_at': time.time()}))
 
-    clips = sorted({name for source in pages for name in CLIP.findall((WEB / source).read_text(encoding='utf-8'))})
+    clips = sorted({name for source in pages for name in CLIP.findall((WEB / source).read_text(encoding='utf-8'))}
+                   | set(home.clips(front)))
     site_media = {f'site-{lang}-{clip}{suffix}' for clip in clips for lang in i18n.LANGUAGES
                   for suffix in ('.webp', '-poster.jpg')}
     sizes = {'journal': 0, 'site': 0}

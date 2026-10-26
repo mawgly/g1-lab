@@ -4,7 +4,7 @@
 
 Without --url: page and server strings that have no entry in humanoid_sim/web/i18n/<lang>.json. With --url, also
 what that server answers in the language (read-only GETs): branch names and notes, robot and parameter labels, the
-journal, report pages and, with --race, race frames (opening a race loads its stages). Every Cyrillic string found is
+journal, the home page's data, report pages and, with --race, race frames (opening a race loads its stages). Every Cyrillic string found is
 either the lab's own text (journal, names, notes) that humanoid_sim.journal_translate has not translated yet, or an
 interface string, a bug: the exit code is 1 when there is any of the latter. For the pages as drawn, paste
 scripts/i18n/dom_scan.js into the browser console.
@@ -17,7 +17,7 @@ import sys
 import urllib.request
 from urllib.parse import quote
 
-from . import i18n
+from . import home, i18n
 
 CYRILLIC = i18n.CYRILLIC
 
@@ -62,6 +62,10 @@ def live(url, lang, race=False):
         add('interface' if kind == 'items' else 'lab text', f'journal {kind}.{field}', text)
         return text
     i18n.map_journal(fetch(url, '/api/lab/journal', lang), journal_text)
+    front = fetch(url, '/api/lab/home', lang)
+    if not front.get('empty'):  # the home page's data: lab text, as the journal's
+        home.map_home(front, lambda text, kind, field: add('lab text', f'home {kind}.{field}', text) or text,
+                      lambda item, field: add('lab text', f'home {field}', item[field]) or item[field])
     for e in lab['experiments']:
         if not e.get('has_report'):
             continue

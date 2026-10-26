@@ -86,6 +86,17 @@ PROBE_ROWS = dict(
     refall=r'Повторное падение в GetUp после подъёма',
     velocity=r'Velocity №\d+ из стойки: падений$',
 )
+# A stage the critic's probe never ran on has package.py's «Проверка навыков» table instead (GETUP_SKILLS,
+# scripts/lab/skills_check.py in the getting-up mode: ready38's rule, up within 6 s, candidate 8's Velocity 1 s later).
+SKILLS_HEADING = '### Проверка навыков'
+SKILLS_PHYSICS = {'Наша физика': 'ours', 'Задержка 20 мс': 'delay', 'Трение стоп 0,3': 'foot'}
+SKILLS_ROWS = dict(
+    success=r'готовность к роботу: (?P<physics>Наша физика|Задержка 20 мс|Трение стоп 0,3): встал, без отсечки '
+            r'скорости, передан в ходьбу (?P<title>№\d+)$',
+    cutoff=r'готовность к роботу: Отсечки скорости g1_ctrl',
+    velocity=r'передача в ходьбу №\d+: Падения в первые 5 с после передачи',
+)
+SKILLS_WITHIN, SKILLS_AFTER = 6, 1  # s: skills_check's getting-up rule (ready38's)
 BRIDGE_ROWS = dict(
     rose=r'Встал; время подъёма$',
     lay=r'Как лёг перед GetUp$',
@@ -325,7 +336,23 @@ def getup_data(reference, getup):
     out['cutoff'] = count(rows['cutoff'][1]) if 'cutoff' in rows else None
     velocity = nums(rows['velocity'][1]) if 'velocity' in rows else []
     out['velocity_falls'] = int(velocity[0].value) if velocity else None
-    starts = STARTS.search(text)
+    out['source'] = 'critic'
+    if not probe:  # the critic's probe did not run on this stage: skills_check's numbers, if REFERENCE.md has them
+        skills = column(section(text, SKILLS_HEADING), lambda head: head.endswith(PACKAGED))
+        hits = [(m, cell) for what, cell in skills.items() for m in [re.match(SKILLS_ROWS['success'], what)] if m]
+        physics = [dict(id=SKILLS_PHYSICS[m['physics']], total=c[1], succeeded=c[0], rise=None, refall=None)
+                   for m, cell in hits for c in [count(cell)] if c]
+        if physics and len(physics) == len(hits):
+            out.update(physics=physics, within=SKILLS_WITHIN, after=SKILLS_AFTER, title=hits[0][0]['title'],
+                       source='skills')
+        rows = find(skills, SKILLS_ROWS)
+        if 'cutoff' in rows:
+            out['cutoff'] = count(rows['cutoff'][1])
+        if 'velocity' in rows:
+            out['velocity_falls'] = int(nums(rows['velocity'][1])[0].value)
+        if skills:
+            out['source'] = 'skills'
+    starts = STARTS.search(text) if out['source'] == 'critic' else None  # the critic's probe's starts
     if starts:
         out['starts'] = dict(total=int(starts[1]), each=int(starts[2]), title=starts[3], falls=int(starts[4]))
     if bridge:
@@ -336,8 +363,8 @@ def getup_data(reference, getup):
             t = RISE.search(rows['rose'][1])
             b['rise'] = [num(t[3]), num(t[4]), num(t[2])] if t else None  # median, p90, the longest
         if 'lay' in rows:
-            lay = re.search(r'спина (\d+), живот (\d+)', rows['lay'][1])
-            b['lay'] = (int(lay[1]), int(lay[2])) if lay else None
+            lay = re.search(r'спина (\d+), живот (\d+)(?:, (?:правый |левый )?бок (\d+))?', rows['lay'][1])
+            b['lay'] = (int(lay[1]), int(lay[2]), int(lay[3] or 0)) if lay else None
         if 'cutoff' in rows:
             b['cutoff'] = count(rows['cutoff'][1])
         if 'velocity' in rows:
@@ -473,7 +500,9 @@ def collect(package, lab=LAB, chatter=None, goal_check=None):
     if info.get('kind') != KIND:
         fail(f'{manifest}: kind {info.get("kind")!r}, а не {KIND!r}')
     main, spare = info['candidates'][0], info['candidates'][1:]
-    branch, _, steps = main['export'].rpartition('-')
+    # <branch>-<steps>, or with export_g1's suffix after it (…-7221510144-symwalk, package n8s)
+    named = re.fullmatch(r'(exp-[0-9a-f]+)-(\d+)-[a-z][\w-]*', main['export'])
+    branch, steps = named.groups() if named else main['export'].rsplit('-', 1)
     steps = int(steps)
     warnings, sources = [], [(rel(manifest), 'package', md5(manifest))]
     reference_path = package / 'REFERENCE.md'
@@ -764,7 +793,10 @@ def render(data, lang='ru'):
     # getting up
     if getup:
         names = dict(ours=_('наша физика'), delay=_('задержка 20 мс'), floor=_('скользкий пол: подошвы 0,4, пол 0,2'),
-                     noise=_('шум датчиков и смещение энкодеров'))
+                     noise=_('шум датчиков и смещение энкодеров'), foot=_('трение стоп 0,3'))
+        # the probe's source: the critic's ready38, or skills_check for a stage it never ran on
+        skills = getup.get('source') == 'skills'
+        probe_source = _('проверка навыков (skills_check)') if skills else critic
         intro = _('Политика вставания — этап {n} ({steps} шагов), выгрузка {export}.',
                   n=int(getup['stage']) // 1_000_000, steps=getup['stage'], export=f"`{getup['export']}`")
         if getup['physics']:
@@ -781,7 +813,9 @@ def render(data, lang='ru'):
         for p in getup['physics'] or []:
             rise = ' / '.join(s(x) for x in p['rise']) if p['rise'] else ''
             share = short(100 * p['succeeded'] / p['total'], lang, 1)
-            out.append(f"| {_('проба критика без подтяжки: {name}', name=names[p['id']])} | "
+            where = (_('проверка навыков без подтяжки: {name}', name=names[p['id']]) if skills
+                     else _('проба критика без подтяжки: {name}', name=names[p['id']]))
+            out.append(f"| {where} | "
                        f"{of((p['succeeded'], p['total']))} ({share}%) | {rise} | "
                        f"{'' if p['refall'] is None else p['refall']} |")
         if not getup['physics']:
@@ -798,11 +832,13 @@ def render(data, lang='ru'):
         unbridged = _('этап в связке не гоняли') if getup['bridged'] else nothing
         out += ['', kv([
             (_('Отсечка по скорости суставов (пороги GetUp), проба'), of(getup['cutoff']) if getup['cutoff'] else None,
-             critic, nothing),
+             probe_source, nothing),
             (_('Ходьба после подъёма, проба: падений'),
-             str(getup['velocity_falls']) if getup['velocity_falls'] is not None else None, critic, nothing),
+             str(getup['velocity_falls']) if getup['velocity_falls'] is not None else None, probe_source, nothing),
             (_('Как лёг перед подъёмом, связка'),
-             _('на спине {n1}, на животе {n2}', n1=g['lay'][0], n2=g['lay'][1]) if g and g['lay'] else None, bridge,
+             (_('на спине {n1}, на животе {n2}', n1=g['lay'][0], n2=g['lay'][1]) if not g['lay'][2] else
+              _('на спине {n1}, на животе {n2}, на боку {n3}', n1=g['lay'][0], n2=g['lay'][1], n3=g['lay'][2]))
+             if g and g['lay'] else None, bridge,
              nothing if g else unbridged),
             (_('Отсечки (тайм-аут, скорость сустава), связка'), of(g['cutoff']) if g and g['cutoff'] else None, bridge,
              nothing if g else unbridged),

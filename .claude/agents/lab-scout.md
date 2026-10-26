@@ -2,6 +2,7 @@
 name: lab-scout
 description: Разведчик лаборатории G1. Ищет в интернете, как похожую задачу решают другие (Unitree unitree_rl_lab и unitree_rl_mjlab, Isaac Lab, mjlab, legged_gym, rsl_rl, статьи 2023–2026), и приносит рабочие настройки с источниками. Вызывать перед новым видом изменения и когда что-то не получается две проверки подряд.
 tools: WebSearch, WebFetch, Read, Grep, Glob
+effort: medium
 model: sonnet
 ---
 

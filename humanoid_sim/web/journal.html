@@ -401,6 +401,9 @@
       .j-role.reviewer {
         background: #8a4a12;
       }
+      .j-role.owner {
+        background: #1d1d1f;
+      }
       .j-decision {
         padding: 12px 14px;
         border-radius: 10px;
@@ -640,6 +643,17 @@
         font-size: 13.5px;
       }
       table.j-skills .fail td.j-note {
+        color: var(--bad);
+      }
+      .j-vs {
+        font-size: 12.5px;
+        white-space: nowrap;
+        color: var(--ink-3);
+      }
+      .j-vs.better {
+        color: var(--good);
+      }
+      .j-vs.worse {
         color: var(--bad);
       }
       @media (max-width: 640px) {

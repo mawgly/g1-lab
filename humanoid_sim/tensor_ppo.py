@@ -98,10 +98,14 @@ def generalized_advantage(rewards, values, dones, next_value, gamma, gae_lambda)
 
 
 class TensorPPO:
-    def __init__(self, model, env, config, normalizer, mirror=None, bounds=None):
+    def __init__(self, model, env, config, normalizer, mirror=None, bounds=None, amp=None):
         """mirror: symmetry.Mirror of the task, required when config['mirror_coef'] > 0.
-        bounds: (low, high) per action for the bounds loss instead of the action box (range_bounds)."""
+        bounds: (low, high) per action for the bounds loss instead of the action box (range_bounds).
+        amp: getup_amp.GetupAMP (g1_getup's amp reward weight): its style reward on the env's state pairs
+        (env.amp_pair, env.amp_band after each step) is added to the task's, and its discriminator takes one step
+        after each PPO minibatch step; None: neither (the old path, bit for bit)."""
         self.model, self.env, self.config, self.normalizer = model, env, config, normalizer
+        self.amp = amp
         self.policy = model.policy
         self.device = env.device
         if config.get('mirror_coef') and mirror is None:
@@ -126,6 +130,8 @@ class TensorPPO:
         completed = torch.zeros((), device=self.device)
         episode_return = torch.zeros((), device=self.device)
         episode_length = torch.zeros((), device=self.device)
+        if self.amp is not None:
+            self.amp.begin_rollout(self.config['n_steps'], self.env.n_envs)
         for step in range(self.config['n_steps']):
             actions, values, log_probs = self.policy(self.obs)
             self.obs_buffer[step].copy_(self.obs)
@@ -133,6 +139,8 @@ class TensorPPO:
             self.values[step].copy_(values.flatten())
             self.log_probs[step].copy_(log_probs)
             obs, reward, terminated, truncated, terminal_obs = self.env.step(actions.clamp(self.low, self.high))
+            if self.amp is not None:  # the AMP style reward on the step's state pairs, after the task's own
+                reward = reward + self.amp.reward(step, self.env.amp_pair, self.env.amp_band)
             done = terminated | truncated
             self.obs = self.normalizer.observation(obs)
             rewards = self.normalizer.reward(reward, done)
@@ -153,6 +161,8 @@ class TensorPPO:
                    'rollout/ep_len_mean': episode_length.item() / count if count else float('nan')}
         if hasattr(self.env, 'rollout_metrics'):  # task means over this rollout (G1: yaw_drift_abs, self_contact, arm_press)
             metrics.update(self.env.rollout_metrics())
+        if self.amp is not None:  # the rollout's in-band pairs into the discriminator's buffer; rollout/amp_reward
+            metrics.update(self.amp.end_rollout())
         return metrics
 
     def update(self):
@@ -216,11 +226,16 @@ class TensorPPO:
                     # state-independent std without bound (seen: sigma 1e10); cap it.
                     with torch.no_grad():
                         self.policy.log_std.clamp_(max=math.log(cfg['max_std']))
+                if self.amp is not None:  # one discriminator step per PPO minibatch, the human batch as large
+                    self.amp.train_step(len(batch))
             self.model._n_updates += 1
             if stop:
                 break
         means = torch.stack(stats).mean(0).detach().cpu().tolist()
         if not all(__import__('math').isfinite(x) for x in means):
             raise RuntimeError('Non-finite PPO update')
-        return dict(zip(('train/policy_gradient_loss', 'train/value_loss', 'train/entropy_loss',
-                         'train/approx_kl', 'train/clip_fraction', 'train/mirror_loss'), means))
+        result = dict(zip(('train/policy_gradient_loss', 'train/value_loss', 'train/entropy_loss',
+                           'train/approx_kl', 'train/clip_fraction', 'train/mirror_loss'), means))
+        if self.amp is not None:
+            result.update(self.amp.end_update(self.rewards.numel()))
+        return result

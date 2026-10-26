@@ -91,10 +91,13 @@ def restore_vec_training_state(env, stage):
 
 
 class StageCallback(BaseCallback):
-    def __init__(self, run_dir, every, target, duration_seconds=None, parent_stop=None, training_state=None):
+    def __init__(self, run_dir, every, target, duration_seconds=None, parent_stop=None, training_state=None,
+                 extras=None):
         super().__init__()
         # training_state(): the environments' state each stage keeps (save_stage), None: nothing (most tasks).
+        # extras(folder): more files each stage keeps (save_stage; full GPU g1_getup with amp: the discriminator).
         self.training_state = training_state
+        self.extras = extras
         self.run_dir = Path(run_dir)
         self.every = every
         self.target = target
@@ -127,7 +130,7 @@ class StageCallback(BaseCallback):
     def snapshot(self):
         self.status('saving')
         stage = save_stage(self.run_dir, self.model, self.training_env,
-                           None if self.training_state is None else self.training_state())
+                           None if self.training_state is None else self.training_state(), extras=self.extras)
         if not (stage / 'evaluation.json').exists():
             metrics = evaluate_stage(stage)
             write_json(stage / 'evaluation.json', metrics)

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from humanoid_sim.tasks import g1_tensor_math as task
-from humanoid_sim.tasks.config import G1_GETUP_REWARD_WEIGHTS
+from humanoid_sim.tasks.config import G1_GETUP_REWARD_WEIGHTS, G1_GETUP_TASK_WEIGHTS
 from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
 
 
@@ -91,7 +91,7 @@ def test_the_head_top_is_the_head_meshs_highest_point():
 def test_numpy_and_torch_give_the_same_numbers():
     inputs = batch()
     expected, standing = task.getup_reward_components(**inputs)
-    assert set(expected) == set(G1_GETUP_REWARD_WEIGHTS) and all(v.shape == (64,) for v in expected.values())
+    assert set(expected) == set(G1_GETUP_TASK_WEIGHTS) and all(v.shape == (64,) for v in expected.values())
     assert isinstance(standing, np.ndarray) and 5 < standing.sum() < 30  # a share of the worlds stands
     for dtype, tolerance in ((torch.float64, 1e-12), (torch.float32, 1e-4)):
         got, got_standing = task.getup_reward_components(**as_torch(inputs, dtype))
@@ -127,7 +127,8 @@ def test_the_terms_lying_and_standing():
     assert {key: float(value[0]) for key, value in terms.items()} == {key: 0. for key in terms}
     assert {key: float(value[1]) for key, value in terms.items()} == dict(
         head=1., upright=.5, stand=1., stand_pose=.5, stand_still=0., effort=0., joint_speed=0., action_change=0.,
-        joint_limits=0., impact=0., sole_impact=0., stance_width=0.)
+        joint_limits=0., impact=0., sole_impact=0., stance_width=0., arm_press=0., style=0., head_rise=0.,
+        sole_slip=0.)
     # Head term linear between 0.15 and 1.20; upright only with the pelvis above 0.4.
     inputs.update(head=np.array([.15 + 1.05 / 2, 2.]), height=np.array([.39, .41]),
                   torso_rotation=np.stack([np.eye(3), np.eye(3)]))

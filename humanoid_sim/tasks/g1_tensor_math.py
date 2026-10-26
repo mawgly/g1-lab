@@ -9,8 +9,8 @@ rotation maps pelvis local coordinates to world coordinates.
 import math
 import numpy as np
 import torch
-from .config import (ARM_PERTURB_RADIANS, G1_COMMANDS, G1_GETUP_REWARD_WEIGHTS, G1_REWARD_WEIGHTS, GETUP_CRITIC_EXTRAS,
-                     GETUP_POSE_STD, backward_share)
+from .config import (ARM_PERTURB_RADIANS, G1_COMMANDS, G1_GETUP_REWARD_WEIGHTS, G1_GETUP_SETTLE_WEIGHTS,
+                     G1_GETUP_TRACK_WEIGHTS, G1_REWARD_WEIGHTS, GETUP_CRITIC_EXTRAS, GETUP_POSE_STD, GETUP_STANCE_PELVIS, TRACK_CRITIC_EXTRAS, backward_share)
 
 # Gait clock: each leg is in stance for the first 55% of its 0.8 s cycle, legs half a cycle apart.
 # Defaults of the task's `gait` setting; a stance share below 0.5 adds flight phases (running).
@@ -1193,7 +1193,8 @@ def getup_success_pose(head, height, torso_rotation, sole_height=None):
 
 def getup_reward_components(head, height, torso_rotation, velocity, position, home, soft_low, soft_high, limit_joints,
                             sole_height, torque, joint_velocity, action, previous_action, weights=None, impact=None,
-                            stand_pose_std=GETUP_POSE_STD, sole_impact=None, stance_width=None):
+                            stand_pose_std=GETUP_POSE_STD, sole_impact=None, stance_width=None, arm_press=None,
+                            style=None, head_speed=None, stance_pelvis=GETUP_STANCE_PELVIS, sole_slip=None):
     """The g1_getup reward terms, each (n,), and the standing state (getup_standing), (n,) bool.
     head: (n,) top of the head (head_height); height: (n,) pelvis height; torso_rotation: (n, 3, 3); velocity: (n, 6)
     pelvis object velocity as reward_components'; position, joint_velocity, torque: (n, joints) after the step (the
@@ -1209,8 +1210,18 @@ def getup_reward_components(head, height, torso_rotation, velocity, position, ho
     step's sole sphere floor contacts per foot with threshold GETUP_SOLE_IMPACT_SPEED, for the sole_impact term
     (iteration 44); None: the term is zero (computed only while that weight is non-zero). stance_width: (n,) W of
     the function stance_width, for the stance_width term (after branch 46); None: the term is zero (likewise).
+    arm_press: (n,) the function arm_press's Σ over the free arm joints (the locked wrists left out) of the target
+    before pd_bound against the angle after the step, for the arm_press term (iteration 52); None: zero (likewise).
+    style: (n,) d of the function style_distance, the frame's distance to the nearest human frame of the style library,
+    for the style term (iteration 53), paid only with the head in STYLE_HEAD_BAND (style_band; outside it d may be
+    +inf, the CPU task does not compute it there); None: zero (likewise).
+    head_speed: (n,) the head top's vertical speed over the control step (head − its height a step before)/dt, for the
+    head_rise term (iteration 57); None: zero (likewise). stance_pelvis: the stance_width term's pelvis threshold (m, a
+    float; task_config stance_pelvis, iteration 60; GETUP_STANCE_PELVIS 0.5 the original). sole_slip: (n,) the function
+    sole_slip's Σ over the feet in contact of their horizontal speed², for the sole_slip term (iteration 62); None:
+    zero (computed only while that weight is non-zero).
 
-    head          w·clip((head − 0.15)/1.05, 0, 1)
+    head         w·clip((head − 0.15)/1.05, 0, 1)
     upright       w·(1 + cos tilt)/2·[pelvis > 0.4]
     stand         w·[standing]  (head > 1.15, tilt < 15°, pelvis > 0.70, both feet in contact)
     stand_pose    w·[standing]·exp(−mean((q − home)²)/σ²)  (σ stand_pose_std, 0.1 by default)
@@ -1221,7 +1232,12 @@ def getup_reward_components(head, height, torso_rotation, velocity, position, ho
     joint_limits  −w·Σ over limit_joints of the excess beyond the soft limits (rad)
     impact        −w·Σ over the bodies of max(0, v − 1.5)²  (v: a body's floor approach speed, m/s; impact_penalty)
     sole_impact   −w·Σ over the feet of max(0, v − 0.5)²  (v: a foot's sole floor approach speed, m/s)
-    stance_width  −w·[pelvis > 0.5, both feet in contact]·max(0, W − 0.30)  (W: the feet's width, m; stance_active)"""
+    stance_width  −w·[pelvis > p, both feet in contact]·max(0, W − 0.30)  (W: the feet's width, m; p stance_pelvis,
+                  0.5 by default; stance_active)
+    arm_press     −w·[standing]·Σ over the free arm joints of (T − q)²  (T: pd_target before pd_bound, rad²)
+    style         w·[0.3 < head < 1.1]·exp(−d/2)  (d: style_distance to the nearest human frame)
+    head_rise     −w·max(0, v_z − 0.8)  (v_z: the head top's vertical speed, m/s; head_rise)
+    sole_slip     −w·Σ over the feet of [sole < 1 cm]·‖v_xy‖²  (v_xy: the foot's horizontal speed, m/s; sole_slip)"""
     weights = G1_GETUP_REWARD_WEIGHTS if weights is None else weights
     xp = _module(head)
     standing = getup_standing(head, height, torso_rotation, sole_height)
@@ -1245,10 +1261,45 @@ def getup_reward_components(head, height, torso_rotation, velocity, position, ho
         'sole_impact': -weights['sole_impact'] * (xp.zeros_like(head) if sole_impact is None
                                                   else _like(sole_impact, head)),
         'stance_width': -weights['stance_width'] * (
-            xp.zeros_like(head) if stance_width is None else _like(stance_active(height, sole_height), head)
+            xp.zeros_like(head) if stance_width is None
+            else _like(stance_active(height, sole_height, stance_pelvis), head)
             * xp.clip(_like(stance_width, head) - GETUP_STANCE_WIDTH, 0, None)),
+        'arm_press': -weights['arm_press'] * (xp.zeros_like(head) if arm_press is None
+                                              else stand * _like(arm_press, head)),
+        'style': weights['style'] * (xp.zeros_like(head) if style is None else xp.where(
+            style_band(head), xp.exp(-_like(style, head) / STYLE_KERNEL), xp.zeros_like(head))),
+        'head_rise': -weights['head_rise'] * (xp.zeros_like(head) if head_speed is None
+                                              else head_rise(_like(head_speed, head))),
+        'sole_slip': -weights['sole_slip'] * (xp.zeros_like(head) if sole_slip is None else _like(sole_slip, head)),
     }
     return components, standing
+
+
+# sole_slip reward weight (g1_getup, iteration 62; the critic's lab-critic/it53/slip61.py): the split is made by
+# dragging, the soles sliding over the floor at 3-4 m/s while below SOLE_CONTACT_HEIGHT (a human's ~0.18 m/s), and
+# with stance_width 4 the legs close by dragging too (up in 108 of 120 starts at foot friction 0.3). The term charges
+# the squared horizontal speed of each foot in contact: the ankle_roll origin's displacement over the control step
+# over dt (the walking task's foot_speed, as clearance and slip read it), the contact the lowest sole point below
+# SOLE_CONTACT_HEIGHT (sole_height). A foot's position before the step is read at the step's start, so the first
+# step after a reset starts from the reset's own pose.
+
+
+def sole_slip(foot_speed, sole_height):
+    """(n,) Σ over both feet of [sole_height < SOLE_CONTACT_HEIGHT]·foot_speed²: foot_speed (n, 2) m/s, sole_height
+    (n, 2) m. numpy or torch alike."""
+    contact = sole_height < SOLE_CONTACT_HEIGHT
+    return (_like(contact, foot_speed) * foot_speed ** 2).sum(-1)
+
+
+# head_rise reward weight (g1_getup, iteration 57; the critic's lab-critic/it53/vz53.py): the robot lifts its head from
+# 0.3 to 1.1 m in 0.77 s, a human in 1.80; its head rises in the band at 1.08 m/s (median), a human's p92 is 0.8. The
+# term charges the head top's vertical speed above GETUP_HEAD_RISE_SPEED on every step (no band condition).
+GETUP_HEAD_RISE_SPEED = .8  # m/s
+
+
+def head_rise(head_speed):
+    """(n,) the head_rise term's excess max(0, v_z − GETUP_HEAD_RISE_SPEED), head_speed (n,) m/s. numpy or torch."""
+    return _module(head_speed).clip(head_speed - GETUP_HEAD_RISE_SPEED, 0, None)
 
 
 def getup_critic_extras(velocity, height, head, force):
@@ -1420,8 +1471,8 @@ GETUP_FLIGHT_SECONDS = .04
 # W the left − right foot (ankle_roll origins) across the pelvis heading (stance_width; getup_stance.py's width), on
 # the feet: the pelvis above GETUP_STANCE_PELVIS and both soles below SOLE_CONTACT_HEIGHT, with nothing asked of the
 # head or the tilt, so the landing counts too (stance_active).
+# The pelvis threshold is task_config stance_pelvis (iteration 60; config.GETUP_STANCE_PELVIS 0.5 when missing).
 GETUP_STANCE_WIDTH = .30  # m
-GETUP_STANCE_PELVIS = .5  # m
 # The pelvis heading of stance_width is the yaw of its x axis while that axis's horizontal length is at least this;
 # below it (the pelvis pitched past 84°: lying on the back or the front) the yaw of its y axis turned −90° about z,
 # whose horizontal length is then at least √(1 − 0.1²). The x axis's yaw there comes from two near-zero numbers, and
@@ -1444,7 +1495,404 @@ def stance_width(feet_position, pelvis_rotation):
     return -xp.sin(yaw) * apart[:, 0] + xp.cos(yaw) * apart[:, 1]
 
 
-def stance_active(height, sole_height):
-    """(n,) bool, where the stance_width term counts: the pelvis (height (n,)) above GETUP_STANCE_PELVIS and both soles
-    (sole_height (n, 2)) below SOLE_CONTACT_HEIGHT."""
-    return (height > GETUP_STANCE_PELVIS) & (sole_height < SOLE_CONTACT_HEIGHT).all(-1)
+def stance_active(height, sole_height, pelvis=GETUP_STANCE_PELVIS):
+    """(n,) bool, where the stance_width term counts: the pelvis (height (n,)) above `pelvis` (m; task_config
+    stance_pelvis, GETUP_STANCE_PELVIS the original) and both soles (sole_height (n, 2)) below SOLE_CONTACT_HEIGHT."""
+    return (height > pelvis) & (sole_height < SOLE_CONTACT_HEIGHT).all(-1)
+
+
+# style reward weight (g1_getup, iteration 53; the critic's lab-critic/it53, human53.py, knn53.py): "AMP without
+# training", a reward for looking like a human getting up. The style library (tasks/g1_getup_style, built by
+# scripts/lab/getup_style_library.py from LAFAN1's fallAndGetUp clips retargeted to the G1 by Unitree, subjects 1-4,
+# resampled to the 50 Hz control step) holds style_features of the human frames with the head in STYLE_HEAD_BAND, the
+# rise itself, not lying still or standing. Per world: d, the distance from its frame's features to the nearest library
+# frame (style_distance), paid w·exp(−d/STYLE_KERNEL) while its head is in the band, 0 outside it. Why: candidates 823
+# and 1044 get up with a jump at a pace no human keeps (their scaled speed features' median norm 2.8 against 0.77);
+# held-out subject 5 lies at d 1.26 (median) from the library, 823 at 4.5, 1044 at 4.6 (knn53.py, at 30 Hz). A
+# positive, wide kernel: a narrow one gives 0 and no gradient at d 4.5, and a charge inside the band would pay for
+# leaving it sooner.
+STYLE_VERSION = 'getup-style-v1'  # the feature layout below; a library of another one is refused
+STYLE_HEAD_BAND = (.3, 1.1)  # m, the head top (head_height), open interval
+STYLE_KERNEL = 2.
+STYLE_HEIGHT_SCALE = 3.  # the pelvis height's weight in the features (knn53.py)
+STYLE_SPEED_SCALE = .1  # the joint speeds' weight (rad/s → feature)
+
+
+def style_band(head):
+    """(n,) bool, where the style term pays: the head top (head (n,), head_height) within STYLE_HEAD_BAND."""
+    return (head > STYLE_HEAD_BAND[0]) & (head < STYLE_HEAD_BAND[1])
+
+
+def style_features(position, joint_velocity, pelvis_rotation, height, vertical_speed, joints):
+    """(n, 2·len(joints) + 5) the style term's features of a frame, knn53.py's: the angles of `joints` (the free ones,
+    all but the locked wrists; position (n, joints) qpos, rad), the gravity direction in the pelvis frame
+    (pelvis_rotation (n, 3, 3) world <- pelvis: Rᵀ·(0, 0, −1)), STYLE_HEIGHT_SCALE·pelvis height (height (n,), m),
+    STYLE_SPEED_SCALE·the speeds of `joints` (joint_velocity (n, joints), rad/s) and the pelvis's vertical speed
+    (vertical_speed (n,), m/s, world). numpy or torch alike."""
+    xp = _module(position)
+    joints = list(joints)
+    parts = (position[:, joints], -pelvis_rotation[:, 2, :], STYLE_HEIGHT_SCALE * height[:, None],
+             STYLE_SPEED_SCALE * joint_velocity[:, joints], vertical_speed[:, None])
+    if xp is torch:
+        return torch.cat([part.to(position.dtype) for part in parts], dim=1)
+    return np.concatenate([np.asarray(part, dtype=position.dtype) for part in parts], axis=1)
+
+
+def style_norms(library):
+    """(m,) the squared norms of the library's rows (m, features), which style_distance takes with it."""
+    return (library ** 2).sum(-1)
+
+
+def style_distance(features, library, norms):
+    """(n,) d, the Euclidean distance from each frame's style_features (features (n, f)) to the nearest row of the
+    library (m, f), and (n,) that row: d² = |x|² + min over the rows of (|y|² − 2·x·y), norms = style_norms(library);
+    one (n, m) product (CUDA: 4096 worlds against ~9 k rows), clipped at 0 before the root. numpy or torch alike."""
+    if isinstance(features, torch.Tensor):
+        nearest = torch.addmm(norms[None, :], features, library.T, alpha=-2.).min(dim=1)
+        best, index = nearest.values, nearest.indices
+    else:
+        scores = norms[None, :] - 2. * (features @ library.T)
+        index = scores.argmin(axis=1)
+        best = scores[np.arange(len(index)), index]
+    xp = _module(features)
+    return xp.sqrt(xp.clip(best + (features ** 2).sum(-1), 0, None)), index
+
+
+# task_config track_clip (g1_getup, iteration 64; the user's decision: the robot gets up as a human does, not as a
+# "spider"): motion tracking of one human clip getting up, as BeyondMimic (arXiv 2508.08241) / mjlab's G1 tracking.
+# The clip (tasks/g1_getup_track) holds, at the 50 Hz control step, the root and joint coordinates and, by the getting-up
+# model's kinematics, the world positions, rotations and the velocities of TRACK_BODIES' frame origins; one more frame
+# repeats the last pose with zero velocities, which the reference holds for TRACK_HOLD_SECONDS after the clip. A
+# world's clip clock counts control steps from its start frame; its reference is the clip at min(clock, hold frame),
+# turned by a yaw and moved by an xy offset (zero for a start from the clip itself, the bank row's pelvis heading and
+# position for a start from the bank, track_align). Rewards w·exp(−e/σ²), e the squared errors of track_errors: the
+# anchor (torso_link) in the world, the 14 bodies against the clip re-anchored under the robot's anchor (its xy, the
+# clip's height, the yaw between them; BeyondMimic's body_pos_relative_w), their linear and angular velocities in the
+# world. Ends (mjlab's terminations): the anchor's height off by more than TRACK_ANCHOR_Z, its projected gravity's z by
+# more than TRACK_GRAVITY_Z, an ankle or a hand (wrist_yaw) height by more than TRACK_END_Z. numpy or torch alike.
+TRACK_BODIES = ('pelvis', 'left_hip_roll_link', 'left_knee_link', 'left_ankle_roll_link', 'right_hip_roll_link',
+                'right_knee_link', 'right_ankle_roll_link', 'torso_link', 'left_shoulder_roll_link', 'left_elbow_link',
+                'left_wrist_yaw_link', 'right_shoulder_roll_link', 'right_elbow_link', 'right_wrist_yaw_link')
+TRACK_ANCHOR = 'torso_link'
+TRACK_END_BODIES = ('left_ankle_roll_link', 'right_ankle_roll_link', 'left_wrist_yaw_link', 'right_wrist_yaw_link')
+TRACK_HOLD_SECONDS = 3.
+TRACK_SIGMA = dict(anchor_pos=.3, anchor_ori=.4, body_pos=.3, body_ori=.4, body_lin_vel=1., body_ang_vel=3.14)
+TRACK_ANCHOR_Z, TRACK_GRAVITY_Z, TRACK_END_Z = .25, .8, .25
+# Training starts: the clip's first frame with mjlab's pose noise, a uniformly drawn frame of the clip with the same
+# noise and the clip's velocities (reference state init), a training row of the start bank lying on the back (the
+# junction with the getting-up task's starts).
+TRACK_START_SHARES = (.6, .3, .1)
+TRACK_START_KINDS = ('clip', 'frame', 'bank')
+TRACK_BANK_CLASS = 'back'
+# A bank start's limbs lie where the bank put them, not where the clip's first frame has them (the clip's right hand
+# 0.24-0.27 m above the held-out back rows'): its first TRACK_GRACE_SECONDS the ankles' and hands' heights end nothing,
+# the anchor's rules hold from the first step.
+TRACK_GRACE_SECONDS = .5
+# Uniform noise half-widths of a clip start: root xy, z (m), roll and pitch, yaw (rad, a world rotation before the
+# pose, Isaac's quat_from_euler_xyz), joints (rad, then the joint ranges); small root velocities (m/s, rad/s).
+TRACK_START_NOISE = dict(xy=.05, z=.01, tilt=.1, yaw=.2, joints=.1, linear=.1, angular=.1)
+TRACK_POSE_NOISE, TRACK_SPEED_NOISE = 35, 6  # uniform numbers a noisy start draws: pose (xyz, rpy, joints), speeds
+TRACK_HAND_PART = 'wrist'  # rollout/hand_force: the floor's force on the bodies named so (wrist roll, pitch, yaw links)
+
+
+def _cat(parts, axis=-1):
+    return torch.cat(parts, dim=axis) if isinstance(parts[0], torch.Tensor) else np.concatenate(parts, axis=axis)
+
+
+def _transpose(matrix):
+    return matrix.transpose(-1, -2) if isinstance(matrix, torch.Tensor) else np.swapaxes(matrix, -1, -2)
+
+
+def yaw_rotation(yaw):
+    """(n, 3, 3) rotations about the world z axis by yaw (n,)."""
+    xp = _module(yaw)
+    c, s = xp.cos(yaw), xp.sin(yaw)
+    zero, one = xp.zeros_like(yaw), xp.ones_like(yaw)
+    return xp.stack([xp.stack([c, -s, zero], -1), xp.stack([s, c, zero], -1), xp.stack([zero, zero, one], -1)], -2)
+
+
+def rotation_angle(a, b):
+    """(...) the angle (rad, 0..π) of the rotation between a and b (..., 3, 3), aᵀb: atan2 of its sine (the skew part)
+    and cosine (the trace), exact near 0 in float32 too; Isaac's quat_error_magnitude."""
+    xp = _module(a)
+    m = _transpose(a) @ b
+    sine = xp.sqrt((m[..., 2, 1] - m[..., 1, 2]) ** 2 + (m[..., 0, 2] - m[..., 2, 0]) ** 2
+                   + (m[..., 1, 0] - m[..., 0, 1]) ** 2) / 2
+    cosine = (m[..., 0, 0] + m[..., 1, 1] + m[..., 2, 2] - 1) / 2
+    return xp.arctan2(sine, cosine)
+
+
+def track_heading(rotation):
+    """(n,) the heading (yaw, rad) of a pelvis (rotation (n, 3, 3) world <- pelvis): the yaw of its x axis, or of its y
+    axis turned −90° where the x axis is within GETUP_STANCE_HEADING of vertical (lying on the back or the front), as
+    stance_width's."""
+    xp = _module(rotation)
+    forward_x, forward_y = rotation[:, 0, 0], rotation[:, 1, 0]
+    steep = forward_x ** 2 + forward_y ** 2 < GETUP_STANCE_HEADING ** 2
+    forward_x = xp.where(steep, rotation[:, 1, 1], forward_x)
+    forward_y = xp.where(steep, -rotation[:, 0, 1], forward_y)
+    return xp.arctan2(forward_y, forward_x)
+
+
+def track_align(position, rotation, clip_position, clip_rotation):
+    """(yaw (n,), offset (n, 2)) that put the clip's first pelvis pose (clip_position (3,), clip_rotation (3, 3)) on a
+    start's pelvis (position (n, 3), rotation (n, 3, 3)): the heading between them (track_heading) and the xy offset of
+    the turned clip pelvis to the start's."""
+    yaw = track_heading(rotation) - track_heading(clip_rotation[None])
+    turned = (yaw_rotation(yaw) @ clip_position[:, None])[:, :, 0]
+    return yaw, position[:, :2] - turned[:, :2]
+
+
+def clip_reference(frames, clock, yaw, offset):
+    """The reference of each world at its clip clock: (positions (n, B, 3), rotations (n, B, 3, 3), linear and angular
+    velocities (n, B, 3)) of frames' pos, rot, lin, ang ((K + 1, B, …): the clip and its hold frame) at min(clock, K),
+    turned about z by yaw (n,) and moved by offset (n, 2) (xy)."""
+    xp = _module(yaw)
+    index = xp.clip(clock, 0, len(frames['pos']) - 1)
+    turn = yaw_rotation(yaw)
+    shift = _cat([offset, xp.zeros_like(offset[:, :1])], -1)
+    position = xp.einsum('nij,nbj->nbi', turn, frames['pos'][index]) + shift[:, None]
+    rotation = xp.einsum('nij,nbjk->nbik', turn, frames['rot'][index])
+    return (position, rotation, xp.einsum('nij,nbj->nbi', turn, frames['lin'][index]),
+            xp.einsum('nij,nbj->nbi', turn, frames['ang'][index]))
+
+
+def body_point_velocity(cvel, point, com):
+    """(linear, angular) world velocities of points on bodies: cvel (..., 6) the bodies' cvel (rotation, then
+    translation, about com, world axes), point and com (..., 3); the bodies' frame origins for point = xpos."""
+    angular = cvel[..., 0:3]
+    return cvel[..., 3:6] + _cross(angular, point - com), angular
+
+
+def track_errors(position, rotation, linear, angular, ref_position, ref_rotation, ref_linear, ref_angular, anchor):
+    """(n,) squared errors of the tracking terms, a dict: the robot's TRACK_BODIES (position (n, B, 3), rotation (n, B,
+    3, 3), linear, angular (n, B, 3) world) against clip_reference's; anchor: the anchor's index among them.
+    anchor_pos ‖Δp‖² and anchor_ori θ² of the anchor in the world; body_pos and body_ori the mean over the bodies of
+    ‖Δp‖² and θ² against the clip re-anchored under the robot (its anchor's xy, the clip anchor's height, turned by the
+    yaw of R_robot·R_clipᵀ of the anchors); body_lin_vel and body_ang_vel the mean of ‖Δv‖², ‖Δω‖² in the world."""
+    xp = _module(position)
+    between = rotation[:, anchor] @ _transpose(ref_rotation[:, anchor])
+    turn = yaw_rotation(xp.arctan2(between[:, 1, 0], between[:, 0, 0]))
+    base = _cat([position[:, anchor, :2], ref_position[:, anchor, 2:3]], -1)
+    relative = base[:, None] + xp.einsum('nij,nbj->nbi', turn, ref_position - ref_position[:, anchor:anchor + 1])
+    relative_rotation = xp.einsum('nij,nbjk->nbik', turn, ref_rotation)
+    return dict(anchor_pos=((ref_position[:, anchor] - position[:, anchor]) ** 2).sum(-1),
+                anchor_ori=rotation_angle(ref_rotation[:, anchor], rotation[:, anchor]) ** 2,
+                body_pos=((relative - position) ** 2).sum(-1).mean(-1),
+                body_ori=(rotation_angle(relative_rotation, rotation) ** 2).mean(-1),
+                body_lin_vel=((ref_linear - linear) ** 2).sum(-1).mean(-1),
+                body_ang_vel=((ref_angular - angular) ** 2).sum(-1).mean(-1))
+
+
+def track_reward_components(errors, action, previous_action, position, soft_low, soft_high, weights=None,
+                            self_contact=None, impact=None, sole_impact=None):
+    """The track_clip reward terms, each (n,): errors from track_errors; action, previous_action (n, joints) this step's
+    applied action and the one before; position (n, joints) after the step; soft_low, soft_high (joints,) soft_limits
+    of the joint ranges (every joint); weights: config.G1_GETUP_TRACK_WEIGHTS' keys plus impact and sole_impact (the
+    task's reward_weights'); self_contact (n,) self_contact_share of the step's substeps, impact and sole_impact (n,)
+    impact_penalty's, None: zero (computed only while weighted).
+
+    anchor_pos …  body_ang_vel   w·exp(−e/σ²)  (σ TRACK_SIGMA)
+    action_rate   −w·Σ(a − a_prev)²
+    joint_limit   −w·Σ over the joints of the excess beyond the soft limits (rad)
+    self_contact  −w·share of substeps with a robot-robot contact above SELF_CONTACT_FORCE
+    impact, sole_impact  as getup_reward_components'"""
+    weights = {**G1_GETUP_TRACK_WEIGHTS, 'impact': 0., 'sole_impact': 0.} if weights is None else weights
+    xp = _module(position)
+    like = errors['anchor_pos']
+    components = {key: weights[key] * xp.exp(-_like(errors[key], like) / TRACK_SIGMA[key] ** 2) for key in TRACK_SIGMA}
+    excess = xp.clip(position - soft_high, 0, None) + xp.clip(soft_low - position, 0, None)
+    components.update(
+        action_rate=-weights['action_rate'] * _like(((action - previous_action) ** 2).sum(-1), like),
+        joint_limit=-weights['joint_limit'] * _like(excess.sum(-1), like),
+        self_contact=-weights['self_contact'] * (xp.zeros_like(like) if self_contact is None
+                                                 else _like(self_contact, like)),
+        impact=-weights['impact'] * (xp.zeros_like(like) if impact is None else _like(impact, like)),
+        sole_impact=-weights['sole_impact'] * (xp.zeros_like(like) if sole_impact is None
+                                               else _like(sole_impact, like)))
+    return components
+
+
+def track_terminated(position, rotation, ref_position, ref_rotation, anchor, ends, ends_active=None):
+    """(n,) bool, mjlab's tracking terminations: the anchor's height (position (n, B, 3) of TRACK_BODIES; anchor its
+    index) off the reference's by more than TRACK_ANCHOR_Z, its projected gravity's z (−R[2, 2]) by more than
+    TRACK_GRAVITY_Z, or any of the bodies `ends` (indices: ankles and hands) by more than TRACK_END_Z in height, where
+    ends_active (n,) bool holds (None: everywhere; a bank start's first TRACK_GRACE_SECONDS do not count it)."""
+    xp = _module(position)
+    ends = list(ends)
+    off = (xp.abs(ref_position[:, ends, 2] - position[:, ends, 2]) > TRACK_END_Z).any(-1)
+    return ((xp.abs(ref_position[:, anchor, 2] - position[:, anchor, 2]) > TRACK_ANCHOR_Z)
+            | (xp.abs(ref_rotation[:, anchor, 2, 2] - rotation[:, anchor, 2, 2]) > TRACK_GRAVITY_Z)
+            | (off if ends_active is None else off & ends_active))
+
+
+def track_phase(clock, last, like):
+    """(n, 2) sin and cos of π·min(clock/last, 1): the clip's phase (clock (n,) control steps, last the clip's last
+    frame), in like's dtype."""
+    xp = _module(like)
+    ratio = xp.clip(_like(clock, like) / last, 0, 1) * math.pi
+    return xp.stack([xp.sin(ratio), xp.cos(ratio)], -1)
+
+
+def track_critic_extras(clock, last, position, rotation, ref_position, ref_rotation):
+    """(n, TRACK_CRITIC_EXTRAS) the critic's track_clip inputs after getup_critic_extras: track_phase, the reference
+    anchor's position in the robot anchor's frame Rᵀ(p_ref − p) (3) and its rotation there Rᵀ·R_ref, first two columns
+    (6; BeyondMimic's motion_anchor_pos_b / ori_b): position (n, 3), rotation (n, 3, 3) of the robot's anchor,
+    ref_position, ref_rotation of the reference's."""
+    inverse = _transpose(rotation)
+    offset = (inverse @ (ref_position - position)[:, :, None])[:, :, 0]
+    relative = (inverse @ ref_rotation)[:, :, :2].reshape(len(position), 6)
+    extras = _cat([track_phase(clock, last, position), offset, relative], -1)
+    assert extras.shape[1] == TRACK_CRITIC_EXTRAS
+    return extras
+
+
+def quat_multiply(a, b):
+    """(n, 4) the products a·b of quaternions w x y z (n, 4)."""
+    xp = _module(a)
+    aw, ax, ay, az = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    bw, bx, by, bz = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    return xp.stack([aw * bw - ax * bx - ay * by - az * bz, aw * bx + ax * bw + ay * bz - az * by,
+                     aw * by - ax * bz + ay * bw + az * bx, aw * bz + ax * by - ay * bx + az * bw], -1)
+
+
+def quat_from_euler(roll, pitch, yaw):
+    """(n, 4) quaternions w x y z of the rotations yaw·pitch·roll about the world z, y, x axes (Isaac's
+    quat_from_euler_xyz)."""
+    xp = _module(roll)
+    cr, sr = xp.cos(roll / 2), xp.sin(roll / 2)
+    cp, sp = xp.cos(pitch / 2), xp.sin(pitch / 2)
+    cy, sy = xp.cos(yaw / 2), xp.sin(yaw / 2)
+    return xp.stack([cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy,
+                     cr * cp * sy - sr * sp * cy], -1)
+
+
+def track_start_pose(qpos, noise, joint_low, joint_high):
+    """(n, 36) a noisy clip start: qpos (n, 36) of the clip frame, noise (n, TRACK_POSE_NOISE) uniform in [−1, 1] times
+    TRACK_START_NOISE's half-widths: root xy and z added, roll / pitch / yaw a world rotation before the root's
+    (quat_from_euler·q, renormalized), joints added and kept within joint_low, joint_high (29,)."""
+    xp = _module(qpos)
+    width = TRACK_START_NOISE
+    delta = quat_from_euler(noise[:, 3] * width['tilt'], noise[:, 4] * width['tilt'], noise[:, 5] * width['yaw'])
+    quat = quat_multiply(delta, qpos[:, 3:7])
+    quat = quat / xp.sqrt((quat ** 2).sum(-1))[:, None]
+    joints = xp.minimum(xp.maximum(qpos[:, 7:] + noise[:, 6:] * width['joints'], joint_low), joint_high)
+    return _cat([qpos[:, 0:2] + noise[:, 0:2] * width['xy'], qpos[:, 2:3] + noise[:, 2:3] * width['z'], quat, joints])
+
+
+def track_start_speed(qvel, noise):
+    """(n, 35) qvel with the root's linear (world) and angular (body) velocity plus noise (n, TRACK_SPEED_NOISE)
+    uniform in [−1, 1] times TRACK_START_NOISE's linear and angular half-widths."""
+    width = TRACK_START_NOISE
+    return _cat([qvel[:, 0:3] + noise[:, 0:3] * width['linear'], qvel[:, 3:6] + noise[:, 3:6] * width['angular'],
+                 qvel[:, 6:]])
+
+
+# task_config settle_clip (g1_getup, iteration 66; the user: get up from any fall pose, as a human does): the trackers of
+# a human clip get up only from the clip's first frame, so a settling policy first takes the robot from any bank start
+# to the nearest of K target poses, the first frames of the clips (lying on the back for cmu-140_09, on the front for
+# cmu-140_01; a side rolls to the nearer one, a front stays a front), and a tracker of that clip takes over there. A
+# target is the pelvis gravity direction g0 (projected gravity, what the IMU gives g1_ctrl) and the free joints q0 (all
+# but the locked wrists). Per target: the angle between g and g0, mean (q − q0)² and mean |q − q0| over the free joints
+# (settle_errors); the nearest is the one with the largest unweighted kernel sum (settle_nearest: the minimum distance,
+# so no target is preferred by its weight). Rewards (settle_reward_components, as HumanUP's rollover and the critic's
+# it63 measure): w·exp(−angle²/SETTLE_ORI_STD²), w·exp(−mean((q − q0)²)/SETTLE_POSE_STD²), stillness −w·[near]·(mean
+# q̇² + ‖v‖² + ‖ω‖²) once the pose is near (settle_near), action rate, joints beyond their soft limits, self_contact,
+# impact and sole_impact. Success (the switch for g1_ctrl, robot sensors only: IMU gravity, joint angles and speeds):
+# near, every free joint slower than SETTLE_DONE_SPEED, for SETTLE_DONE_SECONDS on end (settle_update). Episodes
+# SETTLE_EPISODE_SECONDS from training rows of SETTLE_CLASSES (the standing class is not a fall), going on after the
+# success; no assist. numpy or torch alike.
+SETTLE_EPISODE_SECONDS = 7.
+SETTLE_ORI_STD, SETTLE_POSE_STD = .5, .5  # rad
+SETTLE_DONE_ANGLE, SETTLE_DONE_POSE = math.radians(25.), .3  # rad; mean |q − q0| over the free joints
+SETTLE_DONE_SPEED, SETTLE_DONE_SECONDS = .5, .3  # rad/s, every free joint; s on end
+SETTLE_CLASSES = ('back', 'front', 'side', 'fall', 'sit')
+
+
+def projected_gravity(rotation):
+    """(n, 3) gravity's direction in the pelvis frame, Rᵀ·(0, 0, −1) = −R[2, :] (rotation (n, 3, 3) world <- pelvis),
+    as deploy_observation's projected_gravity."""
+    return -rotation[:, 2, :]
+
+
+def settle_errors(gravity, position, target_gravity, target_position, joints):
+    """Per world and target (n, K): the angle (rad, 0..π) between the pelvis gravity directions gravity (n, 3) and
+    target_gravity (K, 3) (atan2 of the cross product's norm and the dot product, exact near 0 in float32), mean over
+    `joints` of (q − q0)² and of |q − q0|: position (n, joints), target_position (K, joints)."""
+    xp = _module(position)
+    dot = (gravity[:, None] * target_gravity[None]).sum(-1)
+    cross = _cross(xp.broadcast_to(gravity[:, None], dot.shape + (3,)),
+                   xp.broadcast_to(target_gravity[None], dot.shape + (3,)))
+    angle = xp.arctan2(xp.sqrt((cross ** 2).sum(-1)), dot)
+    joints = list(joints)
+    difference = position[:, None, joints] - target_position[None][:, :, joints]
+    return angle, (difference ** 2).mean(-1), xp.abs(difference).mean(-1)
+
+
+def settle_nearest(angle, pose):
+    """(n,) the nearest target's index: the largest exp(−angle²/SETTLE_ORI_STD²) + exp(−pose/SETTLE_POSE_STD²) of
+    settle_errors' (n, K) angle and pose (unweighted, so the weights do not prefer a target)."""
+    xp = _module(angle)
+    score = xp.exp(-angle ** 2 / SETTLE_ORI_STD ** 2) + xp.exp(-pose / SETTLE_POSE_STD ** 2)
+    return score.argmax(-1)
+
+
+def _pick(values, index):
+    """(n,) values (n, K) at index (n,) per row."""
+    if isinstance(values, torch.Tensor):
+        return values.gather(1, index[:, None])[:, 0]
+    return np.take_along_axis(values, index[:, None], 1)[:, 0]
+
+
+def settle_near(angle, deviation):
+    """(n,) bool: the pose near its target, the angle ≤ SETTLE_DONE_ANGLE and the mean |q − q0| ≤ SETTLE_DONE_POSE."""
+    return (angle <= SETTLE_DONE_ANGLE) & (deviation <= SETTLE_DONE_POSE)
+
+
+def settle_update(count, near, joint_velocity, joints):
+    """(n,) each world's control steps on end near its target with every one of `joints` slower than
+    SETTLE_DONE_SPEED (joint_velocity (n, joints)): count + 1 there, else 0. Success at SETTLE_DONE_SECONDS of them."""
+    xp = _module(count)
+    speed = xp.abs(joint_velocity[:, list(joints)])
+    still = near & ((speed.amax(-1) if isinstance(speed, torch.Tensor) else speed.max(-1)) < SETTLE_DONE_SPEED)
+    return xp.where(still, count + 1, xp.zeros_like(count))
+
+
+def settle_reward_components(angle, pose, deviation, joint_velocity, velocity, action, previous_action, position,
+                             soft_low, soft_high, joints, weights=None, self_contact=None, impact=None,
+                             sole_impact=None):
+    """The settle_clip reward terms, each (n,), the nearest target (n,) and whether the pose is near it (n,) bool:
+    angle, pose, deviation (n, K) of settle_errors; joint_velocity, position (n, joints) after the step; velocity (n, 6)
+    the pelvis object velocity as reward_components'; action, previous_action (n, joints) this step's applied action
+    and the one before; soft_low, soft_high (joints,) soft_limits of the joint ranges (every joint); joints: the free
+    ones (stillness); weights: config.G1_GETUP_SETTLE_WEIGHTS' keys plus impact and sole_impact (reward_weights');
+    self_contact, impact, sole_impact (n,) as track_reward_components' (None: zero).
+
+    settle_ori    w·exp(−angle²/0.5²)  (the nearest target's)
+    settle_pose   w·exp(−mean((q − q0)²)/0.5²)
+    settle_still  −w·[near]·(mean over the free joints of q̇² + ‖v‖² + ‖ω‖²)  (pelvis, rad²/s², m²/s²)
+    action_rate   −w·Σ(a − a_prev)²
+    joint_limit   −w·Σ over the joints of the excess beyond the soft limits (rad)
+    self_contact  −w·share of substeps with a robot-robot contact above SELF_CONTACT_FORCE
+    impact, sole_impact  as getup_reward_components'"""
+    weights = {**G1_GETUP_SETTLE_WEIGHTS, 'impact': 0., 'sole_impact': 0.} if weights is None else weights
+    xp = _module(position)
+    nearest = settle_nearest(angle, pose)
+    angle, pose, deviation = _pick(angle, nearest), _pick(pose, nearest), _pick(deviation, nearest)
+    near = settle_near(angle, deviation)
+    like = angle
+    still = ((joint_velocity[:, list(joints)] ** 2).mean(-1) + (velocity[:, 3:6] ** 2).sum(-1)
+             + (velocity[:, 0:3] ** 2).sum(-1))
+    excess = xp.clip(position - soft_high, 0, None) + xp.clip(soft_low - position, 0, None)
+    components = dict(
+        settle_ori=weights['settle_ori'] * xp.exp(-angle ** 2 / SETTLE_ORI_STD ** 2),
+        settle_pose=weights['settle_pose'] * xp.exp(-pose / SETTLE_POSE_STD ** 2),
+        settle_still=-weights['settle_still'] * _like(near, like) * _like(still, like),
+        action_rate=-weights['action_rate'] * _like(((action - previous_action) ** 2).sum(-1), like),
+        joint_limit=-weights['joint_limit'] * _like(excess.sum(-1), like),
+        self_contact=-weights['self_contact'] * (xp.zeros_like(like) if self_contact is None
+                                                 else _like(self_contact, like)),
+        impact=-weights['impact'] * (xp.zeros_like(like) if impact is None else _like(impact, like)),
+        sole_impact=-weights['sole_impact'] * (xp.zeros_like(like) if sole_impact is None
+                                               else _like(sole_impact, like)))
+    return components, nearest, near

@@ -3566,3 +3566,1126 @@ def test_g1_cpu_gpu_arm_error_on_holds(monkeypatch):
         for cpu in cpus:
             cpu.close()
         gpu.close()
+
+
+# g1_getup reward weight arm_press (iteration 52): standing, the free arm joints' target before pd_bound against their
+# angles, on CUDA. The rows of tests/test_g1_getup_stance_width.py's stance_bank: standing in home and in the wide
+# stance, the standing drop from 5 cm and drop_bank's back drop; a PD error bound c 0.15 clamps the arms' targets.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_arm_press(monkeypatch):
+    """The weight on, on CUDA and on the CPU task (no assist, delay, sensor noise or COM offset; pd_bound at c 0.15),
+    15 steps of the same actions (the arms random, now and then beyond the box; the legs at home or holding the wide
+    stance): per world both pass task.getup_reward_components the same Σ (within 1 %) and standing, and charge
+    −w·[standing]·Σ alike; the back drop is never charged; rollout/arm_press is the mean Σ over the standing
+    world-steps, as the steps' own inputs give it. Without the weight nothing is read or logged."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS
+    from test_g1_getup_sole_impact import STAND_DROP, STANDING
+    from test_g1_getup_stance_width import WIDE, hold, stance_bank
+    bank = stance_bank()
+    rows = [STANDING, WIDE, STAND_DROP, 0]
+    settings = dict(reward_weights={'arm_press': .05}, pd_bound=[1., .6])
+    seen, original = [], task.getup_reward_components
+
+    def host(value):
+        return np.asarray(value.cpu() if isinstance(value, torch.Tensor) else value, dtype=float).copy()
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        seen.append(dict(gpu=isinstance(args[0], torch.Tensor), press=host(kwargs['arm_press']),
+                         standing=host(standing).astype(bool), term=host(components['arm_press'])))
+        return components, standing
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    cpus = [G1GetupEnv(bank=bank, **settings) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank, **settings)
+    rng = np.random.default_rng(0)
+    try:
+        assert gpu.press_weighted and gpu.press_joints.tolist() == [15, 16, 17, 18, 19, 22, 23, 24, 25, 26]
+        for cpu, row in zip(cpus, rows):
+            cpu.reset(seed=4, options=dict(OPTIONS, start=row, pd_bound=.15))
+        gpu.reset()
+        gpu.set_starts(rows)
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        gpu.set_assist(0.)
+        gpu.set_pd_bound(.15)
+        gpu._obs('fill')
+        gpu.rollout_metrics()
+        presses, standings = [], []
+        for step in range(15):
+            actions = np.stack([hold(cpus[0]) if row == WIDE else np.zeros(29) for row in rows])
+            actions[:, 15:] += rng.normal(0., 12. if step % 5 == 0 else 2., (len(rows), 14))
+            seen.clear()
+            for cpu, action in zip(cpus, actions):
+                cpu.step(action)
+            _, _, terminated, _, _ = gpu.step(torch.tensor(actions, dtype=torch.float32, device=gpu.device))
+            gpu.check_health()
+            assert not terminated.any()
+            cpu_calls = [call for call in seen if not call['gpu']]
+            (gpu_call,) = [call for call in seen if call['gpu']]
+            cpu_press = np.array([call['press'][0] for call in cpu_calls])
+            cpu_standing = np.array([call['standing'][0] for call in cpu_calls])
+            np.testing.assert_allclose(gpu_call['press'], cpu_press, rtol=.01, atol=.002, err_msg=f'step {step}')
+            np.testing.assert_array_equal(gpu_call['standing'], cpu_standing, err_msg=f'step {step}')
+            np.testing.assert_allclose(gpu_call['term'], -.05 * cpu_standing * cpu_press, rtol=.01, atol=1e-4,
+                                       err_msg=f'step {step}')
+            assert not gpu_call['standing'][3] and gpu_call['term'][3] == 0, step
+            presses.append(gpu_call['press'])
+            standings.append(gpu_call['standing'])
+        presses, standings = np.array(presses), np.array(standings)
+        assert standings[:, 0].sum() >= 5
+        metrics = gpu.rollout_metrics()
+        assert metrics['rollout/arm_press'] == pytest.approx(presses[standings].mean(), rel=1e-5)
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError('arm_press computed with its weight at 0')
+    monkeypatch.setattr(task, 'getup_reward_components', original)
+    monkeypatch.setattr(task, 'arm_press', refuse)
+    plain = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank,
+                             pd_bound=[1., .6])
+    try:
+        assert not plain.press_weighted
+        plain.reset()
+        plain.set_starts(rows)
+        for _ in range(5):
+            plain.step(torch.zeros((len(rows), 29), device=plain.device))
+            plain.check_health()
+        assert 'rollout/arm_press' not in plain.rollout_metrics()
+    finally:
+        plain.close()
+
+
+# g1_getup reward weight style (iteration 53): each world's distance to the nearest human frame of the style library,
+# paid with the head in task.STYLE_HEAD_BAND, on CUDA. drop_bank's rows: back, front and spinning drops (the head starts
+# ~0.4 m up, then lies below 0.3 m) and standing in home (above the band); a library of tests/test_g1_getup_style.py.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_style(monkeypatch, tmp_path):
+    """The weight on, on CUDA and on the CPU task (no assist, delay, sensor noise or COM offset), 15 steps of the same
+    random actions: per world both pass task.getup_reward_components the same d (within 1 %) and pay
+    0.5·[band]·exp(−d/2) alike (the band from each one's head); the standing world is never paid; rollout/style_dist and
+    rollout/style_band are the mean d over the band world-steps and their share, as the steps' own inputs give them.
+    Without the weight nothing is loaded, computed or logged."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_getup_style
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    from test_g1_getup_style import write_library
+    monkeypatch.setattr(g1_getup_style, 'STYLE_DIR', tmp_path)
+    bank = drop_bank()
+    rows = [0, 1, 2, 3]
+    probe = G1GetupEnv(bank=bank)
+    try:
+        centres = []
+        for row in rows[:3]:
+            probe.reset(seed=1, options=dict(OPTIONS, start=row))
+            centres.append(probe.style_features()[0])
+    finally:
+        probe.close()
+    rng = np.random.default_rng(3)
+    write_library(tmp_path, 'gpu', np.concatenate([c + rng.normal(0., .4, (300, len(c))) for c in centres]))
+    settings = dict(reward_weights={'style': .5}, style_library='gpu')
+    seen, original = [], task.getup_reward_components
+
+    def host(value):
+        return np.asarray(value.cpu() if isinstance(value, torch.Tensor) else value, dtype=float).copy()
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        seen.append(dict(gpu=isinstance(args[0], torch.Tensor), style=host(kwargs['style']), head=host(args[0]),
+                         term=host(components['style'])))
+        return components, standing
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    cpus = [G1GetupEnv(bank=bank, **settings) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank, **settings)
+    try:
+        assert gpu.style_weighted and gpu.style_joints.tolist() == list(cpus[0].style_joints)
+        for cpu, row in zip(cpus, rows):
+            cpu.reset(seed=4, options=dict(OPTIONS, start=row))
+        gpu.reset()
+        gpu.set_starts(rows)
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        gpu.set_assist(0.)
+        gpu._obs('fill')
+        gpu.rollout_metrics()
+        styles, bands = [], []
+        for step in range(15):
+            actions = rng.uniform(-10., 10., (len(rows), 29)) * (.3 if step % 4 else 1.)
+            actions[3] = 0.  # the standing world holds home
+            seen.clear()
+            for cpu, action in zip(cpus, actions):
+                cpu.step(action)
+            _, _, terminated, _, _ = gpu.step(torch.tensor(actions, dtype=torch.float32, device=gpu.device))
+            gpu.check_health()
+            assert not terminated.any()
+            cpu_calls = [call for call in seen if not call['gpu']]
+            (gpu_call,) = [call for call in seen if call['gpu']]
+            cpu_style = np.array([call['style'][0] for call in cpu_calls])  # +inf outside the band (not computed)
+            cpu_head = np.array([call['head'][0] for call in cpu_calls])
+            band = (gpu_call['head'] > .3) & (gpu_call['head'] < 1.1)
+            np.testing.assert_array_equal(band, (cpu_head > .3) & (cpu_head < 1.1), err_msg=f'step {step}')
+            assert np.isinf(cpu_style[~band]).all() and np.isfinite(gpu_call['style']).all(), step
+            np.testing.assert_allclose(gpu_call['style'][band], cpu_style[band], rtol=.01, atol=.005,
+                                       err_msg=f'step {step}')
+            np.testing.assert_allclose(gpu_call['term'], .5 * band * np.exp(-gpu_call['style'] / 2), rtol=1e-5,
+                                       atol=1e-7, err_msg=f'step {step}')
+            cpu_term = np.array([call['term'][0] for call in cpu_calls])
+            np.testing.assert_allclose(gpu_call['term'], cpu_term, rtol=.02, atol=1e-4, err_msg=f'step {step}')
+            assert not band[3] and gpu_call['term'][3] == 0, step
+            styles.append(gpu_call['style'])
+            bands.append(band)
+        styles, bands = np.array(styles), np.array(bands)
+        assert bands.sum() >= 5 and (~bands[:, :3]).sum() >= 5
+        metrics = gpu.rollout_metrics()
+        assert metrics['rollout/style_dist'] == pytest.approx(styles[bands].mean(), rel=1e-5)
+        assert metrics['rollout/style_band'] == pytest.approx(bands.mean(), rel=1e-6)
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError('style computed or loaded with its weight at 0')
+    monkeypatch.setattr(task, 'getup_reward_components', original)
+    for name in ('style_features', 'style_distance'):
+        monkeypatch.setattr(task, name, refuse)
+    monkeypatch.setattr(g1_getup_style, 'load', refuse)
+    plain = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank,
+                             style_library='gpu')
+    try:
+        assert not plain.style_weighted
+        plain.reset()
+        plain.set_starts(rows)
+        for _ in range(5):
+            plain.step(torch.zeros((len(rows), 29), device=plain.device))
+            plain.check_health()
+        assert not any(key.startswith('rollout/style') for key in plain.rollout_metrics())
+    finally:
+        plain.close()
+
+
+# g1_getup reward weight amp (iteration 55): each world's state pair (getup_amp.amp_state before and after the step)
+# and its band on CUDA, for the learner's discriminator; with it the style library judges (rollout/style_dist) without
+# paying the style term. drop_bank's rows and a style library of tests/test_g1_getup_style.py, as the style test above.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_amp_pairs_and_the_style_judge(monkeypatch, tmp_path):
+    """The amp weight on, on CUDA and on the CPU task (no assist, delay, sensor noise or COM offset), 15 steps of the
+    same random actions: per world the pair's halves are amp_state of the CPU task's state before and after the step
+    (within 0.03; float32 and Warp against float64: 0.024 after 13 steps of random ±10 actions), the first half the
+    second half of the step before exactly, the
+    band the head band of the CPU task's head; the style term is not paid (style=None) but rollout/style_dist and
+    rollout/style_band are logged. style_judge alone judges too; without either nothing is loaded or computed."""
+    from humanoid_sim import getup_amp
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_getup_style
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    from test_g1_getup_style import write_library
+    monkeypatch.setattr(g1_getup_style, 'STYLE_DIR', tmp_path)
+    bank = drop_bank()
+    rows = [0, 1, 2, 3]
+    rng = np.random.default_rng(3)
+    probe = G1GetupEnv(bank=bank)
+    try:
+        probe.reset(seed=1, options=dict(OPTIONS, start=0))
+        centre = probe.style_features()[0]
+    finally:
+        probe.close()
+    write_library(tmp_path, 'gpu', centre + rng.normal(0., .4, (300, len(centre))))
+    settings = dict(reward_weights={'amp': 1.}, style_library='gpu')
+    seen, original = [], task.getup_reward_components
+
+    def spy(*args, **kwargs):
+        if isinstance(args[0], torch.Tensor):
+            seen.append(kwargs['style'])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+
+    def cpu_state(env):
+        d = env.data
+        bodies, offsets = getup_amp.point_bodies(env.model)
+        head = task.head_height(d.xpos[env.torso][None], d.xmat[env.torso].reshape(1, 3, 3))
+        return getup_amp.amp_state(d.qpos[None, 7:], d.qpos[None, :3], d.xmat[env.pelvis].reshape(1, 3, 3), head,
+                                   getup_amp.amp_points(d.xpos[None], d.xmat[None], bodies, offsets),
+                                   env.style_joints)[0], head[0]
+    cpus = [G1GetupEnv(bank=bank, **settings) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank, **settings)
+    try:
+        assert gpu.amp_weight == 1. and gpu.amp_library == 'gpu' and gpu.amp_joints == cpus[0].style_joints
+        assert gpu.style_judged and not gpu.style_weighted
+        for cpu, row in zip(cpus, rows):
+            cpu.reset(seed=4, options=dict(OPTIONS, start=row))
+        gpu.reset()
+        gpu.set_starts(rows)
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        gpu.set_assist(0.)
+        gpu._obs('fill')
+        gpu.rollout_metrics()
+        start = np.array([cpu_state(cpu)[0] for cpu in cpus])
+        np.testing.assert_allclose(gpu.amp_state.cpu().numpy(), start, atol=2e-3)
+        previous, bands = None, []
+        for step in range(15):
+            actions = rng.uniform(-10., 10., (len(rows), 29)) * (.3 if step % 4 else 1.)
+            actions[3] = 0.
+            before = np.array([cpu_state(cpu)[0] for cpu in cpus])
+            for cpu, action in zip(cpus, actions):
+                cpu.step(action)
+            after, heads = zip(*(cpu_state(cpu) for cpu in cpus))
+            seen.clear()
+            _, _, terminated, truncated, _ = gpu.step(torch.tensor(actions, dtype=torch.float32, device=gpu.device))
+            gpu.check_health()
+            assert not (terminated | truncated).any()
+            assert seen == [None]  # judged, not paid
+            pair = gpu.amp_pair.cpu().numpy()
+            assert pair.shape == (len(rows), 108)
+            np.testing.assert_allclose(pair[:, :54], before, atol=.03, err_msg=f'step {step}')
+            np.testing.assert_allclose(pair[:, 54:], np.array(after), atol=.03, err_msg=f'step {step}')
+            if previous is not None:
+                np.testing.assert_array_equal(pair[:, :54], previous[:, 54:])
+            band = gpu.amp_band.cpu().numpy()
+            np.testing.assert_array_equal(band, (np.array(heads) > .3) & (np.array(heads) < 1.1), err_msg=f'{step}')
+            previous = pair
+            bands.append(band)
+        assert np.array(bands).sum() >= 5 and (~np.array(bands)).sum() >= 5
+        metrics = gpu.rollout_metrics()
+        assert math.isfinite(metrics['rollout/style_dist']) and 0 < metrics['rollout/style_band'] < 1
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+    judge = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank,
+                             style_library='gpu', style_judge=True)
+    try:
+        assert judge.style_judged and judge.amp_pair is None and judge.amp_state is None
+        judge.reset()
+        judge.set_starts(rows)
+        for _ in range(5):
+            judge.step(torch.zeros((len(rows), 29), device=judge.device))
+        assert 'rollout/style_dist' in judge.rollout_metrics() and judge.amp_pair is None
+    finally:
+        judge.close()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError('amp or style computed or loaded with their weights at 0')
+    monkeypatch.setattr(task, 'getup_reward_components', original)
+    for name in ('amp_state', 'amp_points'):
+        monkeypatch.setattr(getup_amp, name, refuse)
+    monkeypatch.setattr(g1_getup_style, 'load', refuse)
+    plain = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank,
+                             style_library='gpu')
+    try:
+        plain.reset()
+        plain.set_starts(rows)
+        for _ in range(5):
+            plain.step(torch.zeros((len(rows), 29), device=plain.device))
+        assert plain.amp_pair is None and not any(key.startswith('rollout/style') for key in plain.rollout_metrics())
+    finally:
+        plain.close()
+
+
+# The AMP discriminator's warm-up from the getting-up stage of branch 53 (exp-588d1616e95c4567 @ 1235091456, style 0.5
+# there; the AMP branch's parent): the run's real learner (full_gpu_train.make_learner) with amp 1 and style 0, 1024
+# worlds, ~2 M steps, all within the 5 M warm-up (reward weight 0). The lab's stage and AMP library are local.
+AMP_PARENT = os.path.join(os.path.dirname(__file__), '..', 'runs', 'humanoid_lab', 'exp-588d1616e95c4567')
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_amp_warmup_separates_the_held_out_subject_from_the_rollouts():
+    """After the warm-up's first ~2 M steps D gives the held-out subject 5's pairs a mean above 0.5 and the policy's
+    in-band pairs of the last rollout one below −0.5; the reward's weight is still 0, the judge's rollout/style_dist is
+    logged, and the stage's own files are untouched (nothing is saved)."""
+    from pathlib import Path
+    from humanoid_sim import full_gpu_train, getup_amp
+    from humanoid_sim.core import read_json
+    from humanoid_sim.lab import validate_config
+    stage = Path(AMP_PARENT) / 'stage_001235091456'
+    if not (stage / 'policy.zip').is_file() or not getup_amp.library_path('lafan1').is_file():
+        pytest.skip('the lab stage or runs/humanoid_lab/getup_style/lafan1-amp.npz is missing')
+    files = sorted(path.name for path in stage.iterdir())
+    parent = read_json(Path(AMP_PARENT) / 'run_config.json')
+    weights = {**parent['task_config']['reward_weights'], 'amp': 1., 'style': 0.}
+    config = validate_config({**{key: parent[key] for key in (
+        'backend', 'seed', 'learning_rate', 'n_steps', 'n_epochs', 'gamma', 'gae_lambda', 'ent_coef', 'clip_range',
+        'target_kl', 'robot_id', 'task_id', 'bounds_coef', 'max_std', 'mirror_coef', 'range_bounds')},
+        'envs': 1024, 'batch_size': 6144, 'steps': 1_000_000_000,
+        'task_config': {**parent['task_config'], 'reward_weights': weights}})
+    learner, export = full_gpu_train.make_learner(config, stage)
+    try:
+        amp = learner.amp
+        assert amp is not None and not amp.restored and amp.weight_now == 0.
+        for _ in range(80):
+            metrics = learner.collect()
+            metrics.update(learner.update())
+        assert 0 < amp.trained_steps <= 80 * 1024 * 24 < getup_amp.AMP_WARMUP_STEPS and amp.weight_now == 0.
+        assert math.isfinite(metrics['rollout/style_dist']) and math.isfinite(metrics['rollout/amp_reward'])
+        with torch.no_grad():
+            heldout = float(amp.score(amp.heldout).mean())
+            rollout = float(amp.score(amp._pairs[amp._band]).mean())
+        print(f'D held out {heldout:.3f}, rollouts {rollout:.3f}, {metrics}')
+        assert heldout > .5 and rollout < -.5
+        assert metrics['train/disc_heldout'] > .5 and metrics['train/disc_policy'] < -.5
+    finally:
+        learner.env.close()
+        export.close()
+    assert sorted(path.name for path in stage.iterdir()) == files
+
+
+# g1_getup task_config human_starts (iteration 56): a share of training resets from human rows, drawn per world with a
+# generator of its own; human episodes step neither the assist nor the bound. tests/test_g1_getup_human.py's rows.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_human_starts():
+    """The same human row starts the CUDA world as the CPU task's reset option human_start (qpos, qvel and the
+    observation); 3 × 4096 training resets at share 0.3 start ~0.3 from human rows (each row drawn); after an episode
+    up the bank worlds' assist and bound step down and the human ones keep theirs; rollout/human_start_share and
+    rollout/getup_success_bank are logged. Without the setting nothing is drawn or logged."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_human import MD5, human_bank
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    bank, human = drop_bank(), human_bank()
+    settings = dict(bank=bank, human_bank=human, human_starts={'share': .3, 'md5': MD5}, pd_bound=[1., .6])
+    rows = list(range(len(human['qpos'])))
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, **settings)
+    cpu = G1GetupEnv(**settings)
+    try:
+        gpu.reset()
+        obs = gpu.set_human_starts(rows).cpu().numpy()
+        assert gpu.human_episode.all() and (gpu.start_row == -1).all()
+        for row in rows:
+            cpu_obs, info = cpu.reset(seed=4, options=dict(OPTIONS, human_start=row))
+            assert info['human_start'] == row
+            np.testing.assert_allclose(gpu.qpos[row].cpu().numpy(), cpu.data.qpos, rtol=0, atol=1e-6)
+            np.testing.assert_allclose(gpu.qvel[row].cpu().numpy(), cpu.data.qvel, rtol=0, atol=1e-6)
+            # the last critic input is the assist force: the CPU reset sets 0 (OPTIONS), the CUDA world keeps its own
+            np.testing.assert_allclose(obs[row, :-1], cpu_obs[:-1], rtol=1e-5, atol=1e-4, err_msg=f'row {row}')
+    finally:
+        gpu.close()
+        cpu.close()
+    gpu = TensorG1GetupEnv(4096, seed=5, **settings)
+    try:
+        gpu.reset()
+        everyone = torch.ones(gpu.n_envs, dtype=torch.bool, device=gpu.device)
+        stream = gpu.wp.ScopedStream(gpu.wp.stream_from_torch(torch.cuda.current_stream(gpu.device)))
+        shares, counts = [], torch.zeros(len(rows), device=gpu.device)
+        with stream:
+            for _ in range(3):
+                gpu._masked_reset(everyone)
+                shares.append(gpu.human_episode.float().mean().item())
+                human_qpos = torch.as_tensor(human['qpos'][:, 0], dtype=torch.float32, device=gpu.device)
+                match = (gpu.qpos[:, 0:1] == human_qpos[None]).float()
+                counts += match[gpu.human_episode].sum(0)
+                assert torch.equal(gpu.human_episode, gpu.start_row == -1)
+            assert abs(np.mean(shares) - .3) < .015 and bool((counts > 100).all()), (shares, counts)
+            started = gpu.human_episode.clone()
+            assist, bound = gpu.assist.clone(), gpu.bound.clone()
+            gpu.lengths.fill_(gpu.head_steps)
+            gpu.head_window.fill_(1.3)  # every world up for the whole window
+            gpu._masked_reset(everyone)
+        assert torch.equal(gpu.assist[started], assist[started]) and torch.equal(gpu.bound[started], bound[started])
+        torch.testing.assert_close(gpu.assist[~started], assist[~started] - 20.)
+        torch.testing.assert_close(gpu.bound[~started], bound[~started] - .02)
+        gpu.reset()  # the first episodes after reset() end at random steps: ~80 of them within 10 steps
+        gpu.rollout_metrics()
+        for _ in range(10):
+            gpu.step(torch.zeros((gpu.n_envs, 29), device=gpu.device))
+        metrics = gpu.rollout_metrics()
+        assert 0 <= metrics['rollout/human_start_share'] <= 1 and 'rollout/getup_success_bank' in metrics
+    finally:
+        gpu.close()
+    plain = TensorG1GetupEnv(64, seed=5, bank=bank)
+    try:
+        assert plain.human_share is None and not hasattr(plain, 'human_generator')
+        plain.reset()
+        plain.step(torch.zeros((64, 29), device=plain.device))
+        assert not any('human' in key or 'bank' in key for key in plain.rollout_metrics())
+    finally:
+        plain.close()
+
+
+# g1_getup reward weight head_rise (iteration 57): the head top's vertical speed over the step, charged above 0.8 m/s,
+# on CUDA. drop_bank's rows (back, front, spinning drops, standing) and a standing world thrown upwards.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_head_rise(monkeypatch):
+    """The weight on, on CUDA and on the CPU task (no assist, delay, sensor noise or COM offset), 15 steps of the same
+    random actions: per world the speed passed to task.getup_reward_components is (head − head a step before)/dt of
+    its own heads, the first step's from the reset's head, and the CPU task's within 1 % (atol 0.01 m/s); the terms
+    alike; rollout/head_rise and rollout/head_speed_p90 as the steps give them. Without the weight nothing is
+    computed or logged."""
+    import mujoco
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    bank = drop_bank()
+    rows = [0, 1, 2, 3, 3]
+    settings = dict(reward_weights={'head_rise': 3.})
+    seen, original = [], task.getup_reward_components
+
+    def host(value):
+        return np.asarray(value.cpu() if isinstance(value, torch.Tensor) else value, dtype=float).copy()
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        seen.append(dict(gpu=isinstance(args[0], torch.Tensor), speed=host(kwargs['head_speed']), head=host(args[0]),
+                         term=host(components['head_rise'])))
+        return components, standing
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    rng = np.random.default_rng(6)
+    cpus = [G1GetupEnv(bank=bank, **settings) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank, **settings)
+    try:
+        assert gpu.rise_weighted
+        for cpu, row in zip(cpus, rows):
+            cpu.reset(seed=4, options=dict(OPTIONS, start=row))
+        gpu.reset()
+        gpu.set_starts(rows)
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        gpu.set_assist(0.)
+        torch.testing.assert_close(gpu.previous_head, gpu._head())  # a reset starts from its own head
+        cpus[4].data.qvel[2] = 3.  # the last world thrown upwards at the same pose
+        mujoco.mj_forward(cpus[4].model, cpus[4].data)
+        gpu.qvel[4, 2] = 3.
+        with gpu.wp.ScopedStream(gpu.wp.stream_from_torch(torch.cuda.current_stream(gpu.device))):
+            gpu.wp.capture_launch(gpu.forward_graph)
+        gpu._obs('fill')
+        gpu.rollout_metrics()
+        previous = gpu._head().cpu().numpy()
+        speeds, bands, terms = [], [], []
+        for step in range(15):
+            actions = rng.uniform(-10., 10., (len(rows), 29)) * (.3 if step % 4 else 1.)
+            seen.clear()
+            for cpu, action in zip(cpus, actions):
+                cpu.step(action)
+            _, _, terminated, truncated, _ = gpu.step(torch.tensor(actions, dtype=torch.float32, device=gpu.device))
+            gpu.check_health()
+            assert not (terminated | truncated).any()
+            cpu_calls = [call for call in seen if not call['gpu']]
+            (gpu_call,) = [call for call in seen if call['gpu']]
+            np.testing.assert_allclose(gpu_call['speed'], (gpu_call['head'] - previous) / gpu.dt, rtol=1e-4,
+                                       atol=1e-4, err_msg=f'step {step}')
+            # within 1 % for 10 steps; later float32 drifts from float64 under the random ±10 actions (0.02 m/s seen at
+            # step 13, as the AMP pairs' parity)
+            tolerance = dict(rtol=.01, atol=.01) if step < 10 else dict(rtol=.01, atol=.03)
+            cpu_speed = np.array([call['speed'][0] for call in cpu_calls])
+            np.testing.assert_allclose(gpu_call['speed'], cpu_speed, **tolerance, err_msg=f'step {step}')
+            cpu_term = np.array([call['term'][0] for call in cpu_calls])
+            np.testing.assert_allclose(gpu_call['term'], cpu_term, rtol=.01, atol=3 * tolerance['atol'],
+                                       err_msg=f'step {step}')
+            np.testing.assert_allclose(gpu_call['term'], -3. * np.maximum(0., gpu_call['speed'] - .8), rtol=1e-5,
+                                       atol=1e-6)
+            previous = gpu_call['head']
+            speeds.append(gpu_call['speed'])
+            bands.append((gpu_call['head'] > .3) & (gpu_call['head'] < 1.1))
+            terms.append(gpu_call['term'])
+        speeds, bands, terms = np.array(speeds), np.array(bands), np.array(terms)
+        assert (terms < 0).sum() >= 1  # the thrown world at least
+        metrics = gpu.rollout_metrics()
+        assert metrics['rollout/head_rise'] == pytest.approx(-terms.mean() / 3., rel=1e-4, abs=1e-6)
+        if bands.any():
+            assert metrics['rollout/head_speed_p90'] == pytest.approx(np.percentile(speeds[bands], 90), rel=1e-4,
+                                                                      abs=1e-5)
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError('head_rise computed with its weight at 0')
+    monkeypatch.setattr(task, 'getup_reward_components', original)
+    monkeypatch.setattr(task, 'head_rise', refuse)
+    plain = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank)
+    try:
+        assert not plain.rise_weighted and plain.previous_head is None
+        plain.reset()
+        plain.set_starts(rows)
+        for _ in range(5):
+            plain.step(torch.zeros((len(rows), 29), device=plain.device))
+        assert not any(key.startswith('rollout/head') for key in plain.rollout_metrics())
+    finally:
+        plain.close()
+
+
+# g1_getup task_config stance_pelvis (iteration 60): the stance_width term's pelvis threshold on CUDA. The wide stance and
+# home standing of tests/test_g1_getup_stance_width.py (pelvis ~0.75 m).
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_stance_pelvis(monkeypatch):
+    """stance_width 2 with stance_pelvis 0.25 and 0.8, on CUDA and on the CPU task, 10 steps of the wide stance held and
+    home standing: at 0.25 the wide stance is charged −2·(W − 0.30) on both (within 0.005), home not (W 0.24); at 0.8
+    (above the pelvis) nothing and rollout/stance_width has no world-step (NaN); the CUDA task passes the threshold to
+    task.getup_reward_components as a float."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS
+    from test_g1_getup_sole_impact import STANDING
+    from test_g1_getup_stance_width import WIDE, hold, stance_bank
+    bank = stance_bank()
+    rows = [STANDING, WIDE]
+    seen, original = [], task.getup_reward_components
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        if isinstance(args[0], torch.Tensor):
+            seen.append((kwargs['stance_pelvis'], components['stance_width'].cpu().numpy().copy()))
+        return components, standing
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    for pelvis in (.25, .8):
+        settings = dict(reward_weights={'stance_width': 2.}, stance_pelvis=pelvis)
+        cpus = [G1GetupEnv(bank=bank, **settings) for _ in rows]
+        gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank, **settings)
+        try:
+            assert gpu.stance_pelvis == pelvis and isinstance(gpu.stance_pelvis, float)
+            for cpu, row in zip(cpus, rows):
+                cpu.reset(seed=4, options=dict(OPTIONS, start=row))
+            gpu.reset()
+            gpu.set_starts(rows)
+            gpu.set_action_delay_steps(0)
+            gpu.set_motor_friction(1.)
+            gpu.set_body_friction(.6)
+            gpu.set_assist(0.)
+            gpu._obs('fill')
+            gpu.rollout_metrics()
+            actions = np.stack([hold(cpus[0]) if row == WIDE else np.zeros(29) for row in rows])
+            for step in range(10):
+                cpu_terms = [cpu.step(action)[-1]['reward_components']['stance_width']
+                             for cpu, action in zip(cpus, actions)]
+                seen.clear()
+                gpu.step(torch.tensor(actions, dtype=torch.float32, device=gpu.device))
+                gpu.check_health()
+                ((threshold, terms),) = seen
+                assert threshold == pelvis and isinstance(threshold, float)
+                if pelvis == .8:
+                    assert cpu_terms == [0., 0.] and not terms.any(), step
+                else:
+                    assert cpu_terms[0] == 0. and cpu_terms[1] < -.15, step
+                np.testing.assert_allclose(terms, cpu_terms, rtol=0, atol=.005, err_msg=f'{pelvis} step {step}')
+            metrics = gpu.rollout_metrics()
+            if pelvis == .8:
+                assert np.isnan(metrics['rollout/stance_width'])
+            else:  # the two worlds' mean W: home 0.24, the wide stance ~0.41
+                assert .3 < metrics['rollout/stance_width'] < .35
+        finally:
+            for cpu in cpus:
+                cpu.close()
+            gpu.close()
+
+
+# g1_getup reward weight sole_slip (iteration 62): the feet in contact charged their horizontal speed², on CUDA.
+# drop_bank's rows (back, front, spinning drops, standing) and a standing world sliding sideways at 2 m/s.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_sole_slip(monkeypatch):
+    """The weight on, on CUDA and on the CPU task (no assist, delay, sensor noise or COM offset), 10 steps of the same
+    random actions: per world the Σ passed to task.getup_reward_components is task.sole_slip of its own feet's speeds
+    over the step (the first from the reset's pose: the slid world is charged at once). The feet's speeds match the CPU
+    task's within 1.5 % (atol 0.01 m/s: the sliding world, sliding friction under PGS and Newton, reaches 1.4 % by step
+    9 and parts after it), the Σ within 3 % (quadratic) where both backends count the same feet; rollout/sole_slip and
+    rollout/sole_slip_speed as the steps give them. Without the weight nothing is computed or logged."""
+    import mujoco
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    bank = drop_bank()
+    rows = [0, 1, 2, 3, 3]
+    settings = dict(reward_weights={'sole_slip': .1})
+    seen, original = [], task.getup_reward_components
+
+    def spy(*args, **kwargs):
+        components, standing = original(*args, **kwargs)
+        if isinstance(args[0], torch.Tensor):
+            seen.append(kwargs['sole_slip'].cpu().numpy().copy())
+        return components, standing
+    monkeypatch.setattr(task, 'getup_reward_components', spy)
+    rng = np.random.default_rng(7)
+    cpus = [G1GetupEnv(bank=bank, **settings) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank, **settings)
+    try:
+        assert gpu.slip_weighted
+        for cpu, row in zip(cpus, rows):
+            cpu.reset(seed=4, options=dict(OPTIONS, start=row))
+        gpu.reset()
+        gpu.set_starts(rows)
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        gpu.set_assist(0.)
+        cpus[4].data.qvel[1] = 2.  # the last world slides sideways at the same pose
+        mujoco.mj_forward(cpus[4].model, cpus[4].data)
+        gpu.qvel[4, 1] = 2.
+        with gpu.wp.ScopedStream(gpu.wp.stream_from_torch(torch.cuda.current_stream(gpu.device))):
+            gpu.wp.capture_launch(gpu.forward_graph)
+        gpu._obs('fill')
+        gpu.rollout_metrics()
+        sums, speeds, disagreed = [], [], 0
+        for step in range(10):
+            actions = rng.uniform(-10., 10., (len(rows), 29)) * (.3 if step % 4 else 1.)
+            actions[4] = 0.
+            before = gpu.xpos[:, gpu.feet, :2].clone()
+            cpu_infos = [cpu.step(action)[-1] for cpu, action in zip(cpus, actions)]
+            seen.clear()
+            _, _, terminated, truncated, _ = gpu.step(torch.tensor(actions, dtype=torch.float32, device=gpu.device))
+            gpu.check_health()
+            assert not (terminated | truncated).any()
+            (slip,) = seen
+            speed = ((gpu.xpos[:, gpu.feet, :2] - before).norm(dim=-1) / gpu.dt)
+            sole = task.sole_height(gpu.geom_xpos[:, gpu.soles, 2], gpu.sole_radius)
+            np.testing.assert_allclose(slip, task.sole_slip(speed, sole).cpu().numpy(), rtol=1e-5, atol=1e-6)
+            cpu_slip = np.array([info['sole_slip'] for info in cpu_infos])
+            cpu_speed = np.array([info['foot_speed'] for info in cpu_infos])
+            cpu_contact = np.array([cpu._sole_height().numpy()[0] < .01 for cpu in cpus])
+            # the speeds everywhere; the Σ where both count the same feet (a foot at the 1 cm threshold may count on one
+            # backend and not the other, as stance_width's landing drop)
+            np.testing.assert_allclose(speed.cpu().numpy(), cpu_speed, rtol=.015, atol=.01, err_msg=f'step {step}')
+            same = (cpu_contact == (sole < .01).cpu().numpy()).all(1)
+            disagreed += int((~same).sum())
+            np.testing.assert_allclose(slip[same], cpu_slip[same], rtol=.03, atol=.01, err_msg=f'step {step}')
+            if step == 0:
+                assert slip[4] > 1. and cpu_slip[4] > 1.  # charged from the reset's own pose
+            sums.append(slip)
+            contact = (sole < .01).cpu().numpy()
+            speeds.append(speed.cpu().numpy()[contact])
+        assert disagreed <= 6, disagreed  # of 50 world-steps
+        metrics = gpu.rollout_metrics()
+        assert metrics['rollout/sole_slip'] == pytest.approx(np.mean(sums), rel=1e-4)
+        assert metrics['rollout/sole_slip_speed'] == pytest.approx(np.median(np.concatenate(speeds)), rel=1e-4,
+                                                                   abs=1e-5)
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError('sole_slip computed with its weight at 0')
+    monkeypatch.setattr(task, 'getup_reward_components', original)
+    monkeypatch.setattr(task, 'sole_slip', refuse)
+    plain = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank)
+    try:
+        assert not plain.slip_weighted
+        plain.reset()
+        plain.set_starts(rows)
+        for _ in range(5):
+            plain.step(torch.zeros((len(rows), 29), device=plain.device))
+        assert not any(key.startswith('rollout/sole_slip') for key in plain.rollout_metrics())
+    finally:
+        plain.close()
+
+
+# g1_getup task_config hip_roll_out (iteration 63): the hip roll PD target's outward limit, on CUDA through the CPU
+# task's target_low / target_high (joint_low / joint_high), as knee_floor.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_hip_roll_out():
+    """hip_roll_out 0.7: the CUDA task's PD bounds are the CPU task's (left hip roll high 0.7, right low −0.7, the rest
+    the joint ranges); lying on the back with both hips driven outwards to the box edge, 10 steps: the motor torques
+    and hip roll angles match the CPU task's (torque within 2 % of the peak, angles within 0.01 rad) and the angles stay
+    near the limit, while the unlimited CUDA task's go far past it."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    bank = drop_bank()
+    rows = [0, 0]
+    rng = np.random.default_rng(3)
+    cpus = [G1GetupEnv(bank=bank, hip_roll_out=.7) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank, hip_roll_out=.7)
+    plain = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, bank=bank)
+    try:
+        np.testing.assert_array_equal(gpu.joint_low.cpu().numpy(), cpus[0].target_low.astype(np.float32))
+        np.testing.assert_array_equal(gpu.joint_high.cpu().numpy(), cpus[0].target_high.astype(np.float32))
+        assert gpu.joint_high[1].item() == pytest.approx(.7) and gpu.joint_low[7].item() == pytest.approx(-.7)
+        assert plain.joint_high[1].item() > 2.9 and plain.joint_low[7].item() < -2.9
+        for cpu in cpus:
+            cpu.reset(seed=4, options=dict(OPTIONS, start=0))
+        for env in (gpu, plain):
+            env.reset()
+            env.set_starts(rows)
+            env.set_action_delay_steps(0)
+            env.set_motor_friction(1.)
+            env.set_body_friction(.6)
+            env.set_assist(0.)
+        peak = np.asarray(cpus[0].peak)
+        for step in range(10):
+            actions = rng.uniform(-1., 1., (len(rows), 29))
+            actions[:, 1], actions[:, 7] = 10., -10.
+            for cpu, action in zip(cpus, actions):
+                cpu.step(action)
+            tensor = torch.tensor(actions, dtype=torch.float32, device=gpu.device)
+            gpu.step(tensor)
+            plain.step(tensor)
+            gpu.check_health()
+            torque = np.array([cpu.data.ctrl.copy() for cpu in cpus])
+            np.testing.assert_allclose(gpu.ctrl.cpu().numpy(), torque, rtol=0, atol=.02 * peak.max(),
+                                       err_msg=f'step {step}')
+            angles = np.array([cpu.data.qpos[cpu.qadr][[1, 7]] for cpu in cpus])
+            np.testing.assert_allclose(gpu.qpos[:, gpu.qadr][:, [1, 7]].cpu().numpy(), angles, rtol=0, atol=.01,
+                                       err_msg=f'step {step}')
+        outward = lambda env: (env.qpos[:, env.qadr][:, [1, 7]] * torch.tensor([1., -1.], device=env.device)).max()
+        assert outward(gpu).item() < .7 + .15 and outward(plain).item() > 1.2
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+        plain.close()
+
+
+
+# g1_getup task_config track_clip (iteration 64): motion tracking of one human clip on CUDA, against the CPU task.
+# tests/test_g1_getup_track.py's synthetic clip (drop_bank's back row moving), the lab clip where it is on disk.
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_track_clip(monkeypatch):
+    """Worlds started from clip frames 0, 10, 20, 30 and the last without noise (and one from the bank's back row) are
+    the CPU task's resets track_frame / start: qpos, qvel, the reference's alignment and the observation with its 17
+    critic extras match; over five steps of the same actions the observation, the reward, every tracking term
+    (task.track_reward_components, numpy and torch: errors, self_contact, impact, sole_impact), the hands' floor force
+    and the terminations match within float32-vs-float64 and contact noise; the clock counts on in both."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    from test_g1_getup_track import SETTING, synthetic_clip
+    bank, clip = drop_bank(), synthetic_clip()
+    settings = dict(bank=bank, track_clip=SETTING, track_bank=clip, reward_weights={'impact': 2., 'sole_impact': 1.})
+    frames = [0, 10, 20, 30, len(clip['qpos']) - 1]
+    seen, original = [], task.track_reward_components
+
+    def spy(*args, **kwargs):
+        components = original(*args, **kwargs)
+        seen.append((isinstance(args[0]['anchor_pos'], torch.Tensor), {
+            key: np.asarray(value.cpu() if isinstance(value, torch.Tensor) else value, dtype=float).copy()
+            for key, value in components.items()}))
+        return components
+
+    monkeypatch.setattr(task, 'track_reward_components', spy)
+    cpus = [G1GetupEnv(**settings) for _ in frames]
+    gpu = TensorG1GetupEnv(len(frames), seed=4, observation_noise=False, randomize=False, **settings)
+    try:
+        cpu_obs = np.stack([cpu.reset(seed=4, options=dict(OPTIONS, track_frame=f, track_noise=False))[0]
+                            for cpu, f in zip(cpus, frames)])
+        gpu.reset()
+        obs = gpu.set_clip_starts(frames).cpu().numpy()
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        assert obs.shape == (len(frames), 507) and gpu.clip_clock.tolist() == frames
+        assert (gpu.clip_kind == 1).all() and not gpu.clip_yaw.any() and not gpu.clip_offset.any()
+        np.testing.assert_allclose(gpu.qpos.cpu().numpy(), np.stack([c.data.qpos for c in cpus]), atol=1e-3)
+        np.testing.assert_allclose(gpu.qvel.cpu().numpy(), np.stack([c.data.qvel for c in cpus]), atol=1e-4)
+        np.testing.assert_allclose(obs, cpu_obs, atol=2e-3, rtol=1e-3)
+        np.testing.assert_allclose(gpu.episode_limit.cpu().numpy(), [min(gpu.max_episode_steps, gpu.clip_end - f)
+                                                                     for f in frames])
+        speeds = np.zeros(507, dtype=bool)
+        speeds[task.joint_positions(29, 5, (), (0,), range(3)) + task.joint_positions(29, 5, (), (5,), range(29))] = True
+        rng = np.random.default_rng(0)
+        for step in range(5):
+            action = np.stack([(c.clip['qpos'][min(c.clip_clock + 1, c.clip_last), 7:] - c.home) / c.scale
+                               for c in cpus]) + rng.normal(0., .3, (len(frames), 29))
+            seen.clear()
+            results = [cpu.step(a) for cpu, a in zip(cpus, action)]
+            _, reward, terminated, truncated, terminal = gpu.step(torch.tensor(action, dtype=torch.float32,
+                                                                               device=gpu.device))
+            gpu.check_health()
+            assert terminated.cpu().tolist() == [r[2] for r in results], step
+            got, expected = terminal.cpu().numpy(), np.stack([r[0] for r in results])
+            np.testing.assert_allclose(got[:, ~speeds], expected[:, ~speeds], atol=.03, rtol=.02, err_msg=f'step {step}')
+            np.testing.assert_allclose(got[:, speeds], expected[:, speeds], atol=.1, rtol=.02, err_msg=f'step {step}')
+            np.testing.assert_allclose(reward.cpu().numpy(), [r[1] for r in results], atol=.05, rtol=.02)
+            np.testing.assert_allclose(gpu.hand_substeps.amax(dim=1).cpu().numpy(), [r[4]['hand_force'] for r in results],
+                                       atol=5., rtol=.1)
+            cpu_terms = [terms for on_gpu, terms in seen if not on_gpu]
+            (gpu_terms,) = [terms for on_gpu, terms in seen if on_gpu]
+            for key in gpu_terms:
+                np.testing.assert_allclose(gpu_terms[key], [terms[key][0] for terms in cpu_terms], atol=.03, rtol=.02,
+                                           err_msg=f'{key} step {step}')
+            live = ~(terminated | truncated).cpu().numpy()
+            assert gpu.clip_clock.cpu().numpy()[live].tolist() == [c.clip_clock for c, k in zip(cpus, live) if k]
+        cpus[0].reset(seed=4, options=dict(OPTIONS, start=0))
+        obs = gpu.set_starts([0] * len(frames)).cpu().numpy()
+        assert (gpu.clip_kind == 2).all() and (gpu.clip_clock == 0).all() and (gpu.start_row == 0).all()
+        np.testing.assert_allclose(gpu.clip_yaw[0].item(), cpus[0].clip_yaw, atol=1e-5)
+        np.testing.assert_allclose(gpu.clip_offset[0].cpu().numpy(), cpus[0].clip_offset, atol=1e-5)
+        np.testing.assert_allclose(obs[0, -task.TRACK_CRITIC_EXTRAS:], cpus[0]._observation()[-task.TRACK_CRITIC_EXTRAS:],
+                                   atol=1e-4)
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_track_clip_starts_ends_and_logs():
+    """4096 worlds: training resets start 0.6 / 0.3 / 0.1 from the clip's first frame, a uniform frame and the bank's
+    back rows; the clip starts carry mjlab's noise within its widths and nothing is left in the floor; each episode
+    ends within what is left of the clip and its hold; a full reset() cuts the first episodes within that too; the
+    logs carry track_done, the errors, the hand force and self_contact; standing worlds against a lying reference end
+    by the tracking rules. Off: no clip and no track logs."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from test_g1_getup_impact import drop_bank
+    from test_g1_getup_track import SETTING, synthetic_clip
+    bank, clip = drop_bank(), synthetic_clip()
+    n = 4096
+    gpu = TensorG1GetupEnv(n, seed=7, bank=bank, track_clip=SETTING, track_bank=clip)
+    try:
+        gpu.reset()
+        assert bool((gpu.episode_limit <= (gpu.clip_end - gpu.clip_clock)).all())
+        everyone = torch.ones(n, dtype=torch.bool, device=gpu.device)
+        with gpu.wp.ScopedStream(gpu.wp.stream_from_torch(torch.cuda.current_stream(gpu.device))):
+            gpu._masked_reset(everyone)
+        kinds = gpu.clip_kind.bincount(minlength=3).cpu().numpy() / n
+        np.testing.assert_allclose(kinds, task.TRACK_START_SHARES, atol=.025)
+        frames = gpu.clip_clock[gpu.clip_kind == 1]
+        assert len(frames.unique()) == len(clip['qpos'])
+        assert bool((gpu.clip_clock[gpu.clip_kind != 1] == 0).all())
+        assert bool((gpu.start_row[gpu.clip_kind == 2] == 0).all()) and bool((gpu.start_row[gpu.clip_kind != 2] == -1).all())
+        first = gpu.clip_kind == 0
+        start = torch.as_tensor(clip['qpos'][0], dtype=torch.float32, device=gpu.device)
+        assert float((gpu.qpos[first, :2] - start[:2]).abs().max()) <= task.TRACK_START_NOISE['xy'] + 1e-5
+        joints = (gpu.qpos[first, 7:] - start[7:]).abs()
+        assert float(joints.max()) <= task.TRACK_START_NOISE['joints'] + 1e-5 and float(joints.max()) > .09
+        assert float(gpu._floor_depth()[gpu.clip_kind != 2].min()) > -2e-3
+        np.testing.assert_array_equal(gpu.episode_limit.cpu().numpy(),
+                                      np.minimum(gpu.max_episode_steps, gpu.clip_end - gpu.clip_clock.cpu().numpy()))
+        gpu.rollout_metrics()
+        generator = torch.Generator(device=gpu.device).manual_seed(1)
+        for _ in range(40):
+            gpu.step(torch.randn((n, 29), device=gpu.device, generator=generator) * .5)
+            gpu.check_health()
+        metrics = gpu.rollout_metrics()
+        for key in ('track_done', 'track_done_clip', 'track_failed', 'track_standing', 'hand_force', 'self_contact',
+                    *(f'track_err_{k}' for k in task.TRACK_SIGMA)):
+            assert f'rollout/{key}' in metrics, key
+        assert metrics['rollout/bad_states'] == 0 and metrics['rollout/track_err_anchor_pos'] > 0
+        assert 0. <= metrics['rollout/track_standing'] <= metrics['rollout/track_done'] + 1e-9 or math.isnan(
+            metrics['rollout/track_standing'])
+        gpu.set_clip_starts(0)
+        gpu.qpos[:, 2:7] = torch.tensor([.8, 1., 0., 0., 0.], device=gpu.device)  # standing while the clip lies
+        gpu.qpos[:, gpu.qadr] = gpu.home
+        gpu.qvel.zero_()
+        gpu.wp.capture_launch(gpu.forward_graph)
+        _, _, terminated, _, _ = gpu.step(torch.zeros((n, 29), device=gpu.device))
+        metrics = gpu.rollout_metrics()
+        assert bool(terminated.all()) and metrics['rollout/track_failed'] == 1.
+        assert metrics['rollout/track_standing'] == 0.  # up, but ended by the tracking rules, not by the hold's end
+    finally:
+        gpu.close()
+    plain = TensorG1GetupEnv(64, seed=5, bank=bank)
+    try:
+        assert plain.clip is None
+        plain.reset()
+        plain.step(torch.zeros((64, 29), device=plain.device))
+        assert not any('track' in key or 'hand_force' in key for key in plain.rollout_metrics())
+    finally:
+        plain.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_track_clip_4096_worlds_speed():
+    """The training batch of the lab clip (or the synthetic one): 4096 worlds with the training randomization, σ 1
+    action noise around the clip's targets for 200 steps: no contact buffer overflow or non-finite state; prints the
+    steps per second (the getting-up task: ~38-50 thousand) and the logs."""
+    import time
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_getup_track
+    from test_g1_getup_track import REAL, SETTING, synthetic_clip
+    if g1_getup_track.clip_path(REAL).is_file() and bank_file_present():
+        clip = g1_getup_track.load(REAL)
+        settings = dict(track_clip={'file': REAL, 'md5': clip['md5']})
+    else:
+        from test_g1_getup_impact import drop_bank
+        settings = dict(bank=drop_bank(), track_clip=SETTING, track_bank=synthetic_clip())
+    n = 4096
+    env = TensorG1GetupEnv(n, seed=11, reward_weights={'impact': 2., 'sole_impact': 1.}, **settings)
+    try:
+        env.reset()
+        generator = torch.Generator(device=env.device).manual_seed(5)
+
+        def actions():
+            frame = (env.clip_clock + 1).clamp(max=env.clip_last)
+            return (env.clip_qpos[frame, 7:] - env.home) / env.scale + torch.randn((n, 29), device=env.device,
+                                                                                 generator=generator)
+        for _ in range(10):
+            env.step(actions())
+        env.check_health()
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        for _ in range(200):
+            env.step(actions())
+            env.check_health()
+        torch.cuda.synchronize()
+        speed = 200 * n / (time.perf_counter() - started)
+        metrics = env.rollout_metrics()
+        print(f'g1_getup track_clip 4096 worlds: {speed:,.0f} steps/s; ' + ', '.join(
+            f'{key[8:]} {value:.3g}' for key, value in metrics.items()))
+        assert metrics['rollout/ncon_max'] < 128 and metrics['rollout/bad_states'] == 0
+        assert speed > 10000
+    finally:
+        env.close()
+
+
+def bank_file_present():
+    from humanoid_sim.tasks import g1_getup_bank as bank_module
+    return bank_module.BANK.is_file()
+
+
+# g1_getup task_config settle_clip (iteration 66): settling into the nearest clip start on CUDA, against the CPU task.
+# tests/test_g1_getup_settle.py's two-frame clips (drop_bank's home pose lying on the back and on the front).
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_cpu_gpu_getup_settle_clip(monkeypatch):
+    """Worlds started from drop_bank's rows (back, front, spinning front, back) are the CPU task's resets start: qpos,
+    qvel and the observation match; over ten steps of the same actions (each row's target held, noise on top) the
+    observation, the reward, every settling term (task.settle_reward_components, numpy and torch: the errors, the
+    nearest target, stillness, self_contact, impact, sole_impact) and the hands' floor force match within
+    float32-vs-float64 and contact noise; then, holding the targets without noise, both settle into the same target
+    within a few steps of each other."""
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from humanoid_sim.tasks import g1_tensor_math as task
+    from humanoid_sim.tasks.g1_getup import G1GetupEnv
+    from test_g1_getup_impact import OPTIONS, drop_bank
+    from test_g1_getup_settle import SETTING, lying_clip
+    bank = drop_bank()
+    settings = dict(bank=bank, settle_clip=SETTING, settle_bank=[lying_clip(0), lying_clip(1)],
+                    reward_weights={'impact': 2., 'sole_impact': 1.})
+    rows = [0, 1, 2, 0]
+    seen, original = [], task.settle_reward_components
+
+    def spy(*args, **kwargs):
+        components, nearest, near = original(*args, **kwargs)
+        on_gpu = isinstance(args[0], torch.Tensor)
+        seen.append((on_gpu, {key: np.asarray(value.cpu() if on_gpu else value, dtype=float).copy()
+                              for key, value in components.items()},
+                     np.asarray(nearest.cpu() if on_gpu else nearest).copy()))
+        return components, nearest, near
+
+    monkeypatch.setattr(task, 'settle_reward_components', spy)
+    cpus = [G1GetupEnv(**settings) for _ in rows]
+    gpu = TensorG1GetupEnv(len(rows), seed=4, observation_noise=False, randomize=False, **settings)
+    try:
+        assert gpu.max_episode_steps == 350 and not gpu.assist.any()
+        cpu_obs = np.stack([cpu.reset(seed=4, options=dict(OPTIONS, start=row))[0] for cpu, row in zip(cpus, rows)])
+        gpu.reset()
+        obs = gpu.set_starts(rows).cpu().numpy()
+        gpu.set_action_delay_steps(0)
+        gpu.set_motor_friction(1.)
+        gpu.set_body_friction(.6)
+        assert obs.shape == (len(rows), 496)
+        np.testing.assert_allclose(gpu.qpos.cpu().numpy(), np.stack([c.data.qpos for c in cpus]), atol=1e-5)
+        np.testing.assert_allclose(obs, cpu_obs, atol=2e-3, rtol=1e-3)
+        targets = np.stack([(c.settle['position'][min(row, 1)] - c.home) / c.scale for c, row in zip(cpus, rows)])
+        speeds = np.zeros(496, dtype=bool)
+        speeds[task.joint_positions(29, 5, (), (0,), range(3)) + task.joint_positions(29, 5, (), (5,), range(29))] = True
+        rng = np.random.default_rng(0)
+        for step in range(10):
+            action = targets + rng.normal(0., .3, targets.shape)
+            seen.clear()
+            results = [cpu.step(a) for cpu, a in zip(cpus, action)]
+            _, reward, terminated, truncated, terminal = gpu.step(torch.tensor(action, dtype=torch.float32,
+                                                                               device=gpu.device))
+            gpu.check_health()
+            assert terminated.cpu().tolist() == [r[2] for r in results], step
+            got, expected = terminal.cpu().numpy(), np.stack([r[0] for r in results])
+            np.testing.assert_allclose(got[:, ~speeds], expected[:, ~speeds], atol=.03, rtol=.02, err_msg=f'step {step}')
+            np.testing.assert_allclose(got[:, speeds], expected[:, speeds], atol=.1, rtol=.02, err_msg=f'step {step}')
+            np.testing.assert_allclose(reward.cpu().numpy(), [r[1] for r in results], atol=.05, rtol=.02)
+            np.testing.assert_allclose(gpu.hand_substeps.amax(dim=1).cpu().numpy(),
+                                       [r[4]['hand_force'] for r in results], atol=5., rtol=.1)
+            cpu_seen = [(terms, nearest) for on_gpu, terms, nearest in seen if not on_gpu]
+            ((gpu_terms, gpu_nearest),) = [(terms, nearest) for on_gpu, terms, nearest in seen if on_gpu]
+            assert gpu_nearest.tolist() == [int(nearest[0]) for _, nearest in cpu_seen]
+            for key in gpu_terms:
+                np.testing.assert_allclose(gpu_terms[key], [terms[key][0] for terms, _ in cpu_seen], atol=.03, rtol=.02,
+                                           err_msg=f'{key} step {step}')
+        # Holding the targets: both backends settle each world into the same target at nearly the same step.
+        cpu_at = [None] * len(rows)
+        for step in range(200):
+            results = [cpu.step(a) for cpu, a in zip(cpus, targets)]
+            gpu.step(torch.tensor(targets, dtype=torch.float32, device=gpu.device))
+            for w, result in enumerate(results):
+                if cpu_at[w] is None and result[4]['settle_done']:
+                    cpu_at[w] = (cpus[w].steps, result[4]['settle_target'])
+        gpu.check_health()
+        assert all(at is not None for at in cpu_at)
+        gpu_at, gpu_target = gpu.settle_at.cpu().tolist(), gpu.settle_target.cpu().tolist()
+        for w, (steps, name) in enumerate(cpu_at):
+            assert gpu_at[w] >= 0 and abs(gpu_at[w] - steps) <= 10 and gpu.settle_names[gpu_target[w]] == name, w
+    finally:
+        for cpu in cpus:
+            cpu.close()
+        gpu.close()
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G1_GPU_TESTS') != '1', reason='Requires exclusive GPU slot')
+def test_g1_gpu_getup_settle_clip_starts_logs_and_speed():
+    """4096 worlds with the training randomization: training resets draw the bank's rows of the settling classes only
+    (never the standing row), no assist, episodes within 350 steps (a full reset() cuts the first ones within that);
+    random actions for 40 steps give the settle logs and no overflow or non-finite state; worlds lying on the back with
+    their motors holding the back target settle into it (settle_at, settle_target) and an ended episode counts in
+    rollout/settle_done; prints the steps per second of σ 1 action noise around the targets. Off: no settle logs."""
+    import time
+    from humanoid_sim.g1_getup_tensor_env import TensorG1GetupEnv
+    from test_g1_getup_impact import drop_bank
+    from test_g1_getup_settle import SETTING, lying_clip
+    bank = drop_bank()
+    n = 4096
+    gpu = TensorG1GetupEnv(n, seed=7, bank=bank, settle_clip=SETTING, settle_bank=[lying_clip(0), lying_clip(1)],
+                           reward_weights={'impact': 2., 'sole_impact': 1.})
+    try:
+        gpu.reset()
+        assert not gpu.assist.any() and bool((gpu.episode_limit <= 350).all())
+        assert set(gpu.start_row.unique().cpu().tolist()) == {0, 1, 2}  # row 3 stands
+        gpu.rollout_metrics()
+        generator = torch.Generator(device=gpu.device).manual_seed(1)
+        for _ in range(40):
+            gpu.step(torch.randn((n, 29), device=gpu.device, generator=generator))
+            gpu.check_health()
+        metrics = gpu.rollout_metrics()
+        for key in ('settle_done', 'settle_seconds', 'settle_target0', 'settle_target1', 'settle_angle',
+                    'settle_deviation', 'hand_force', 'self_contact', 'impact', 'sole_impact'):
+            assert f'rollout/{key}' in metrics, key
+        assert metrics['rollout/bad_states'] == 0 and metrics['rollout/ncon_max'] < 128
+        assert metrics['rollout/settle_angle'] > 0
+        gpu.set_starts(0)
+        hold = ((gpu.settle['position'][0] - gpu.home) / gpu.scale).expand(n, -1).contiguous()
+        for _ in range(150):
+            gpu.step(hold)
+        gpu.check_health()
+        settled = gpu.settle_at >= 0
+        assert settled.float().mean().item() > .9 and bool((gpu.settle_target[settled] == 0).all())
+        gpu.episode_limit.copy_(gpu.lengths + 1)  # end every episode on the next step
+        gpu.step(hold)
+        metrics = gpu.rollout_metrics()
+        assert metrics['rollout/settle_done'] > .9 and metrics['rollout/settle_target0'] == 1.
+        assert 0 < metrics['rollout/settle_seconds'] < 3
+        gpu.reset()
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        for _ in range(200):
+            gpu.step(hold + torch.randn((n, 29), device=gpu.device, generator=generator))
+            gpu.check_health()
+        torch.cuda.synchronize()
+        speed = 200 * n / (time.perf_counter() - started)
+        metrics = gpu.rollout_metrics()
+        print(f'g1_getup settle_clip 4096 worlds: {speed:,.0f} steps/s; ' + ', '.join(
+            f'{key[8:]} {value:.3g}' for key, value in metrics.items()))
+        assert metrics['rollout/ncon_max'] < 128 and metrics['rollout/bad_states'] == 0 and speed > 10000
+    finally:
+        gpu.close()
+    plain = TensorG1GetupEnv(64, seed=5, bank=bank)
+    try:
+        assert plain.settle is None
+        plain.reset()
+        plain.step(torch.zeros((64, 29), device=plain.device))
+        assert not any('settle' in key or 'hand_force' in key for key in plain.rollout_metrics())
+    finally:
+        plain.close()

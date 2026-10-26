@@ -859,6 +859,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == '/api/lab/journal':
                     from . import journal
                     self.reply(200, i18n.localize_journal(journal.load(self.server.lab.root), lang, content))
+                elif path == '/api/lab/home':
+                    from . import home
+                    saved = home.load(self.server.lab.root)
+                    self.reply(200, {'empty': True} if saved is None else home.localize(saved, lang, content))
                 elif path == '/api/lab/journal/image':
                     from . import journal
                     file = journal.image_file(self.server.lab.root, query.get('name', [''])[0])

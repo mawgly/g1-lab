@@ -9,7 +9,7 @@ import pytest
 from humanoid_sim.checkpoint_schema import validate_resume
 from humanoid_sim.tasks import g1_getup_bank as bank_module
 from humanoid_sim.tasks import g1_tensor_math as task
-from humanoid_sim.tasks.config import G1_GETUP_DEFAULTS, G1_GETUP_REWARD_WEIGHTS, g1_getup_config
+from humanoid_sim.tasks.config import G1_GETUP_DEFAULTS, G1_GETUP_REWARD_WEIGHTS, G1_GETUP_TASK_WEIGHTS, g1_getup_config
 from humanoid_sim.tasks.g1_getup import G1GetupEnv
 from humanoid_sim.tasks.identity import task_identity
 
@@ -72,10 +72,15 @@ def test_settings_are_bounded_and_spelled_out():
     config = validate_config(dict(robot_id='g1_29dof', task_id='g1_getup'))
     assert config['task_config'] == {'reward_weights': G1_GETUP_REWARD_WEIGHTS, 'assist_force': 200.,
                                      'action_delay': .02, 'motor_friction': 1.25, 'body_friction': [.3, 1.],
-                                     'pd_bound': None, 'stand_pose_std': .1, 'action_change_unbounded': False}
+                                     'pd_bound': None, 'stand_pose_std': .1, 'action_change_unbounded': False,
+                                     'style_library': 'lafan1', 'style_judge': False, 'human_starts': None,
+                                     'stance_pelvis': .5, 'hip_roll_out': None, 'track_clip': None,
+                                     'settle_clip': None}
     assert G1_GETUP_REWARD_WEIGHTS == dict(head=1., upright=.5, stand=1., stand_pose=.5, stand_still=1., effort=2e-5,
                                            joint_speed=1e-4, action_change=.01, joint_limits=1., impact=0.,
-                                           sole_impact=0., stance_width=0.)
+                                           sole_impact=0., stance_width=0., arm_press=0., style=0., head_rise=0.,
+                                           sole_slip=0., amp=0.)
+    assert G1_GETUP_TASK_WEIGHTS == tuple(G1_GETUP_REWARD_WEIGHTS)[:-1]  # amp is paid by the learner (getup_amp)
     for bad in ({'invented': 1}, {'reward_weights': {'velocity': 1.}}, {'reward_weights': {'head': -1}},
                 {'assist_force': -1.}, {'assist_force': 600.}, {'action_delay': .1}, {'motor_friction': 3.},
                 {'body_friction': [1., .3]}, {'body_friction': [.3]}, {'body_friction': [0., 1.]},
@@ -116,7 +121,7 @@ def test_the_walking_connector_with_a_zero_command_and_its_critic_extras(small_b
             np.testing.assert_allclose(obs[490:], np.r_[velocity[3:6], env.data.qpos[2], torso[2], env.assist],
                                        rtol=1e-6, atol=1e-6)
             obs, reward, terminated, truncated, info = env.step(rng.uniform(-2, 2, 29))
-            assert set(info['reward_components']) == set(G1_GETUP_REWARD_WEIGHTS)
+            assert set(info['reward_components']) == set(G1_GETUP_TASK_WEIGHTS)
             assert reward == pytest.approx(sum(info['reward_components'].values()))
             assert not terminated and not truncated
         np.testing.assert_array_equal(env.command, 0.)

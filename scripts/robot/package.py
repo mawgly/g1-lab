@@ -1,10 +1,13 @@
 """Robot package for the first G1 run on the hoist (CPU only): runs/humanoid_lab/robot/<name>/.
 
-Usage: .venv\\Scripts\\python.exe scripts\\robot\\package.py --candidate n8|n9|n10 [--getup EXPORT] [--name NAME]
+Usage: .venv\\Scripts\\python.exe scripts\\robot\\package.py --candidate n8s|n8|n9|n10 [--getup EXPORT] [--name NAME]
 
-Three packages (PACKAGES):
-  n8   the first floor run: candidate 8 (main) and 7 (spare), one contract (ONNX obs [1, 490]), the g1_ctrl patches
-       without g1_ctrl-height.patch
+Four packages (PACKAGES):
+  n8s  the first floor run since 26.10: candidate 8 exported with --symmetric-walk (main; its standing branch checked
+       against the plain export) and 7 (spare); the rest as n8, plus skills_check's table in REFERENCE.md and the
+       candidate's caveats in README.md
+  n8   the first floor run before it, now the spare package: candidate 8 (main) and 7 (spare), one contract (ONNX obs
+       [1, 490]), the g1_ctrl patches without g1_ctrl-height.patch
   n9   experimental, with the crouch: candidate 9 (exp-04f74e3838184b82 @ 7741440000, ONNX obs [1, 585]: the terms
        height_command and upper_body_command of g1_ctrl-height.patch) and candidate 8 as the spare (the n8 package's
        export, run on the g1_ctrl build without the height patch); every patch, apply_patches.sh --no-height for n8
@@ -103,6 +106,16 @@ N8 = dict(label='n8', title='№8', export='exp-28691193718e4d0e-7221510144', re
 N7 = dict(label='n7', title='№7', export='exp-c362df8e578148d0-6368231424', reference='6368', obs=490, height=False,
           sim2sim='## Этап 6368 (итерация 24)',
           about='итерация 24: стопы сталкиваются капсулами Unitree с их трением; ветка от №6 через итерации 22–23')
+# Candidate 8 exported with `export_g1 --symmetric-walk` (26.10): the same stage, on the move (newest velocity_commands
+# norm 0.1 or more) the graph returns (pi(o) + M_a pi(M_o o)) / 2, standing pi(o) itself. symmetric_walk: the export of
+# the same stage without it, which the standing branch must match (check_symmetric). Its reference data (*_7221sym.json):
+# hoist.py and enc_bias.py run on the export folder (stand_turn.stage_data), fixstand_air.py on the stage (FixStand does
+# not run the policy).
+N8S = dict(label='n8s', title='№8 симм.', export='exp-28691193718e4d0e-7221510144-symwalk', reference='7221sym',
+           obs=490, height=False, symmetric_walk='exp-28691193718e4d0e-7221510144',
+           sim2sim='## Ходьба №8: симметричная выгрузка',
+           about='№8 (итерация 27), выгруженный с `--symmetric-walk`: на ходу — среднее политики и её зеркала, стоя — '
+                 'прежний граф №8; принят 26.10 двумя подписями (критик и ревизор)')
 REFERENCE_PROBES = ('hoist', 'fixstand_air', 'enc_bias')
 # docs/robot-first-run.md, item 9: on the floor only exports with `export_g1 --command-ranges -0.5 1 0.5 1`
 COMMAND_RANGES = dict(lin_vel_x=(-0.5, 1.0), lin_vel_y=(-0.5, 0.5), ang_vel_z=(-1.0, 1.0))
@@ -324,6 +337,75 @@ SIM2SIM_TABLE_N10 = [
      '100–300 Н (в приседе до 1380 Н); опускание, начатое не позже 2 с после входа в Velocity, — спокойно',
      'спокоен: p95 0,4–0,6 рад/с'),
 ]
+# Package n8s: docs/sim2sim.md «Ходьба №8: симметричная выгрузка (26.10.2026)» (its 14 runs in the session of 20, g1_ctrl
+# build 1fc0c5e8…, with candidate 8 as the control in the same session, its numbers in brackets) and, for what that
+# section does not write out (speed and drift after 2 s, side-step drift, latency), those runs' report.json
+# (scripts/sim2sim/analyze.py, /home/mawgly/unitree/sim2sim_logs/exp-28691193718e4d0e-7221510144-symwalk-20261026-2*):
+# (what, №8 symmetric, №7). The rows passport.py reads (its ROWS) keep SIM2SIM_TABLE's wording. №7's column as in
+# SIM2SIM_TABLE («Этап 6368 (итерация 24)», «сеанс №8»: its 14 runs in №8's session). The last rows are not the bridge:
+# the bridge copy (stand_turn.py, stand_long.py) and our physics (chatter.py), from the same section.
+SIM2SIM_TABLE_N8S = [
+    ('Прогонов; падений', '14; 0 (в том же сеансе ещё 3 прогона №8 и 3 выгрузки с подстройкой стоя — тоже 0)',
+     '22; 0 (и 14; 0 в сеансе №8)'),
+    ('Задержка: состояние → первый шаг физики с новой целью, медиана / 95% / макс', '4–6 / 6–8 / 8–16 мс',
+     '6 (в трёх прогонах 4) / 10 (в двух 8) / 12–22 мс'),
+    ('lowstate пришёл → lowcmd с ответом (часы ВМ): медиана; 95%', '2,19–2,75 мс; 3,69–5,11 мс',
+     '2,21–3,05 мс; 5,11–7,47 мс'),
+    ('Прямо 0,5 м/с: скорость; увод после 2 с; курс за 10 с', '0,46 м/с; +0,000 / +0,001 / +0,001 рад/с; −0,7 / −0,8 / '
+     '−0,4° (№8 в том же сеансе: +0,030 рад/с за 10 с, +17,0°)', '0,51 м/с; −0,001 / −0,004 / +0,001 рад/с; −1,7…−3,1°'),
+    ('За 10 с ходьбы 0,5 м/с: вперёд; вбок', '4,47–4,50 м; −0,06 / −0,06 / −0,02 м (№8: 4,49 м; +0,71 м)',
+     '4,84–4,93 м; −0,02…+0,05 м'),
+    ('Стоп-старт (0,5 м/с 3 с, стоп 3 с) × 3: скорость; курс', '0,46–0,47 м/с; −0,9…+0,7°',
+     '0,49–0,51 м/с; увод −0,004…+0,013 рад/с'),
+    ('Прямо 1 м/с: скорость; увод; курс за 10 с', '1,01 м/с; +0,000 / +0,002 рад/с; −2,9° / −2,4° (№8: +0,026 рад/с за '
+     '10 с, +14,7°; вбок за 10 с −0,49 / −0,36 м, у №8 +1,06; вперёд 9,67 / 9,70 м, у №8 9,45)',
+     '0,97 м/с; +0,028 / +0,031 рад/с; +11,9° / +12,6°'),
+    ('Шаг вбок ±0,3 м/с: скорость; увод при шаге влево; вправо', '0,27 м/с; −0,002; −0,001 (курс за 10 с −1,8° / −0,4°; '
+     '№8 вправо +8,6…+9,8°)', '0,26–0,27 м/с; −0,001 / +0,004; −0,004 / −0,005'),
+    ('Шаг вбок ±0,5 м/с (предел стика deploy.yaml): скорость влево / вправо; увод при шаге влево; вправо',
+     '0,45 / 0,45–0,46 м/с; +0,004 / +0,005; −0,011 / −0,010 (курс за 10 с +2,2 / +2,5° и −2,2 / −2,7°; №8 −1,5…+6,2°)',
+     'сеанс №8: 0,46–0,47 / 0,42 м/с; −0,002…+0,002; −0,040 / −0,036 / −0,036 (курс −19,5…−21,6° за 10 с)'),
+    ('Стоп после шага вбок ±0,3 / ±0,5: сдвиг за 3 с, после шага влево; вправо (окно 5 с)',
+     '0,07 / 0,12–0,13 м; 0,08 / 0,13–0,14 м (№8: 0,11–0,13 м за 3 с после ±0,5)',
+     'сеанс №8: 0,08–0,11 / 0,14–0,15 м (за 3 с, в обе стороны); —'),
+    ('Торможение за 3 с от стопа с 0,5 м/с', '0,22–0,23 м (стоп-старт, 3 стопа; №8 0,24–0,25)', '0,23–0,26 м'),
+    ('Стоп после 0,5 / 1 м/с: сдвиг за 4 с (сценарий `walk`)', '0,075–0,089 / 0,095–0,112 м (№8: 0,087 / 0,083)',
+     'так не мерили'),
+    ('Поворот ±0,5 рад/с: на месте; на ходу 0,5 м/с', '+0,46 / −0,47; +0,43 / −0,43 рад/с (два прогона: на месте '
+     '+0,461 / −0,471 и +0,460 / −0,471, на ходу +0,435 / −0,432 и +0,432 / −0,432; №8 +0,449 / −0,514 и +0,418 / −0,436)',
+     '+0,505 / −0,453; +0,500 / −0,461 рад/с'),
+    ('Стояние 30 с: поворот; смещение', '−7,6° / −5,8° (2 прогона; №8 −8,0°); 3 / 1 см; за 60 с −8,6°, 1 см',
+     '−5,8° / −5,9° / −6,3° (3 прогона; в сеансе №8 −5,4° / −5,3° / −4,9°); 2–3 см; без шага'),
+    ('Таз на ходу не ниже: 0,5 / 1 м/с', '0,765 / 0,744 м (№8: 0,767 / 0,745)', '0,768 / 0,747 м'),
+    ('Запястья', 'режим «ни одного» во всех 14', 'q20 = q27 = 0 («ни одного»)'),
+    ('Толчки стоя / на ходу 0,5 м/с, падений', 'в связке не мерили; копия связки с капсулами стоп (`skills_check`): '
+     'стоя 0 из 32 (Δv 1,0 / 1,25), на ходу 0 из 16 (Δv 1,0) — как у №8', 'стоя 0 из 44 (Δv 0,5–1,5), на ходу 0 из 8'),
+    ('Не связка. Порог 0,1 (копия связки, 48 прогонов, 0 падений): курс за 10 с вперёд 0,10 / 0,12 / 0,15 м/с',
+     '`um` −1,0 / −0,9 / −1,0°, `ours` −1,3 / −0,8 / −1,6° (№8: +9,5 / +11,7 / +13,3° и +5,2 / +6,1 / +8,5°); рывка '
+     'на пороге нет: переключение меняет действие на 0,29–0,46 при шаге к шагу p99 0,94–1,56', '— (без симметрии)'),
+    ('Не связка. Дрожание (`chatter.py`, наша физика, 18 прогонов): худший сустав, момент выше 10 Гц / цель выше 5 Гц',
+     '4,31 Н·м / 0,129 рад: ×1,06 / ×1,15 от v0 (порог ×1,5; №8 4,55 / 0,136)', 'не мерили'),
+    ('Не связка. Стоять 120 с (копия связки, `stand_long.py`): курс; ширина стоп',
+     '`um` −13,8°, `ours` −13,6°; 0,28 → 0,40 / 0,38 м, отрывов стоп нет (граф стоя — №8, числа совпали)', 'не мерили'),
+]
+# skills_check of the n8s export against candidate 8 (the reviewer's run, lab-reviewer/skills_symwalk.json, copied to
+# scripts/robot/reference/skills_7221sym.json): REFERENCE.md's «Проверка навыков» table (skills_table).
+SKILLS_N8S = dict(file='skills_7221sym.json', against='№8')
+# README.md's «Оговорки» of the package's main candidate (lab decisions: the reviewer's condition and the known
+# properties of candidate 8; the numbers from skills_check, the reviewer's corners.json and docs/sim2sim.md).
+CAVEATS_N8S = [
+    'Торможение после 0,5 м/с — 0,19 м за 3 с (у v0 0,13, у №8 0,17; норма ≤ 0,25; `skills_check`, наша физика): '
+    'единственная строка хуже v0. Условие ревизора — на роботе смотреть стоп после 0,5 м/с (шаг 5).',
+    'Шаг вбок ±0,3 м/с в нашей физике уводит на 0,032 рад/с (у №8 0,021; порог < 0,05) — единственная строка '
+    '`skills_check` хуже №8; в связке курс при ±0,3 влево −1,8°, вправо −0,4° за 10 с.',
+    'Долго стоять без команды не давать: за 120 с стоя (копия связки) курс −14°, стопы расходятся с 0,28 до 0,40 м. '
+    'Это свойство самого №8 — стоя граф выгрузки тот же, симметрия его не лечит и не ухудшает.',
+    'Руки в любой позе (±1 рад, `arm_probe`) норму не держат: стоя поворот до 55°, уползание до 0,64 м, увод на ходу '
+    'до 0,085 рад/с (у №8 55,6°, 0,87 м, 0,150; норма ≤ 10°, ≤ 0,2 м, ≤ 0,05). Падений 0 из 9.',
+    'Углы поля команд (вперёд −0,5 / 0 / 1, вбок ±0,5 / 0, поворот ±1 / 0; задержка 10 мс, наша физика): 0 падений '
+    'из 52 (26 команд × 2), моменты выше 90% пика — 0. При ходьбе с поворотом (1, ·, ±1) робот почти не идёт вперёд: '
+    '−0,19…+0,01 м/с при повороте 0,53–0,64 рад/с (у №8 так же).',
+]
 # Lead's decisions: 23.10 after the bridge (docs/lab-knowledge.md, iteration 27, «Решение руководителя»; docs/sim2sim.md
 # «Этап 7221 (итерация 27)»): candidate 8 for the hoist and the floor, candidate 7 the spare; 24.10 after the bridge
 # (docs/sim2sim.md «Этап 7741 (итерация 29, присед)», commit fe7e917): 7741 passes every criterion, candidate 9 goes
@@ -346,6 +428,16 @@ PACKAGES = {
                            'высоты.\nПрисед — отрезки `--scenario crouch` и стояния 30 с в приседе; c — по правилу патча '
                            'высоты из `ry`\n(`analyze.py`). Две последние строки — не связка: проба поз рук '
                            '(`scripts/lab/probes/arm_probe.py`)\nи проба подвеса (раздел «Подвес в симуляции» ниже).'),
+    # 26.10 (docs/sim2sim.md «Ходьба №8: симметричная выгрузка», both signatures): candidate 8's symmetric-walk export
+    # replaces its plain one as the main policy, candidate 7 the spare as in n8; package n8 stays as the spare package.
+    'n8s': dict(candidates=[dict(N8S, role='основной'), dict(N7, role='запасной')], table=SIM2SIM_TABLE_N8S,
+                skills=SKILLS_N8S, caveats=CAVEATS_N8S,
+                table_note='Столбец №8 симм. — его 14 прогонов из 20 в сеансе 26.10 (сборка `g1_ctrl` `1fc0c5e8…`, RTF '
+                           '1,000);\nв скобках — №8 без симметрии в том же сеансе (контроль). Скорость и увод — после 2-й '
+                           'с хода, курс —\nза 10 с; задержки, скорости и увод вбок — из `report.json` этих прогонов '
+                           '(`analyze.py`), остальное —\nиз раздела. Строки «Не связка» — копия связки (`stand_turn.py`, '
+                           '`stand_long.py`) и наша физика\n(`chatter.py`) из того же раздела. Столбец №7 — его раздел и '
+                           '«сеанс №8» (его 14 прогонов в одном\nсеансе с №8, из раздела «Этап 7221 (итерация 27)»).'),
 }
 HOIST_PLANS = dict(air5='в воздухе, стопы 5 см над полом', air15='в воздухе, стопы 15 см над полом',
                    half='стопы на полу, трос натянут', lower='опускание из Velocity',
@@ -378,10 +470,24 @@ GETUP_ABOUT_39 = ('ветка 39 exp-f19f12fb1eff4ef3 (итерация 39: от
 # docs/sim2sim.md for one that ran in the bridge (None: not run there; an optional note says what of it did), and
 # compare: the stage whose probe column stands next to its own in REFERENCE.md (the candidate before it), and whose
 # bridge REFERENCE.md shows for a stage without one of its own.
+GETUP_ABOUT_59 = ('ветка 59 exp-207eb498dc824027 (итерация 59: от этапа 1104 ветки 52 с `head_rise` 6; `impact` 2, '
+                  '`sole_impact` 1, `stance_width` 2, `arm_press` 0,05, `pd_bound` c 0,6, `stand_pose_std` 0,3, '
+                  '`action_change_unbounded`)')
+# caveats: the stage's own warnings, a list in README.md's «Политика вставания» (lab decisions; the numbers from the
+# stage's probes and bridge).
 GETUP_STAGES = {
     '683606016': dict(about=GETUP_ABOUT_37, sim2sim='## Вставание: этап 683 (итерация 37)', compare=None),
     '753795072': dict(about=GETUP_ABOUT_37, sim2sim='## Вставание: этап 753 (итерация 38)', compare='683606016'),
     '823984128': dict(about=GETUP_ABOUT_39, sim2sim='## Вставание: этап 823 (итерация 39)', compare='753795072'),
+    '1164902400': dict(about=GETUP_ABOUT_59, sim2sim='## Вставание: этап 1164 (итерация 59)', compare='823984128',
+                       caveats=[
+                           'Вставать только на мате и кисти Dex3-1 не нагружать: при подъёме кисть упирается в пол с '
+                           'силой до 455 Н (`scripts/lab/probes/getup_split.py`, 20 стартов: p90 269 Н; у 823 — '
+                           '389 / 679 Н).',
+                           'Со старта на боку бывает вторая попытка: в 2 из 4 стартов на боку он встаёт со второго '
+                           'раза, за 2,9–3,9 с.',
+                           'LAFAN1 не использован: в `task_config` этапа есть только метка `style_library: lafan1`, '
+                           'веса `style` и `amp` равны 0 (награды по движениям человека не было).']),
 }
 # The critic's probe of iteration 38 (lab-critic/it38): ready38.py, 276 fresh starts (back, front, side, sitting 56 each,
 # candidate 8's falls 52) in 4 physics (ours, a 20 ms delay, soles 0.4 with the rest and the floor 0.2, the training's
@@ -446,52 +552,123 @@ GETUP_PROBE = [
      'тангажу и крену, правое по крену', {'823984128': 'не мерили', '753795072': '226 Н; 0,59 и 0,61, 0,60',
                                           '683606016': '242 Н; 0,58 и 0,60, 0,61'}),
 ]
+# skills_check of a getting-up stage (scripts/lab/skills_check.py, mode getup: getup_probe / ready38-style starts in
+# ours, a 20 ms delay and foot friction 0.3, getup_stance's stance, the hand-over to candidate 8, the loads; the
+# reviewer's run against its compare stage, lab-reviewer/skills1164.json): (what, threshold, {stage: value}).
+GETUP_SKILLS = [
+    ('готовность к роботу: Наша физика: встал, без отсечки скорости, передан в ходьбу №8', '≥ 99%',
+     {'1164902400': '120 из 120', '823984128': '120 из 120'}),
+    ('готовность к роботу: Задержка 20 мс: встал, без отсечки скорости, передан в ходьбу №8', '≥ 96%',
+     {'1164902400': '120 из 120', '823984128': '120 из 120'}),
+    ('готовность к роботу: Трение стоп 0,3: встал, без отсечки скорости, передан в ходьбу №8', '≥ 96%',
+     {'1164902400': '119 из 120', '823984128': '119 из 120'}),
+    ('готовность к роботу: Старт на спине, все физики', 'не судится',
+     {'1164902400': '72 из 72', '823984128': '72 из 72'}),
+    ('готовность к роботу: Старт на животе, все физики', 'не судится',
+     {'1164902400': '72 из 72', '823984128': '72 из 72'}),
+    ('готовность к роботу: Старт на боку, все физики', 'не судится',
+     {'1164902400': '71 из 72', '823984128': '71 из 72'}),
+    ('готовность к роботу: Старт сидя, все физики', 'не судится',
+     {'1164902400': '72 из 72', '823984128': '72 из 72'}),
+    ('готовность к роботу: Старт из падения №8, все физики', 'не судится',
+     {'1164902400': '72 из 72', '823984128': '72 из 72'}),
+    ('готовность к роботу: Наша физика: встал за 6 с и простоял 3 с без уползания (getup_probe)', 'не судится',
+     {'1164902400': '119 из 120', '823984128': '106 из 120'}),
+    ('готовность к роботу: Отсечки скорости g1_ctrl до +1 с после подъёма, все физики', '0',
+     {'1164902400': '0 из 360', '823984128': '0 из 360'}),
+    ('готовность к роботу: Подъём, медиана, наша физика, с', 'не судится',
+     {'1164902400': '1,66', '823984128': '1,11'}),
+    ('стойка после подъёма: Ширина стоп через 1 с, м: медиана / p90', '≤ 0,34 / ≤ 0,40',
+     {'1164902400': '0,303 / 0,329', '823984128': '0,461 / 0,547'}),
+    ('стойка после подъёма: Ширина стоп через 2 с, м: медиана / p90', '≤ 0,34 / ≤ 0,40',
+     {'1164902400': '0,294 / 0,316', '823984128': '0,458 / 0,527'}),
+    ('стойка после подъёма: Тяга крена бёдер внутрь, Н·м', '≤ 6',
+     {'1164902400': '9,9', '823984128': '16,2'}),
+    ('стойка после подъёма: Касание рука–корпус > 10 Н, доля шагов', '≤ 10%',
+     {'1164902400': '0,0%', '823984128': '100,0%'}),
+    ('стойка после подъёма: Крен плеч от home, худшее плечо, рад', '≤ 0,08',
+     {'1164902400': '0,032', '823984128': '0,241'}),
+    ('стойка после подъёма: Полёт ≥ 40 мс при подъёме: подъёмов', '≤ 10%',
+     {'1164902400': '73 из 120', '823984128': '104 из 120'}),
+    ('стойка после подъёма: Касание стопы, м/с вниз: медиана / max', '≤ 1,0',
+     {'1164902400': '1,74 / 5,01', '823984128': '2,60 / 5,24'}),
+    ('стойка после подъёма: Пик силы на стопу, Н: max / медиана', '≤ 700',
+     {'1164902400': '905 / 431', '823984128': '1017 / 395'}),
+    ('передача в ходьбу №8: Поворот за 5 с стоя после передачи, медиана |°|, наша физика', '≤ 8',
+     {'1164902400': '4,4', '823984128': '9,4'}),
+    ('передача в ходьбу №8: Поворот больше 15°: передач, наша физика', '≤ 12,5%',
+     {'1164902400': '1 из 120', '823984128': '30 из 120'}),
+    ('передача в ходьбу №8: Падения в первые 5 с после передачи, все физики', '0',
+     {'1164902400': '0 из 359', '823984128': '0 из 359'}),
+    ('нагрузки: Закреплённые запястья > 90% пика момента: доля времени, наша физика', '≤ 3%',
+     {'1164902400': '5,5%', '823984128': '5,6%'}),
+    ('нагрузки: Остальные моторы > 90% пика: доля времени, наша физика', 'не судится',
+     {'1164902400': '0,0%', '823984128': '0,1%'}),
+    ('нагрузки: Удары головой или корпусом о пол > 300 Н: стартов, все физики', '0',
+     {'1164902400': '82 из 360', '823984128': '72 из 360'}),
+    ('нагрузки: Моменты в первые 0,2 с > 60% пика: стартов, все физики', '0',
+     {'1164902400': '360 из 360', '823984128': '360 из 360'}),
+]
 # The bridge (docs/sim2sim.md, its section of GETUP_STAGES): unitree_mujoco + g1_ctrl in WSL2, the getup scenario of
 # gamepad.py (fall, 5 s lying, L2+down, R2+A after 5 s, candidate 8's Velocity: 5 s standing, 5 s at 0.5 m/s, stop).
 GETUP_BRIDGE = [
     ('Прогонов; сборка `g1_ctrl`', {
+        '1164902400': ('18 и 4 повтора, строго по одному; `8e72aa9e…`, тангаж плеч с порогом 30 (как в пакете); на '
+                       'видеокарте шло обучение'),
         '823984128': '18, строго по одному; `8e72aa9e…`, тангаж плеч с порогом 30 (как в пакете)',
         '753795072': '18, строго по одному; `8e72aa9e…`, тангаж плеч с порогом 30 (как в пакете)',
         '683606016': '18, строго по одному; `8e72aa9e…` (тангаж плеч тогда с порогом 26)'}),
     ('Встал; время подъёма', {
+        '1164902400': '18 из 18; 1,46–3,22 с, медиана 1,7, p90 2,7 (повторы 4 из 4, 1,50–1,74 с)',
         '823984128': '18 из 18; 0,86–2,95 с, медиана 1,1, p90 2,3',
         '753795072': '18 из 18; 0,86–2,05 с, медиана 1,1, p90 1,8',
         '683606016': '18 из 18; 0,77–3,73 с, медиана 1,2, p90 2,8'}),
     ('Как лёг перед GetUp', {
+        '1164902400': 'спина 11, живот 5, правый бок 2; старта сидя не было',
         '823984128': 'спина 13, живот 5; на бок не лёг ни разу из 8 боковых падений, старта сидя не было',
         '753795072': 'спина 11, живот 7; на бок не лёг ни разу из 8 боковых падений, старта сидя не было',
         '683606016': 'спина 14, живот 4; на бок не лёг ни разу из 8 боковых падений, старта сидя не было'}),
     ('Отсечки (тайм-аут, скорость сустава)', {
+        '1164902400': '0 из 18 (в повторах 0 из 4)',
         '823984128': '0 из 18', '753795072': '0 из 18', '683606016': '0 из 18'}),
     ('Быстрее всего в GetUp; ближе всех к своему порогу', {
+        '1164902400': ('рыскание левого бедра до 23,0 рад/с (порог 35); тангаж правого бедра 18,6 из 26 и левого '
+                       'голеностопа 19,7 из 28 (0,71–0,72); тангаж плеч до 20,3 из 30'),
         '823984128': 'рыскание левого плеча до 20,7 рад/с; левое колено 15,6 из 20 (0,78); тангаж плеч до 18,1 из 30',
         '753795072': 'рыскание правого бедра до 22,8 рад/с; тангаж левого бедра 18,8 из 26 (0,72); тангаж плеч до '
                      '21,5 из 30',
         '683606016': 'рыскание левого бедра до 23,2 рад/с; тангаж левого плеча 20,9 из 26 (0,80)'}),
     ('Закреплённые запястья / крены запястий в GetUp, рад/с', {
+        '1164902400': 'в сводке не выписаны; ни один сустав не быстрее 25 рад/с',
         '823984128': '2,0–9,2 (9,2 — в одном прогоне, в остальных ≤ 6,5) / 13,7–15,2',
         '753795072': '2,4–10,2 (10,2 — в одном прогоне, в остальных ≤ 5,2) / 13,7–14,8',
         '683606016': '2,7–6,5 / 13,7–15,1'}),
     ('Вне позы после подъёма', {
+        '1164902400': 'в 0 из 18 (в повторах 0 из 4)',
         '823984128': 'в 0 из 18',
         '753795072': 'в 1 из 18, на 0,01 с (торс 15,0°)',
         '683606016': 'в 4 из 18, на 0,07–0,19 с (торс до 15,3–18,5°)'}),
     ('Смещение стоя в GetUp от подъёма до R2+A', {
+        '1164902400': '0,03–0,58 м, медиана 0,09; не меньше 0,3 м — в 1 (0,58)',
         '823984128': '0,02–0,62 м, медиана 0,09; не меньше 0,3 м — в 3 (за 2,9–4,9 с)',
         '753795072': '0,02–0,44 м, медиана 0,07; не меньше 0,3 м — в 1 (за 4,9 с)',
         '683606016': '0,01–0,43 м, медиана 0,09; не меньше 0,3 м — в 3 (за 4,2–4,6 с)'}),
     ('Поза передачи: Σ(q − home)²; наклон торса / таза', {
+        '1164902400': '0,22–0,26 рад² (№8 стоя — 0,18); 1,1–2,5 / 1,4–3,9°',
         '823984128': '0,36–0,49 рад²; 1,1–4,6 / 2,1–6,7°',
         '753795072': '0,84–1,45 рад²; 1,2–7,6 / 7,7–11,7°',
         '683606016': '1,74–2,35 рад²; 4,8–13,1 / 20,9–22,4°'}),
     ('Первая 1 с Velocity: рука; самый быстрый сустав', {
+        '1164902400': '0,5–1,1; 0,7–5,0 рад/с',
         '823984128': '1,4–2,9; 1,4–5,9 рад/с', '753795072': '2,7–5,1; 2,9–7,5 рад/с',
         '683606016': '5,1–6,8; 5,5–9,8 рад/с'}),
     ('Курс таза через 5,4 с после R2+A', {
+        '1164902400': '−4,5…+2,0°, медиана −0,4° (больше 8° — в 0 из 18; через 0,5 с −1,4…+0,6°)',
         '823984128': '−18,5…−1,5°, медиана −6° (больше 8° в 5 из 18, вправо больше 9° в 2; через 0,5 с −5,5…−0,3°)',
         '753795072': '−26,1…−8,2°, медиана −13° (вправо больше 9° в 15 из 18; через 0,5 с −7,6…+1,9°)',
         '683606016': '−24,9…+8,4°, медиана −13° (вправо на 9–25° за 2–5 с в 13 из 18)'}),
     ('Velocity №8: падений; стоять 5 с; ходьба 0,5 м/с; стоп за 3 с', {
+        '1164902400': '0 из 18; 0,00–0,02 м; 0,43–0,44 м/с (0,47 после 1-й с); 0,18–0,26 м',
         '823984128': '0 из 18; 0,01–0,06 м; 0,43–0,45 м/с (0,47 после 1-й с); 0,21–0,26 м',
         '753795072': '0 из 18; 0,02–0,08 м; 0,42–0,45 м/с (0,47–0,48 после 1-й с); 0,20–0,27 м',
         '683606016': '0 из 18; 0,01–0,11 м; 0,42–0,44 м/с (0,46–0,47 после 1-й с); 0,20–0,27 м'}),
@@ -504,6 +681,69 @@ def md5(path):
 
 def fail(message):
     raise SystemExit(f'package.py: {message}')
+
+
+# Reward weights trained on LAFAN1 (Ubisoft La Forge, CC BY-NC-ND 4.0: no derivatives, no commercial use): g1_getup's
+# style (iteration 53) and amp (iteration 55). A policy trained with either is a derivative and never goes to a client.
+LAFAN_WEIGHTS = ('style', 'amp')
+# g1_getup's task_config track_clip (iteration 64): the policy follows a human clip
+# (runs/humanoid_lab/getup_track/<file>.npz, its header's dataset). A LAFAN1 clip (the dataset missing in clips made
+# before CMU, or lafan1) is a research prototype and refused the same way; a CMU one (scripts/lab/getup_track_clip.py
+# --source cmu) may go to a robot: its licence allows commercial products (not reselling the data), with the
+# acknowledgement CMU_ACKNOWLEDGEMENT in the package's README.
+LAFAN_SETTINGS = ('track_clip',)
+TRACK_DIR = SIM / 'runs' / 'humanoid_lab' / 'getup_track'
+COMMERCIAL_CLIPS = ('cmu',)
+CMU_ACKNOWLEDGEMENT = ('The data used in this project was obtained from mocap.cs.cmu.edu. The database was created with '
+                       'funding from NSF EIA-0196217.')
+
+
+def track_clip_header(folder, setting):
+    """The header (dict) of the track clip a stage's setting {file, md5} names, read without pickle after checking the
+    file's md5; refuses a setting it cannot check."""
+    name = setting.get('file') if isinstance(setting, dict) else None
+    path = TRACK_DIR / f'{name}.npz'
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or not path.is_file():
+        fail(f'{folder.name}: этап следует записи человека {setting!r}, а клипа {path} нет: не проверить, из каких он '
+             'данных (LAFAN1 в пакет нельзя)')
+    if md5(path) != setting.get('md5'):
+        fail(f'{folder.name}: md5 клипа {path.name} {md5(path)}, а этап обучен на {setting.get("md5")} (другой файл)')
+    with np.load(path, allow_pickle=False) as arrays:
+        return json.loads(str(arrays['header']))
+
+
+def check_licence(folder):
+    """Refuses an export whose stage (deploy.yaml's first line, export_g1's header) was trained with a LAFAN1 reward
+    weight (LAFAN_WEIGHTS) or setting (LAFAN_SETTINGS: a track clip whose header's dataset is not in
+    COMMERCIAL_CLIPS), or cannot be read to tell. Returns the stage's track clip (dict: file, dataset, source, frames)
+    or None."""
+    first = (folder / 'deploy.yaml').read_text(encoding='utf-8').splitlines()[0]
+    m = re.match(r'# humanoid_sim\.export_g1: (.+?) \(\d+ steps\)', first)
+    metadata = Path(m.group(1)) / 'metadata.json' if m else None
+    if metadata is None or not metadata.is_file():
+        fail(f'{folder.name}: не найден этап выгрузки ({first!r}), не проверить, обучен ли он с наградой по данным '
+             'LAFAN1 (style, amp)')
+    config = json.loads(metadata.read_text(encoding='utf-8')).get('task_config') or {}
+    weights = config.get('reward_weights') or {}
+    used = [key for key in LAFAN_WEIGHTS if weights.get(key)]
+    if used:
+        fail(f'{folder.name}: этап обучен с наградой {", ".join(used)} по движениям человека из LAFAN1 '
+             '(лицензия CC BY-NC-ND 4.0 — без производных и без коммерческого использования): такую политику '
+             'нельзя ставить в пакет для робота клиента')
+    clip = None
+    # settle_clip (iteration 66): each clip whose first frame is a settling target, checked the same way.
+    settings = [(key, config[key]) for key in LAFAN_SETTINGS if config.get(key) is not None]
+    settings += [('settle_clip', entry) for entry in config.get('settle_clip') or ()]
+    for key, setting in settings:
+        header = track_clip_header(folder, setting)
+        dataset = header.get('dataset', 'lafan1')
+        if dataset not in COMMERCIAL_CLIPS:
+            fail(f'{folder.name}: этап обучен следовать записи человека из LAFAN1 ({key}: {setting["file"]}, '
+                 f'данные {dataset}; лицензия CC BY-NC-ND 4.0 — без производных и без коммерческого использования): это '
+                 'исследовательский прототип, такую политику нельзя ставить в пакет для робота')
+        if clip is None:
+            clip = dict(file=setting['file'], dataset=dataset, source=header.get('source'), frames=header.get('frames'))
+    return clip
 
 
 def write(path, text):
@@ -559,6 +799,7 @@ def check_export(candidate):
     for name in ('policy.onnx', 'deploy.yaml'):
         if not (folder / name).exists():
             fail(f'нет {folder / name}')
+    check_licence(folder)
     deploy = yaml.safe_load((folder / 'deploy.yaml').read_text(encoding='utf-8'))
     first = (folder / 'deploy.yaml').read_text(encoding='utf-8').splitlines()[0]
     m = re.search(r'stage_(\d+)', first)
@@ -613,13 +854,28 @@ def check_export(candidate):
     if blind and not onnx['arm_change'] <= ARM_BLIND_TOL:
         problems.append(f"ONNX: случайные входы рук меняют действие на {onnx['arm_change']:.2e} (> {ARM_BLIND_TOL:g}): "
                         'руки не слепые')
+    symmetric = None
+    if candidate.get('symmetric_walk'):
+        base = EXPORTS / candidate['symmetric_walk'] / 'policy.onnx'
+        if not base.exists():
+            fail(f"нет {base}: выгрузки того же этапа без --symmetric-walk, с которой сверить ветку «стоя»")
+        symmetric = symmetric_contract(folder / 'policy.onnx', base, candidate['obs'])
+        if not symmetric['symmetric_walk'] or symmetric['standing'] is None:
+            problems.append(f"ONNX: свойство symmetric_walk {symmetric['symmetric_walk']}, столбцы команды "
+                            f"{symmetric['command']}, а кандидат — выгрузка --symmetric-walk")
+        elif not symmetric['standing'] <= SYMMETRIC_TOL:
+            problems.append(f"ONNX: стоя (команда 0) действие отличается от {candidate['symmetric_walk']} на "
+                            f"{symmetric['standing']:.2e} (> {SYMMETRIC_TOL:g}): граф «стоя» не прежний")
+        elif not symmetric['walking'] > SYMMETRIC_TOL:
+            problems.append(f"ONNX: на ходу действие то же, что у {candidate['symmetric_walk']}: симметрии нет")
     if problems:
         fail(f"{candidate['export']}: " + '; '.join(problems))
     comments = [line for line in (folder / 'deploy.yaml').read_text(encoding='utf-8').splitlines()
                 if line.lstrip().startswith('#')]
     return dict(folder=folder, stage=m.group(1).lstrip('0') if m else None, onnx=onnx,
                 knee_clip=clip[list(KNEES), 0].tolist(), comments=comments,
-                command_ranges={k: ranges[k] for k in COMMAND_RANGES}, height_terms=height)
+                command_ranges={k: ranges[k] for k in COMMAND_RANGES}, height_terms=height,
+                **({'symmetric': symmetric} if symmetric else {}))
 
 
 def arm_columns(terms):
@@ -660,6 +916,38 @@ def onnx_contract(path, size, n=64, arms=None, draws=5):
                 max_abs=float(np.abs(out).max()), arm_blind=meta.get('arm_blind') == 'true',
                 arm_inputs=sum(len(c) for c in arms.values()) if arms else None, arm_draws=draws if arms else None,
                 arm_change=arm_change)
+
+
+SYMMETRIC_TOL = 1e-6
+
+
+def symmetric_contract(path, base, size, n=64):
+    """A symmetric-walk export (export_g1 --symmetric-walk) against `base`, the same stage's export without it: the ONNX
+    properties symmetric_walk, its command columns and threshold; on n random observations drawn as onnx_contract's,
+    the largest action difference from `base` with those columns zeroed (standing: the same graph, at most
+    SYMMETRIC_TOL) and with them drawn at a norm of 0.2-1 (walking: the symmetrized branch, so not 0)."""
+    import onnxruntime
+    sessions = [onnxruntime.InferenceSession(str(p), providers=['CPUExecutionProvider']) for p in (path, base)]
+    meta = sessions[0].get_modelmeta().custom_metadata_map
+    columns = json.loads(meta.get('symmetric_walk_command', 'null'))
+    threshold = float(meta.get('symmetric_walk_threshold', 'nan'))
+    out = dict(symmetric_walk=meta.get('symmetric_walk') == 'true', command=columns, threshold=threshold, samples=n,
+               base=Path(base).parent.name, standing=None, walking=None)
+    if not (isinstance(columns, list) and len(columns) == 2):
+        return out
+    rng = np.random.default_rng(0)
+    obs = (rng.normal(size=(n, size)) * rng.choice([0.1, 1., 10.], size=(n, 1))).astype(np.float32)
+    act = lambda s, x: s.run(None, {s.get_inputs()[0].name: x[None]})[0]
+    width = columns[1] - columns[0]
+    standing = walking = 0.
+    for x in obs:
+        still, moving = x.copy(), x.copy()
+        still[columns[0]:columns[1]] = 0.
+        command = rng.uniform(-1., 1., width)
+        moving[columns[0]:columns[1]] = command / np.linalg.norm(command) * rng.uniform(.2, 1.)
+        standing = max(standing, float(np.abs(act(sessions[0], still) - act(sessions[1], still)).max()))
+        walking = max(walking, float(np.abs(act(sessions[0], moving) - act(sessions[1], moving)).max()))
+    return dict(out, standing=standing, walking=walking)
 
 
 def term_layout(terms):
@@ -721,6 +1009,7 @@ def check_getup(folder, walking, checked):
     for name in ('policy.onnx', 'deploy.yaml'):
         if not (folder / name).exists():
             fail(f'нет {folder / name}')
+    track_clip = check_licence(folder)
     lines = (folder / 'deploy.yaml').read_text(encoding='utf-8').splitlines()
     deploy = yaml.safe_load('\n'.join(lines))
     comments = [line for line in lines if line.lstrip().startswith('#')]
@@ -773,7 +1062,7 @@ def check_getup(folder, walking, checked):
     stage = m.group(1).lstrip('0') if m else None
     return dict(export=folder.name, folder=folder, stage=stage, slot=f'getup-{stage or folder.name}', onnx=onnx,
                 comments=comments, command_ranges={k: ranges[k] for k in COMMAND_RANGES},
-                knee_clip=clip[list(KNEES), 0].tolist(), same_deploy_as=walking['title'])
+                knee_clip=clip[list(KNEES), 0].tolist(), same_deploy_as=walking['title'], track_clip=track_clip)
 
 
 def getup_patch_info(path):
@@ -813,6 +1102,11 @@ def getup_stages(stage):
     return [stage] + ([compare] if compare else [])
 
 
+def has_numbers(stage, table):
+    """Whether every row of a reference table (GETUP_PROBE, GETUP_SKILLS) has a value for the stage."""
+    return all(stage in row[-1] for row in table)
+
+
 def getup_bridged(stage):
     """The stage whose bridge REFERENCE.md shows for a getting-up stage: its own, else its compare stage's (None:
     neither ran in the bridge)."""
@@ -843,6 +1137,27 @@ def getup_reference_md(getup):
                   f'опирается\nкраем запястья, а политика обучена с капсулами.\n\n{head([shown])}\n'
                   f'{rows(GETUP_BRIDGE, [shown])}')
     shoulder = getup['max_joint_speed'][15]
+    # The critic's probe of iterations 38-39 for the stages it ran on; a later stage, which that probe did not run on,
+    # has skills_check's instead (GETUP_SKILLS), next to its compare stage's (a stage of the probe: as before).
+    probe_stages = [s for s in stages if has_numbers(s, GETUP_PROBE)]
+    probe_note = '' if stage in probe_stages else (
+        f'Этап {stage_title(stage)} этой пробой не мерили (его проверка — ниже, «Проверка навыков»); в таблице — '
+        'этап сравнения.\n\n')
+    skills = ''
+    if stage not in probe_stages:
+        skill_stages = [s for s in stages if has_numbers(s, GETUP_SKILLS)]
+        skills = ('\n### Проверка навыков (`skills_check`)\n\n'
+                  f"`scripts/lab/skills_check.py <этап> --against <этап сравнения>`, режим вставания: 120 новых стартов (спина,\n"
+                  'живот, бок, сидя, падения №8) в трёх физиках — «наша», «задержка 20 мс», «трение стоп 0,3»; GetUp без '
+                  'подтяжки\nс порогами скорости `g1_ctrl`, через 1 с — Velocity №8; стойка после подъёма '
+                  '(`getup_stance.py`) и нагрузки\n(`getup_probe.py`). Порог — правило приёмки (`docs/lab-knowledge.md`, '
+                  '«Вставание 823»); «не судится» — только\nне хуже этапа сравнения.\n\n'
+                  '| Что | Порог | ' + ' | '.join(stage_title(s) + (' (в пакете)' if s == stage else '')
+                                                for s in skill_stages)
+                  + ' |\n|---|---|' + '---|' * len(skill_stages) + '\n'
+                  + '\n'.join(f"| {what.replace('|', chr(92) + '|')} | {threshold} | "
+                              + ' | '.join(values[s] for s in skill_stages) + ' |'
+                              for what, threshold, values in GETUP_SKILLS) + '\n')
     return f"""## Вставание (GetUp)
 
 Политика вставания `policy/{getup['slot']}` — этап {stage_title(stage)} ({stage} шагов), {GETUP_STAGES[stage]['about']};
@@ -858,14 +1173,28 @@ Velocity — №8. Как вести сеанс — `PROTOCOL.md`, «Встав�
 0,5 м/с. Четыре числа подряд — эти физики по порядку. Поза передачи и поворот после неё — `pose38.py` (60 передач) и
 `lab-critic/it39/turn39.py` (40 передач, ещё и ширина стоп), руки у корпуса — `press38.py` (60 стартов, наша).
 
-{head(stages)}
-{rows(GETUP_PROBE, stages)}
-
+{probe_note}{head(probe_stages)}
+{rows(GETUP_PROBE, probe_stages)}
+{skills}
 ### Связка (sim2sim)
 
 {bridge}
 
 """
+
+
+def track_clip_note(clip):
+    """README.md's paragraph on the human clip a getting-up policy was trained to follow (check_licence's track clip;
+    '' without one): the CMU database's acknowledgement, which its licence asks for."""
+    if not clip:
+        return ''
+    frames = clip.get('frames') or []
+    span = f', кадры {frames[0]}–{frames[1]}' if len(frames) == 2 else ''
+    return (f"\n\n**Данные движения.** Политика обучена следовать записи человека: база захвата движений CMU, субъект "
+            f"140, запись `{clip.get('source')}`{span}\n(клип `{clip['file']}`, перенос на G1 — "
+            "`scripts/lab/cmu_mocap.py`). Лицензия базы разрешает коммерческие продукты, но не перепродажу самих\n"
+            f"данных, даже в переработанном виде; данных в пакете нет. Благодарность, о которой просит база:\n\n"
+            f"> {CMU_ACKNOWLEDGEMENT}")
 
 
 def getup_readme(getup):
@@ -885,7 +1214,8 @@ def getup_readme(getup):
 встал — R2 + A, дальше Velocity (передача проверена только в №8). Сеанс — `PROTOCOL.md`, «Вставание после падения»;
 числа — `REFERENCE.md`, «Вставание (GetUp)».
 
-""" + ru(
+""" + ''.join(f'**Оговорки.**\n\n' + ''.join(f'- {ru(c)}\n' for c in caveats) + '\n'
+              for caveats in [GETUP_STAGES[stage].get('caveats')] if caveats) + ru(
         f"Разъём — как у {getup['same_deploy_as']}: ONNX `obs` [1, {o['input'][1][1]}] → `actions` [1, 29]; `deploy.yaml` "
         f"совпадает с `deploy.yaml` {getup['same_deploy_as']},\nкроме комментариев и диапазонов команд: у вставания они "
         "[0, 0] (команды хода нет, фаза шага стоит). В ONNX — свойства `getup`\nи `task_id` g1_getup и граница ошибки "
@@ -905,6 +1235,7 @@ def getup_readme(getup):
 
 ```
 """ + '\n'.join(getup['comments']) + '\n```'
+    section += track_clip_note(getup.get('track_clip'))
     limits = getup['max_joint_speed']
     install = f"""
 
@@ -1093,8 +1424,41 @@ def encoder_note(data):
             f"увод при ходьбе — с σ {span(walk, '{:.3f}')} рад/с")
 
 
+def on_export(candidate):
+    """How a symmetric-walk candidate's probes ran (N8S): on its export, the symmetry included."""
+    return (' — прогнаны на самой выгрузке (`policy.onnx` с симметрией на ходу)' if candidate.get('symmetric_walk')
+            else '')
+
+
 def load_reference(candidate, probe):
     return json.loads((HERE / 'reference' / f"{probe}_{candidate['reference']}.json").read_text(encoding='utf-8'))
+
+
+SKILLS_VS = dict(better='лучше', same='так же', worse='хуже')
+
+
+def skills_md(path, title, against):
+    """REFERENCE.md's «Проверка навыков» from a skills_check --json file (scripts/lab/skills_check.py): every judged row
+    (`title`, the package's candidate, against its reference `against` and Unitree v0), with the counts."""
+    data = json.loads(Path(path).read_text(encoding='utf-8'))
+    rows = [r for r in data['rows'] if r.get('ok') is not None]
+    cell = lambda text: str(text).replace('|', '\\|')
+    passed = sum(bool(r['ok']) for r in rows)
+    vs = {key: sum(r.get('v0_vs') == key for r in rows) for key in SKILLS_VS}
+    lines = [f"| {cell(r['skill'])}: {cell(r['label'])} | {cell(r['target'])} | {cell(r['value'])} | "
+             f"{cell(r['reference'])} | {cell(r['v0'])} | {'да' if r['ok'] else '**нет**'}: {cell(r['note'])} | "
+             f"{SKILLS_VS.get(r.get('v0_vs'), '—')} |" for r in rows]
+    return f"""## Проверка навыков (`skills_check`)
+
+`scripts/lab/skills_check.py <выгрузка> --against <этап>` (данные `reference/{Path(path).name}`): быстрые части проб
+лаборатории в нашей физике и копии связки, {data['runs']} прогонов. Эталон — {against}
+(`{data['reference']['label']}`), третий столбец — Unitree v0 в тех же прогонах. Строка проходит по порогу (или если эталон его тоже не
+берёт) и если не хуже эталона сверх допуска. {title}: {passed} из {len(rows)} строк; против v0 — лучше {vs['better']},
+так же {vs['same']}, хуже {vs['worse']}.
+
+| Навык: что | Порог | {title} | {against} | v0 | Прошла | Против v0 |
+|---|---|---|---|---|---|---|
+""" + '\n'.join(lines) + '\n\n'
 
 
 def reference_md(info, package, sources):
@@ -1119,7 +1483,8 @@ def reference_md(info, package, sources):
     hoist = []
     for c in cands:
         data = load_reference(c, 'hoist')
-        hoist.append(f"### {name(c)}\n\nДанные `reference/hoist_{c['reference']}.json`, этап {c['stage']}.\n\n"
+        hoist.append(f"### {name(c)}\n\nДанные `reference/hoist_{c['reference']}.json`, этап {c['stage']}"
+                     f"{on_export(c)}.\n\n"
                      f"{ru(hoist_table(data))}\n\nЧто из этого следует (выводы критика, итерация 21; числа — из "
                      "таблицы выше):\n" + '\n'.join(f'- {ru(line)}' for line in hoist_summary(data)))
     fix = load_reference(cands[0], 'fixstand_air')
@@ -1137,7 +1502,8 @@ def reference_md(info, package, sources):
     for c in cands:
         data = load_reference(c, 'enc_bias')
         table, no_bias = (ru(x) for x in encoder_table(data))
-        encoders.append(f"### {name(c)}\n\nДанные `reference/enc_bias_{c['reference']}.json`, этап {c['stage']}. Без "
+        encoders.append(f"### {name(c)}\n\nДанные `reference/enc_bias_{c['reference']}.json`, этап {c['stage']}"
+                        f"{on_export(c)}. Без "
                         f"смещения: {no_bias}.\n\n{table}\n\nНа роботе работает первая модель: "
                         f"{ru(encoder_note(data))}.")
     hoist, fix_rest, encoders = ('\n\n'.join(x) for x in (hoist, fix_rest, encoders))
@@ -1145,6 +1511,8 @@ def reference_md(info, package, sources):
     columns = ' | '.join(f"{c['title']} ({c['reference']})" for c in cands)
     about = ', '.join(f"{c['title']} — {c['role']} ({c['about']})" for c in cands)
     getup = getup_reference_md(info['getup']) if info.get('getup') else ''
+    skills = package.get('skills')
+    skills = skills_md(HERE / 'reference' / skills['file'], cands[0]['title'], skills['against']) if skills else ''
     return f"""# Эталоны для первого запуска
 
 Собрано `scripts/robot/package.py` {info['created']}. Числа ниже — то, с чем сравнивать робота; пороги остановки — в
@@ -1169,7 +1537,7 @@ def reference_md(info, package, sources):
 lowcmd с ответом» (`tools/record_check.py`). Тайминги WSL неровные: период политики там 13–27 мс, на роботе ждём
 ровнее (порог протокола — 20 ± 2 мс в 95% тактов).
 
-## Подвес в симуляции
+{skills}## Подвес в симуляции
 
 `reference/hoist.py` (проба критика, итерация 21; для каждого кандидата свой файл данных): CPU, детерминированная
 политика, удержания курса нет. Трос — только натяжение, 20 кН/м и 1 кН·с/м, к торсу, точка крепления 3 м над стартом.
@@ -1217,7 +1585,7 @@ def sci(x):
 def contract_md(cands):
     """README.md's paragraph on the policies' contract: one for all, or (with a height policy) two; then the blind-arm
     policies' check, if any."""
-    text = contract_text(cands)
+    text = contract_text(cands) + symmetric_md(cands)
     blind = [c for c in cands if c.get('arm_blind')]
     if not blind:
         return text
@@ -1231,6 +1599,24 @@ def contract_md(cands):
         f"±{ARM_RANDOM['joint_pos_rel']:g} рад,\nскорости ±{ARM_RANDOM['joint_vel_rel']:g} рад/с, прошлые действия "
         f"±{ARM_RANDOM['last_action']:g}), действие менялось не больше чем на {sci(change)} (порог сборки "
         f"{sci(ARM_BLIND_TOL)}).\nВ `g1_ctrl` для этого ставить нечего.")
+
+
+def symmetric_md(cands):
+    """README.md's paragraph on the symmetric-walk candidates' check (symmetric_contract; '' without one)."""
+    out = ''
+    for c in cands:
+        s = c.get('symmetric')
+        if not s:
+            continue
+        out += '\n\n' + ru(
+            f"{c['title']} — выгрузка `--symmetric-walk`: пока норма новейшей команды хода (входы "
+            f"{s['command'][0]}–{s['command'][1] - 1}) не ниже {s['threshold']:g},\n`policy.onnx` отдаёт среднее "
+            "политики и её зеркала ½(π(o) + M·π(M·o)), ниже — саму π(o); в ONNX — свойство `symmetric_walk`,\nв "
+            f"`g1_ctrl` ставить нечего. На {s['samples']} случайных наблюдениях с командой 0 действия совпали с "
+            f"выгрузкой без симметрии\n`{s['base']}` "
+            + ('ровно' if s['standing'] == 0 else f"до {sci(s['standing'])}") + f" (порог сборки {sci(SYMMETRIC_TOL)}), "
+            f"с командой хода — отличаются до {s['walking']:.2f}.")
+    return out
 
 
 def contract_text(cands):
@@ -1311,6 +1697,12 @@ def readme_md(info):
         dirty = ('\nИсточники пакета с незакоммиченными правками на момент сборки: '
                  + ', '.join(f"`{line[3:]}`" for line in info['git']['uncommitted']) + '.\n')
     commit = info['git']['commit'] if info['git'] else 'нет git'
+    caveats = list(PACKAGES[info['package']].get('caveats') or [])
+    if caveats and info.get('getup') and main.get('symmetric_walk'):
+        caveats.append('Передачу из GetUp в Velocity гоняли с №8 без симметрии; стоя (команда 0) граф этой выгрузки — '
+                       'тот же (сборка сверяет), на ходу — нет.')
+    caveats = (f"\n\n**Оговорки {main['title']}** (числа — `REFERENCE.md`):\n\n" + '\n'.join(f'- {c}' for c in caveats)
+               if caveats else '')
     getup_row = getup_section = getup_install = ''
     if info.get('getup'):
         title += f", вставание {stage_title(info['getup']['stage'])}"
@@ -1338,7 +1730,7 @@ def readme_md(info):
 
 ## Политики
 
-{contract_md(cands)}
+{contract_md(cands)}{caveats}
 
 Диапазоны команд: {ranges}. Для пола — не шире `export_g1 --command-ranges -0.5 1 0.5 1` (протокол, п. 9
 «Безопасности»): сборка это проверяет.
@@ -1619,6 +2011,7 @@ def build(name, key, getup_dir=None):
     # the probes, then each candidate's data (scripts/robot/reference/<probe>_<stage>.json)
     reference = [f'{p}.py' for p in REFERENCE_PROBES]
     reference += [f"{p}_{c['reference']}.json" for c in candidates for p in REFERENCE_PROBES]
+    reference += [package['skills']['file']] if package.get('skills') else []
     missing = [f for f in reference if not (HERE / 'reference' / f).exists()]
     if missing:
         fail(f"нет данных проб в {HERE / 'reference'}: {', '.join(missing)} (scripts/robot/reference/<проба>.py "
@@ -1640,10 +2033,11 @@ def build(name, key, getup_dir=None):
             fail('в пакете нет кандидата без термов высоты, с чьим разъёмом сверить политику вставания')
         getup = check_getup(getup_dir, *walking[0])
         stage = getup['stage']
-        if stage not in GETUP_STAGES or any(s not in values for s in getup_stages(stage) for _, values in GETUP_PROBE):
+        if stage not in GETUP_STAGES or any(not has_numbers(s, GETUP_PROBE) and not has_numbers(s, GETUP_SKILLS)
+                                            for s in getup_stages(stage)):
             fail(f'нет справочных чисел вставания этапа {stage} или его этапа сравнения: добавить в GETUP_STAGES и '
                  'столбец в GETUP_PROBE (проба критика, lab-critic/it38: ready38.py, pose38.py, press38.py; it39: '
-                 'turn39.py)')
+                 'turn39.py) или в GETUP_SKILLS (scripts/lab/skills_check.py)')
         shown = getup_bridged(stage)
         if shown is not None and any(shown not in values for _, values in GETUP_BRIDGE):
             fail(f'в GETUP_BRIDGE нет чисел связки этапа {shown}')
@@ -1685,6 +2079,7 @@ def build(name, key, getup_dir=None):
         info['candidates'].append(dict(c, slot=slot, stage=x['stage'], onnx=x['onnx'], knee_clip=x['knee_clip'],
                                        comments=x['comments'], command_ranges=x['command_ranges'],
                                        height_terms=x['height_terms'],
+                                       **({'symmetric': x['symmetric']} if 'symmetric' in x else {}),
                                        md5={f: md5(x['folder'] / f) for f in ('policy.onnx', 'deploy.yaml')}))
     if getup is not None:
         for f in ('policy.onnx', 'deploy.yaml'):
@@ -1756,7 +2151,8 @@ def build(name, key, getup_dir=None):
 def main():
     parser = argparse.ArgumentParser(description='Пакет для первого запуска G1 на подвесе')
     parser.add_argument('--candidate', required=True, choices=list(PACKAGES),
-                        help='n8 — первый пол (№8 и запасной №7); n9 — экспериментальный с приседом (№9 и запасной №8); '
+                        help='n8s — первый пол (№8 с симметричной выгрузкой и запасной №7); n8 — прежний пакет пола (№8 '
+                             'без симметрии и запасной №7); n9 — экспериментальный с приседом (№9 и запасной №8); '
                              'n10 — экспериментальный со слепыми руками и приседом (№10 и запасной №8)')
     parser.add_argument('--getup', help='выгрузка этапа вставания (export_g1 этапа g1_getup) — папка в '
                                         'runs/humanoid_lab/export, имя или путь: политика для состояния GetUp g1_ctrl')

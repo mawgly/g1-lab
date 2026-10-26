@@ -37,6 +37,7 @@ Scenarios (CLIPS):
             (--start: the class's n-th, 0 first), without the assist and at the lowest PD bound (the task's
             evaluation options), no delay, the motor model as measured and the files' friction (getup_probe's ours),
             8 s; the footer gives the head height and when it got up (the task's success pose within 6 s).
+            getup_track: a track_clip stage from its clip's first frame without noise (no bank row).
 Camera (--focus): body (the default: the pelvis from 2.5 m, as before; getting up the centre of mass, from further
 off), or closer on the centre of the torso, the arms (shoulders, elbows, palms), the hands (palms) or the feet
 (ankle_roll links), following the robot with the focus's offset from it smoothed over FOCUS_SECONDS, so a swinging
@@ -202,7 +203,7 @@ CLIPS.update((clip.scenario.name, clip) for clip in (
     _arms('arms_poses', ((0., STAND),), ((.5, 'carry_low'), (2.5, 'carry_mid'), (4.5, 'extended'),
                                          (6.5, 'carry_wide'), (8.5, 'arms_side')), seconds=11.),
     *(ClipScenario(Scenario(f'getup_{kind}', ((0., STAND),)), 'getup', getup=kind, seconds=8.)
-      for kind in ('back', 'front', 'side')),
+      for kind in ('back', 'front', 'side', 'track')),
     ClipScenario(Scenario('side_left_fast', ((0., (0., 1., 0.)),)), 'left_gap', focus='feet', view='front'),
     ClipScenario(Scenario('side_right_fast', ((0., (0., -1., 0.)),)), 'right_gap', focus='feet', view='front'),
     ClipScenario(Scenario('arm_pose_stand', ((0., STAND),)), 'creep', held=(HELD_FROM, 'random')),
@@ -466,8 +467,11 @@ def _play(stage, identity, policy, norm, clip, seed, seconds, on_step):
         moves, heights, held = {}, {}, None
         if clip.getup:
             options = dict(resolve_task(identity['robot_id'], identity['task_id']).evaluation_options or {})
-            options.update(start=getup_start(raw.bank, clip.getup, clip.start), action_delay_steps=0,
-                           motor_friction_scale=1.)
+            if clip.getup == 'track':
+                options.update(track_frame=0, track_noise=False)
+            else:
+                options.update(start=getup_start(raw.bank, clip.getup, clip.start))
+            options.update(action_delay_steps=0, motor_friction_scale=1.)
             obs, _ = env.reset(seed=seed, options=options)
             raw.model.geom_friction[:, 0] = raw.nominal_friction
         else:

@@ -42,13 +42,15 @@ _cache = {}
 
 
 def setup(stage):
-    """This worker's policy, normalization and the stage's task_config, once per stage."""
+    """This worker's policy, normalization and the stage's task_config, once per stage; an export_g1 folder: its
+    policy.onnx as both (export_g1.ExportedPolicy) and its stage's task_config."""
     if stage not in _cache:
         import torch
         torch.set_num_threads(1)
-        from humanoid_sim.core import load_stage, stage_task_config
-        model, norm = load_stage(Path(stage))
-        _cache[stage] = (model, norm, stage_task_config(Path(stage)))
+        from humanoid_sim.core import stage_task_config
+        from humanoid_sim.export_g1 import load_policy
+        model, norm, source = load_policy(Path(stage))
+        _cache[stage] = (model, norm, stage_task_config(source))
     return _cache[stage]
 
 

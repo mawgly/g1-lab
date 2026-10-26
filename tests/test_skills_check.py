@@ -82,11 +82,68 @@ def test_rows_a_policy_cannot_run_are_not_applicable_with_the_reason(check):
     assert rows['push:stand']['ok'] is False and rows['push:stand']['note'] == 'порог не взят'  # 2 of 32, ≤ 1
     assert rows['push:stand']['value'] == '2 из 32'
     assert rows['speed:1']['ok'] is False and rows['speed:1']['note'] == 'не измерено'
-    exported = {r['key']: r for r in check.rows(walk, theirs, export, plain, False)}
-    assert exported['hoist']['ok'] is None and exported['hoist']['note'] == 'н/п: проба не берёт выгрузку'
     armed = dict(plain, arms=True, height=True)
+    exported = {r['key']: r for r in check.rows(walk, theirs, dict(armed, export=True), armed, True)}
+    assert exported['falls:free']['ok'] is None and exported['falls:free']['note'] == 'н/п: проба не берёт выгрузку'
+    assert exported['hoist']['ok'] is True and exported['joints:roll0']['note'] == 'не измерено'  # both run an export
+    assert export['export']
     rows = {r['key']: r for r in check.rows({}, {}, armed, plain, True)}  # against a stage without them
     assert rows['joints:roll0']['reference'] == 'н/п' and rows['joints:roll0']['note'] == 'не измерено'
+
+
+def test_unitree_v0_column_compares_its_walking_rows_and_is_cached_per_run(check, tmp_path, monkeypatch):
+    """The third column: v0's value where it can run the row (walking, the bridge copy, chatter), 'н/п (у v0 нет)'
+    on the arm, crouch, getting-up and hoist rows; better / same / worse by the row's own margin both ways; its runs
+    are kept per job (key = sha256 of kind and job) and dropped when the v0 policy file changed."""
+    plain = dict(path='x', export=False, height=False, arms=False, delay=0., label='x')
+    mine = {'side:03': dict(v=.03), 'side:05': dict(v=.04), 'push:stand': dict(v=0, n=32), 'armp:falls': dict(v=0, n=9)}
+    v0 = {'side:03': dict(v=.06), 'side:05': dict(v=.045), 'push:stand': dict(v=5, n=32)}
+    rows = {r['key']: r for r in check.rows(mine, mine, plain, plain, False, v0=v0)}
+    assert (rows['side:03']['v0'], rows['side:03']['v0_vs']) == ('0,060', 'better')  # 0.03 against 0.06
+    assert rows['side:05']['v0_vs'] == 'same' and rows['push:stand']['v0_vs'] == 'better'
+    assert rows['armp:falls']['v0'] == rows['hoist']['v0'] == 'н/п (у v0 нет)' and rows['armp:falls']['v0_vs'] is None
+    assert rows['speed:1']['v0'] == '—' and rows['speed:1']['v0_vs'] is None  # neither measured
+    assert check.versus(('lower', .25, .01), dict(v=.08), dict(v=.03)) == 'worse'
+    assert check.versus_counts(list(rows.values())) == {'better': 2, 'same': 1, 'worse': 0}
+    assert 'v0' not in check.rows(mine, mine, plain, plain, False)[0]  # without v0: no column
+    jobs = check.v0_jobs([0., .02])
+    assert all(tag.startswith(check.V0_TAGS + ('chatter:',)) for tag, _, _ in jobs)
+    assert not any(tag.startswith(('armp:', 'hoist', 'joints:', 'falls:', 'crouch:')) for tag, _, _ in jobs)
+    assert sum(tag.startswith('chatter:') for tag, _, _ in jobs) == 2 * 18
+    assert len({check.job_key(kind, job) for _, kind, job in jobs}) == len(jobs)
+    monkeypatch.setattr(check, 'V0_CACHE', tmp_path / 'skills_v0.json')
+    monkeypatch.setattr(check, 'v0_policy_md5', lambda: 'a')
+    check.save_v0({'k': {'fell': None, 'rate': float('nan')}})
+    assert check.v0_cache()['k']['fell'] is None
+    monkeypatch.setattr(check, 'v0_policy_md5', lambda: 'b')  # another v0 file: the runs are not its
+    assert check.v0_cache() == {}
+    monkeypatch.setattr(check, 'v0_policy_md5', lambda: None)  # WSL not running: the saved runs stand
+    assert 'k' in check.v0_cache()
+    root = tmp_path / 'lab'
+    journal.set_skills(root, 'exp-1', 1, 'x', dict(branch='exp-0', stage=1, title='y'),
+                       [dict(skill='a', label='b', ok=True, v0='0,060', v0_vs='better')])
+    assert journal.load(root)['skills']['items'][0]['v0_vs'] == 'better'
+    with pytest.raises(ValueError):
+        journal.set_skills(root, 'exp-1', 1, 'x', dict(branch='exp-0', stage=1, title='y'),
+                           [dict(skill='a', label='b', ok=True, v0='1', v0_vs='лучше')])
+
+
+def test_goal_check_runs_a_policy_in_a_given_task_config(tmp_path):
+    """supervise.check_stage and goal_check.walks with acting and config (how v0 runs goal_check's conditions): the
+    stage gives the identity only, no σ."""
+    from humanoid_sim.core import load_stage, stage_task_config
+    from humanoid_sim.goal_check import walks
+    from humanoid_sim.supervise import check_stage
+    _, stage = _stage(tmp_path, ARMS)
+    policy, norm = load_stage(stage)
+    try:
+        config = stage_task_config(stage)
+        report = check_stage(stage, seconds=1., seeds=1, acting=(policy, norm), config=config)
+        assert report['policy_std'] is None and set(report['scenarios']) == {'stand', 'walk', 'stop_start'}
+        walk = walks(stage, seeds=1, seconds=1., acting=(policy, norm), turns=((0., .5),), straight=(), config=config)
+        assert list(walk['turn']) == [(0., .5)]
+    finally:
+        norm.close()
 
 
 def test_measures_of_falls_pushes_and_speeds(check):

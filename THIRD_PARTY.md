@@ -31,3 +31,12 @@ and keep their own licenses, which are stored next to them.
   licenses. The Gymnasium Humanoid-v5 model is loaded from the installed Gymnasium package.
 - `scripts/sim2sim/setup.sh` clones unitree_sdk2, unitree_mujoco and unitree_rl_mjlab at pinned commits and
   downloads the MuJoCo 3.3.6 release into WSL; nothing of them is stored here.
+
+## Data used locally, not included
+
+- CMU Graphics Lab Motion Capture Database ([mocap.cs.cmu.edu](http://mocap.cs.cmu.edu/)), subject 140 (getting up
+  from the ground), read from `.tools/datasets/cmu_mocap_140` (untracked) by `scripts/lab/cmu_mocap.py` and
+  retargeted to the G1 by `scripts/lab/getup_track_clip.py --source cmu` into a getting-up tracking clip under
+  `runs/` (untracked). The database's terms allow its use in commercially sold products but not reselling the data,
+  even in converted form, so neither the recordings nor the clip are published. The data used in this project was
+  obtained from mocap.cs.cmu.edu. The database was created with funding from NSF EIA-0196217.

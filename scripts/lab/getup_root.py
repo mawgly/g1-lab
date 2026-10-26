@@ -10,7 +10,13 @@ with the initial σ 1.0 (log std 0; make_learner's own fresh start has σ e^-1 �
 the actor on the 490 robot inputs, the critic on all 496), 256×256 as the walking ones, a fresh normalization; the
 trainer starts from it. Queued like task_branch.py unless --no-queue (the worker then trains it after the jobs before
 it). --dry-run checks everything (the lab's config schema, the environment, the first stage's policy) and prints what
-it would create, writing nothing. --lab: the original run dir of another lab (a check copy in .tools/)."""
+it would create, writing nothing. --lab: the original run dir of another lab (a check copy in .tools/).
+--track-clip <name> (iteration 64): the motion tracking mode instead, task_config track_clip of the clip
+runs/humanoid_lab/getup_track/<name>.npz (its md5 read from the file) with impact 2 and sole_impact 1; the critic then
+sees TRACK_CRITIC_EXTRAS more inputs.
+--settle-clip <name> (iteration 66; repeated for several clips): the settling mode, task_config settle_clip of those
+clips (their md5s read from the files): from any fall pose into the nearest of their first frames, impact 2,
+sole_impact 1, assist 0; the contract the getting-up one's."""
 import argparse
 import json
 import sys
@@ -33,11 +39,28 @@ parser.add_argument('note')
 parser.add_argument('--dry-run', action='store_true', help='check and print, create nothing')
 parser.add_argument('--lab', type=Path, default=DEFAULT_RUN, help='original run dir of the lab to create the root in')
 parser.add_argument('--no-queue', action='store_true', help='create and annotate only')
+parser.add_argument('--track-clip', metavar='NAME',
+                    help='следование клипу человека runs/humanoid_lab/getup_track/<NAME>.npz (итерация 64)')
+parser.add_argument('--settle-clip', metavar='NAME', action='append', default=[],
+                    help='укладка в первый кадр клипа runs/humanoid_lab/getup_track/<NAME>.npz (итерация 66; '
+                         'несколько раз — цель ближайший из кадров)')
 args = parser.parse_args()
+if args.track_clip and args.settle_clip:
+    raise SystemExit('--track-clip и --settle-clip — разные задачи, выберите одну')
 
+task_config = {}
+if args.track_clip:  # iteration 64: follow a human clip, the hardware's impact terms kept
+    from humanoid_sim.tasks import g1_getup_track
+    clip = g1_getup_track.load(args.track_clip)
+    task_config = dict(track_clip={'file': args.track_clip, 'md5': clip['md5']}, assist_force=0.,
+                       reward_weights={'impact': 2., 'sole_impact': 1.})
+if args.settle_clip:  # iteration 66: settle into the nearest clip start, the hardware's impact terms kept
+    from humanoid_sim.tasks import g1_getup_track
+    task_config = dict(settle_clip=[{'file': name, 'md5': g1_getup_track.load(name)['md5']} for name in args.settle_clip],
+                       assist_force=0., reward_weights={'impact': 2., 'sole_impact': 1.})
 config = dict(name=args.name, backend='full_gpu', envs=4096, steps=1_000_000_000, hours=3, every=10_000_000, seed=42,
-              preset='custom', robot_id='g1_29dof', task_id='g1_getup', task_config={}, max_std=1., mirror_coef=0.,
-              **RECIPE)
+              preset='custom', robot_id='g1_29dof', task_id='g1_getup', task_config=task_config, max_std=1.,
+              mirror_coef=0., **RECIPE)
 checked = validate_config(config)
 
 
@@ -73,6 +96,16 @@ ppo = {key: checked[key] for key in (*RECIPE, 'max_std', 'mirror_coef', 'envs', 
 note = (f'Корень задачи вставания g1_getup (итерация 33): full_gpu, {checked["envs"]} сред, рецепт PPO ходьбы '
         f'({json.dumps(ppo, ensure_ascii=False)}), начальная σ {INITIAL_STD:g}, сеть {NET_ARCH}, настройки задачи по '
         f'умолчанию. {args.note}')
+if args.track_clip:
+    note = (f'Корень следования записи человека g1_getup (итерация 64): клип {args.track_clip} '
+            f'(md5 {task_config["track_clip"]["md5"]}), impact 2, sole_impact 1, full_gpu, {checked["envs"]} сред, '
+            f'рецепт PPO ходьбы ({json.dumps(ppo, ensure_ascii=False)}), начальная σ {INITIAL_STD:g}, сеть {NET_ARCH}. '
+            f'{args.note}')
+if args.settle_clip:
+    clips = ', '.join(f'{entry["file"]} (md5 {entry["md5"]})' for entry in task_config['settle_clip'])
+    note = (f'Корень укладки g1_getup (итерация 66): из любой позы падения в ближайший первый кадр клипов {clips}, '
+            f'impact 2, sole_impact 1, без подтяжки, full_gpu, {checked["envs"]} сред, рецепт PPO ходьбы '
+            f'({json.dumps(ppo, ensure_ascii=False)}), начальная σ {INITIAL_STD:g}, сеть {NET_ARCH}. {args.note}')
 if args.dry_run:
     _, info = first_stage()
     print('dry run, nothing created:', checked['name'])

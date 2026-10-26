@@ -39,7 +39,8 @@ const firstSentence = (text, limit = 160) => {
 
 // Who speaks in the council (humanoid_sim.journal.ROLES), roadmap states and path verdicts.
 const ROLES = {
-  lead: t('Руководитель'),
+  owner: t('Павел'),
+  lead: t('Ведущий агент'),
   critic: t('Критик'),
   scout: t('Разведчик'),
   analyst: t('Аналитик'),
@@ -200,7 +201,7 @@ function asideMarkup() {
     : `<section class="card"><p class="eyebrow">${t('Последняя проверка')}</p><p>${t('Проверок пока не было.')}</p><div class="j-now" data-now hidden></div></section>`;
   const s = journal.skills;
   const skills = s
-    ? `<section class="card" aria-labelledby="aside-skills"><p class="eyebrow">${t('Проверка навыков')}</p><p class="j-meta">${time(s.at)}</p><h2 class="j-title" id="aside-skills"><a href="#check/skills">${esc(s.title)}</a></h2><p>${t('Эталон: {title}', { title: esc(s.against.title) })}</p><p>${skillsScore(s)}</p></section>`
+    ? `<section class="card" aria-labelledby="aside-skills"><p class="eyebrow">${t('Проверка навыков')}</p><p class="j-meta">${time(s.at)}</p><h2 class="j-title" id="aside-skills"><a href="#check/skills">${esc(s.title)}</a></h2><p>${t('Эталон: {title}', { title: esc(s.against.title) })}</p><p>${skillsScore(s)}</p>${s.items.some((item) => 'v0' in item) ? `<p>${t('Против Unitree v0: лучше {better}, так же {same}, хуже {worse}', versusCounts(s))}</p>` : ''}</section>`
     : '';
   const council = latest
     ? `<section class="card" aria-labelledby="aside-council"><p class="eyebrow">${t('Совет лаборатории')}</p><p class="j-meta">${time(latest.at)}</p><h2 class="j-title" id="aside-council"><a href="#council/${esc(latest.id)}">${esc(latest.title)}</a></h2><p><b>${latest.decision ? t('Решение:') : t('Обсуждается:')}</b> ${esc(firstSentence(latest.decision || t('решения ещё нет'), 240))}</p></section>`
@@ -350,24 +351,37 @@ function renderCheck() {
 }
 // The skills check: has the stage kept what its reference (the branch's parent, or a candidate) could do? A row a
 // skill's measure: the threshold, the stage's value, the reference's and which held (the note).
+// The stage against Unitree v0 on a row (skills_check's versus codes) and their counts.
+const VERSUS = { better: t('лучше'), same: t('так же'), worse: t('хуже') };
+const versusCounts = (skills) =>
+  Object.fromEntries(Object.keys(VERSUS).map((code) => [code, skills.items.filter((i) => i.v0_vs === code).length]));
 function skillsMarkup() {
   const s = journal.skills;
   if (!s) return '';
+  const third = s.items.some((item) => 'v0' in item);
   let skill = null;
   const rows = s.items
     .map((item) => {
       const mark = markOf(item);
       const head =
-        item.skill !== skill ? `<tr class="j-skill"><th scope="rowgroup" colspan="5">${esc(item.skill)}</th></tr>` : '';
+        item.skill !== skill
+          ? `<tr class="j-skill"><th scope="rowgroup" colspan="${third ? 6 : 5}">${esc(item.skill)}</th></tr>`
+          : '';
       skill = item.skill;
-      return `${head}<tr class="${mark}"><td><span class="j-mark" aria-hidden="true">${MARKS[mark]}</span><span class="j-sr">${MARK_WORDS[mark]}: </span>${esc(item.label)}</td><td data-label="${t('Порог')}">${esc(item.target)}</td><td class="num" data-label="${t('Этап')}">${esc(item.value)}</td><td class="num" data-label="${t('Эталон')}">${esc(item.reference)}</td><td class="j-note" data-label="${t('Итог')}">${esc(item.note)}</td></tr>`;
+      const v0 = third
+        ? `<td class="num" data-label="Unitree v0">${esc(item.v0)}${item.v0_vs ? ` <span class="j-vs ${esc(item.v0_vs)}">${VERSUS[item.v0_vs] || ''}</span>` : ''}</td>`
+        : '';
+      return `${head}<tr class="${mark}"><td><span class="j-mark" aria-hidden="true">${MARKS[mark]}</span><span class="j-sr">${MARK_WORDS[mark]}: </span>${esc(item.label)}</td><td data-label="${t('Порог')}">${esc(item.target)}</td><td class="num" data-label="${t('Этап')}">${esc(item.value)}</td><td class="num" data-label="${t('Эталон')}">${esc(item.reference)}</td>${v0}<td class="j-note" data-label="${t('Итог')}">${esc(item.note)}</td></tr>`;
     })
     .join('');
+  const versus = third
+    ? `<p>${t('Против Unitree v0: лучше {better}, так же {same}, хуже {worse}', versusCounts(s))}</p>`
+    : '';
   const spent =
     s.seconds != null
       ? ` · ${t('{n} мин', { n: fmt(s.seconds / 60, 1) })}, ${fmt(s.runs)} ${tn(s.runs || 0, 'прогон|прогона|прогонов')}`
       : '';
-  return `<div class="card j-check" id="skills-card"><p class="eyebrow">${t('Проверка навыков')}</p><p class="j-meta">${time(s.at)} · ${esc(s.branch)} · ${t('{n} млн шагов', { n: fmt(s.stage / 1e6, 1) })}${spent}</p><h2 class="j-title">${esc(s.title)}</h2><p>${t('Эталон: {title}', { title: esc(s.against.title) })}</p><p class="j-score">${skillsScore(s)}</p><div class="scroll-x"><table class="data j-checks j-skills"><thead><tr><th scope="col">${t('Навык и мера')}</th><th scope="col">${t('Порог')}</th><th scope="col">${t('Этап')}</th><th scope="col">${t('Эталон')}</th><th scope="col">${t('Итог')}</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+  return `<div class="card j-check" id="skills-card"><p class="eyebrow">${t('Проверка навыков')}</p><p class="j-meta">${time(s.at)} · ${esc(s.branch)} · ${t('{n} млн шагов', { n: fmt(s.stage / 1e6, 1) })}${spent}</p><h2 class="j-title">${esc(s.title)}</h2><p>${t('Эталон: {title}', { title: esc(s.against.title) })}</p><p class="j-score">${skillsScore(s)}</p>${versus}<div class="scroll-x"><table class="data j-checks j-skills"><thead><tr><th scope="col">${t('Навык и мера')}</th><th scope="col">${t('Порог')}</th><th scope="col">${t('Этап')}</th><th scope="col">${t('Эталон')}</th>${third ? '<th scope="col">Unitree v0</th>' : ''}<th scope="col">${t('Итог')}</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
 }
 
 // --- Showing a view ---------------------------------------------------------------------------------------------

@@ -60,7 +60,8 @@ def drop_bank(height=DROP):
 
 # Reward terms added with or after the impact weight, always among the components (0 without their weight): left out of
 # getup_digest, which the code before them made.
-NEWER_TERMS = ('impact', 'sole_impact', 'stance_width')
+NEWER_TERMS = ('impact', 'sole_impact', 'stance_width', 'arm_press', 'style', 'head_rise',
+               'sole_slip')
 
 
 def getup_digest(config, bank, seed=35, steps=240):

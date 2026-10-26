@@ -1,13 +1,16 @@
-"""Branch from the latest stage of a G1 experiment (or <parent>:<steps>) with one reward weight changed, g1_velocity or
-g1_getup alike (a g1_getup branch keeps the stage's training_state, its worlds' assist forces and pd_bound bounds, which
-the branch's copy of the stage carries and its first run restores):
-reward_branch.py <parent>[:steps] <key> <value> <name> <note> [--dry-run].
+"""Branch from the latest stage of a G1 experiment (or <parent>:<steps>) with reward weights changed (one change:
+weights that only act together, such as amp with style 0, go in one call), g1_velocity or g1_getup alike (a g1_getup
+branch keeps the stage's training_state, its worlds' assist forces and pd_bound bounds, which the branch's copy of the
+stage carries and its first run restores, and with it any other file of the stage, such as the AMP discriminator's
+amp.pt):
+reward_branch.py <parent>[:steps] <key> <value> [<key> <value> ...] <name> <note> [--dry-run].
 
---dry-run checks everything the branch needs (the lab's config schema with the weight, the source stage's checkpoint
+--dry-run checks everything the branch needs (the lab's config schema with the weights, the source stage's checkpoint
 identity, the environment accepting the settings) and prints what it would create, without creating or queueing
 anything.
 
-Example: reward_branch.py exp-15f0753be2ea4aa4:320864256 impact 2 'G1 вставание · удары' '…' --dry-run"""
+Examples: reward_branch.py exp-15f0753be2ea4aa4:320864256 impact 2 'G1 вставание · удары' '…' --dry-run
+reward_branch.py exp-588d1616e95c4567:1235091456 amp 1 style 0 'G1 вставание · AMP' '…' --dry-run"""
 import sys
 from pathlib import Path
 
@@ -20,9 +23,12 @@ from humanoid_sim.tasks.identity import task_identity  # noqa: E402
 
 ARGS = [arg for arg in sys.argv[1:] if arg != '--dry-run']
 DRY = len(ARGS) != len(sys.argv) - 1
-if len(ARGS) != 5:
+if len(ARGS) < 5 or len(ARGS) % 2 == 0:
     raise SystemExit(__doc__)
-PARENT, KEY, VALUE, NAME, NOTE = ARGS[0], ARGS[1], float(ARGS[2]), ARGS[3], ARGS[4]
+PARENT, PAIRS, NAME, NOTE = ARGS[0], ARGS[1:-2], ARGS[-2], ARGS[-1]
+CHANGES = {key: float(value) for key, value in zip(PAIRS[::2], PAIRS[1::2])}
+if len(CHANGES) != len(PAIRS) // 2:
+    raise SystemExit('один вес указан дважды')
 PARENT, _, AT = PARENT.partition(':')
 lab = Laboratory(DEFAULT_RUN)
 run = lab.resolve(PARENT)
@@ -34,14 +40,15 @@ if stage not in stages:
     raise SystemExit(f'у {PARENT} нет этапа {stage}')
 parent = read_json(run / 'run_config.json')
 weights = parent['task_config']['reward_weights']
-before = weights.get(KEY, 0.)  # a term added after the parent was created is absent there
-task_config = {**parent['task_config'], 'reward_weights': {**weights, KEY: VALUE}}  # history and the rest as the parent
+before = {key: weights.get(key, 0.) for key in CHANGES}  # a term added after the parent was created is absent there
+task_config = {**parent['task_config'], 'reward_weights': {**weights, **CHANGES}}  # history and the rest as the parent
 config = {key: parent.get(key, DEFAULTS[key]) for key in (
     'backend', 'envs', 'every', 'seed', 'learning_rate', 'n_steps', 'batch_size', 'n_epochs', 'gamma', 'gae_lambda',
     'ent_coef', 'clip_range', 'target_kl', 'robot_id', 'task_id', 'bounds_coef', 'max_std', 'mirror_coef', 'range_bounds')}
 config.update(name=f'{NAME} (от {stage / 1e6:.0f} млн)', preset='custom', steps=1_000_000_000, hours=3, every=10_000_000,
               source_id=PARENT, source_stage=stage, task_config=task_config)
-note = f'{KEY} {before:g} → {VALUE:g}. {NOTE} Остальное как у {PARENT[:12]}.'
+change = ', '.join(f'{key} {before[key]:g} → {value:g}' for key, value in CHANGES.items())
+note = f'{change}. {NOTE} Остальное как у {PARENT[:12]}.'
 if DRY:  # what lab.create checks, plus the environment itself; nothing is written
     checked = validate_config(config)
     source = run / f'stage_{stage:012d}'
@@ -49,17 +56,20 @@ if DRY:  # what lab.create checks, plus the environment itself; nothing is writt
     identity = task_identity(checked['robot_id'], checked['task_id'], checked['task_config'])
     validate_resume(saved, identity)
     make_task(checked['task_id'], checked['robot_id'], checked['task_config']).close()
-    print('dry run, nothing created:', PARENT, stage, f'{KEY} {before:g} -> {VALUE:g}')
+    print('dry run, nothing created:', PARENT, stage, change.replace('→', '->'))
     print('name:', checked['name'])
     print('task:', checked['task_id'], '| backend:', checked['backend'], '| envs:', checked['envs'])
     print('observation_schema:', identity['observation_schema'], '| action_schema:', identity['action_schema'])
     state = saved.get('training_state') or {}
     print('training_state carried:', ', '.join(
         f'{key} ({len(values)} worlds, {min(values):g} to {max(values):g})' for key, values in state.items()) or 'none')
+    files = sorted(path.name for path in source.iterdir() if path.name not in (
+        'policy.zip', 'normalize.pkl', 'metadata.json', 'evaluation.json'))
+    print('other stage files carried:', ', '.join(files) or 'none')
     print('note:', note)
     raise SystemExit(0)
 entry = lab.create(config)
 identity = entry['id'] if isinstance(entry, dict) else entry
 lab.enqueue([identity])
-print(identity, stage, f'{KEY} {before:g} -> {VALUE:g}')
+print(identity, stage, change.replace('→', '->'))
 lab.annotate(identity, verdict='active', note=note)

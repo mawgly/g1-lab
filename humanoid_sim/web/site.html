@@ -24,7 +24,7 @@
 
       <section class="hero wrap">
         <div class="hero-text">
-          <p class="eyebrow">Обновлено 23 октября 2026 · этап 2 из 9 · только симуляция, робота пока нет</p>
+          <p class="eyebrow" id="home-updated">только симуляция, робота пока нет</p>
           <h1>Политика ходьбы для Unitree G1, проверенная на симуляторе и контроллере самой Unitree</h1>
           <p class="lead" data-rich>
             Лаборатория из одного человека на одном домашнем ПК: я ставлю цели и основные правила, а код пишут и
@@ -47,151 +47,24 @@
       </section>
 
       <section class="stats" aria-label="Ключевые числа">
-        <div class="wrap grid cards-220">
-          <div class="card">
-            <span class="stat">0 / 31</span><span>падений в 31 прогоне в unitree_mujoco + g1_ctrl</span>
-          </div>
-          <div class="card">
-            <span class="stat">52 / 52</span
-            ><span>толчков выдержано там же — стоя до Δv 1,5 м/с (527 Н, 0,1 с), на ходу до 1,0</span>
-          </div>
-          <div class="card">
-            <span class="stat">0 / 400</span
-            ><span>падений на сетке толчков стоя — в физике Unitree с их капсулами стоп</span>
-          </div>
-          <div class="card accent">
-            <span class="stat">1,96 м/с</span
-            ><span
-              >при команде 2 м/с (штатная v0: 1,78); в связке стик даёт не больше 1 м/с, поэтому бег проверен только в
-              нашей физике</span
-            >
-          </div>
-        </div>
+        <div class="wrap grid cards-220" id="home-stats"></div>
       </section>
 
       <section id="skills" class="band section" aria-labelledby="skills-title">
         <div class="wrap">
-          <h2 id="skills-title">Что умеет кандидат 8</h2>
+          <h2 id="skills-title">Что умеет робот сейчас</h2>
           <p class="note" data-rich>
-            Одна политика, 29 суставов, 50 Гц. Ролики — наша физика MuJoCo на CPU; числа с пометкой **связка** — из
-            симулятора Unitree с их контроллером. Слабые места написаны рядом с сильными.
+            Две политики на 29 суставов, 50 Гц: ходьба и вставание после падения. Ролики — наша симуляция MuJoCo. Под
+            каждым числом указано, откуда оно: **физика Unitree** — их симулятор `unitree_mujoco` с их контроллером
+            `g1_ctrl`, **наша симуляция** — MuJoCo с моторами Unitree. Слабые места выделены красным рядом с сильными.
+            Числа обновляются каждое утро из записей лаборатории; чего не измеряли, того здесь нет.
           </p>
-          <div class="grid cards-260">
-            <figure class="clip-card">
-              <div class="media"><img data-clip="walk" alt="Идёт со скоростью 1 м/с" /></div>
-              <figcaption>
-                <b>Ходьба 1 м/с</b
-                ><span
-                  >связка 0,99–1,00 м/с, 9,4–9,5 м за 10 с, увод +0,022 рад/с ·
-                  <span class="weak">слабое место: курс в связке +10…+11° за 10 с</span></span
-                >
-              </figcaption>
-            </figure>
-            <figure class="clip-card">
-              <div class="media"><img data-clip="slow_front" alt="Идёт со скоростью 0,5 м/с, вид спереди" /></div>
-              <figcaption>
-                <b>Ходьба 0,5 м/с</b
-                ><span
-                  >связка 0,46–0,47 м/с ·
-                  <span class="weak"
-                    >слабое место: уводит влево на +0,032…+0,037 рад/с, курс +17…+20° за 10 с — на полу подруливать
-                    стиком</span
-                  ></span
-                >
-              </figcaption>
-            </figure>
-            <figure class="clip-card">
-              <div class="media"><img data-clip="back" alt="Идёт назад" /></div>
-              <figcaption>
-                <b>Назад 0,5 м/с</b
-                ><span>3,8 м за 8 с, без падений · <span class="weak">в связке ещё не измерено</span></span>
-              </figcaption>
-            </figure>
-            <figure class="clip-card">
-              <div class="media"><img data-clip="side_left" alt="Шаг вбок влево" /></div>
-              <figcaption>
-                <b>Шаг вбок 0,3 м/с</b
-                ><span
-                  >связка 0,26–0,28 м/с; на пределе стика ±0,5 — 0,44–0,45 м/с, увод −0,002…+0,011 рад/с ·
-                  <span class="weak"
-                    >слабое место: шаг вправо 0,3 уводит на +0,012…+0,017 рад/с, курс +9…+10° за 10 с</span
-                  ></span
-                >
-              </figcaption>
-            </figure>
-            <figure class="clip-card">
-              <div class="media"><img data-clip="turn_left" alt="Поворачивается на месте" /></div>
-              <figcaption>
-                <b>Поворот на месте</b><span>команда ±0,5 рад/с → связка +0,449 / −0,514 рад/с</span>
-              </figcaption>
-            </figure>
-            <figure class="clip-card">
-              <div class="media"><img data-clip="walk_turn" alt="Идёт и поворачивает" /></div>
-              <figcaption>
-                <b>Ходьба с поворотом</b
-                ><span
-                  >0,5 м/с с ±0,5 рад/с → связка +0,418 / −0,436 рад/с ·
-                  <span class="weak">слабое место: 84–87% команды</span></span
-                >
-              </figcaption>
-            </figure>
-            <figure class="clip-card">
-              <div class="media"><img data-clip="stop_start" alt="Стоит, идёт, останавливается" /></div>
-              <figcaption>
-                <b>Стоять, идти, остановиться</b
-                ><span
-                  >в связке тормозит за 0,23–0,26 м с 0,5 м/с ·
-                  <span class="weak"
-                    >слабое место: после остановки таз докатывается на 8–10 см, один раз два шага назад через 1,5 с после
-                    стопа с 0,5 м/с (1 из 30)</span
-                  ></span
-                >
-              </figcaption>
-            </figure>
-            <figure class="clip-card">
-              <div class="media"><img data-clip="side_stop" alt="Шаг вбок, затем остановка" /></div>
-              <figcaption>
-                <b>Шаг вбок, затем стоп</b
-                ><span
-                  >когда-то за всеми 29 падениями итерации 18 · в связке 0,07–0,13 м после остановки (17 стопов)</span
-                >
-              </figcaption>
-            </figure>
-            <figure class="clip-card">
-              <div class="media"><img data-clip="push_back" alt="Толчок назад, стоя" /></div>
-              <figcaption>
-                <b>Толчок спереди</b><span>в связке Δv 1,25: 0 из 20, Δv 1,5: 0 из 8, наклон ≤ 11°</span>
-              </figcaption>
-            </figure>
-            <figure class="clip-card">
-              <div class="media"><img data-clip="push_left" alt="Толчок вбок, стоя" /></div>
-              <figcaption>
-                <b>Толчок сбоку</b
-                ><span
-                  >сетка с капсулами стоп Unitree: 0 из 400; в связке стопы коснулись бы в 3 из 18 боковых толчков стоя
-                  Δv ≥ 1 (у кандидата 7 — в 12 из 18), накрест — ни разу ·
-                  <span class="weak">боковых толчков на роботе пока всё равно не делаем</span></span
-                >
-              </figcaption>
-            </figure>
-            <figure class="clip-card">
-              <div class="media"><img data-clip="push_walk" alt="Толчок на ходу" /></div>
-              <figcaption>
-                <b>Толчок на ходу</b><span>связка Δv 0,5 и 1,0: 0 из 8</span>
-              </figcaption>
-            </figure>
-            <figure class="clip-card accent">
-              <div class="media"><img data-clip="sprint" alt="Бег по команде 2 м/с" /></div>
-              <figcaption>
-                <b>Бег, команда 2 м/с</b
-                ><span
-                  >1,96 м/с в нашей физике, 0 падений со старта стоя (приёмка скорости 7 из 7) ·
-                  <span class="weak">стик связки ограничен 1 м/с</span></span
-                >
-              </figcaption>
-            </figure>
-          </div>
+          <div id="home-candidates"></div>
         </div>
+      </section>
+
+      <section id="research" class="section" aria-labelledby="research-title" hidden>
+        <div class="wrap" id="home-research"></div>
       </section>
 
       <section id="stack" class="section" aria-labelledby="stack-title">

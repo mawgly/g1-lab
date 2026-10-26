@@ -102,6 +102,52 @@ def test_arm_counterfactual_runs_base_and_oracle_on_a_stage(tmp_path, monkeypatc
     assert 'cmd 0.0 load 1.0: n 1' in capsys.readouterr().out
 
 
+def test_arm_joints_takes_an_export_folder_and_gives_its_stage_numbers(tmp_path, monkeypatch):
+    """arm_joints (arm_counterfactual.setup) on an export_g1 folder: its policy.onnx acts in the stage's task
+    (ExportedPolicy hands back the residual), so a short run gives the stage's errors and palms."""
+    pytest.importorskip('onnxruntime')
+    from humanoid_sim.export_g1 import export
+    probe = lab_probe('arm_joints', monkeypatch)
+    for key, value in dict(STEPS=12, MOVE_AT=2, WINDOW_AT=6).items():
+        monkeypatch.setattr(probe, key, value)
+    _, stage = _stage(tmp_path, ARMS)
+    folder = export(stage, tmp_path / 'export', symmetric_walk=True)['onnx'].parent
+    threads = torch.get_num_threads()
+    try:
+        name, names, pose = [p for p in probe.poses() if p[0].startswith('carry')][1]
+        runs = [probe.run(dict(stage=str(where), pose_name=name, names=names, pose=pose, load=0.))
+                for where in (stage, folder)]
+    finally:
+        torch.set_num_threads(threads)
+    assert runs[0]['fell'] is None and runs[1]['fell'] is None
+    for joint, value in runs[0]['error'].items():  # standing: the export's own branch, the stage's policy
+        assert runs[1]['error'][joint] == pytest.approx(value, abs=1e-3)
+    assert runs[1]['palm'] == pytest.approx(runs[0]['palm'], abs=1e-3)
+    assert probe.label(folder) == 'export' and probe.report(runs[1:], [str(folder)], [0.])[0]['falls'] == 0
+
+
+def test_drift_rows_judge_the_symmetric_walk_acceptance(monkeypatch):
+    """drift_rows' summary: the shares of the command turning on the spot, the bias, side steps, drift, the turn at
+    1 m/s, the 0.5 m/s speed, against the acceptance of iteration 50."""
+    import math
+    probe = lab_probe('drift_rows', monkeypatch)
+
+    def rate(scen, cmd):  # turning with the command, side steps drifting away from it, walking nearly straight
+        if scen in ('place', 'turn1'):
+            return math.copysign(.31 if scen == 'place' else .32, cmd[2])
+        if scen.startswith('side'):
+            return math.copysign(.02 if scen == 'side3' else .04, cmd[1])
+        return .003
+    runs = [dict(scen=scen, cmd=list(cmd), phase=phase, rate=rate(scen, cmd), speed=.92 * cmd[0], fell=False)
+            for scen, cmd, phase in probe.SCENARIOS]
+    good = probe.summary(runs)
+    assert good['passes'] and good['place'] == pytest.approx((.62, .62)) and abs(good['bias']) < 1e-12
+    assert good['v05'] == pytest.approx(.92) and good['back'] == pytest.approx(.92)
+    biased = [dict(r, rate=r['rate'] - .05) if r['scen'] == 'place' else r for r in runs]
+    bad = probe.summary(biased)
+    assert not bad['passes'] and not bad['checks']['bias'] and not bad['checks']['place'] and bad['checks']['v05']
+
+
 def test_arm_joints_errors_per_joint_and_the_palms(tmp_path, monkeypatch, capsys):
     """arm_joints on a small arm_targets stage, a short run: the mean signed error of each of the ten tracked joints by
     name, the palms against the target pose's (forward kinematics: home gives the palms of the home pose standing),

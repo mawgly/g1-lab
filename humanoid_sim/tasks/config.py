@@ -1,5 +1,6 @@
 """Bounded task parameters; callers never supply arbitrary environment kwargs."""
 import math
+import re
 
 # g1_velocity v2 weights. A key missing from a saved config takes this value, so terms added later
 # default to "absent" (forward, sideways, torso, orientation, height = 0) and old checkpoints keep their reward.
@@ -26,9 +27,26 @@ G1_RECOMMENDED = {**G1_REWARD_WEIGHTS, 'torso': 2.}
 # stance_width (after branch 46, working value 2): the feet's width beyond 0.30 m while the pelvis is above 0.5 m and
 # both soles are down (g1_tensor_math.GETUP_STANCE_WIDTH, stance_active); 0, the default, is the task before it bit for
 # bit and computes nothing. A reward weight only.
+# arm_press (iteration 52, working value 0.05): standing only (getup_standing), Σ over the free arm joints (the locked
+# wrists left out) of (PD target before pd_bound − angle after the step)², as walking's arm_press; 0, the default, is
+# the task before it bit for bit and computes nothing. A reward weight only.
+# style (iteration 53, working value 0.5): +w·exp(−d/2) while the head top is 0.3-1.1 m up, d the distance to the
+# nearest human frame of the style library (task_config style_library; g1_tensor_math.style_distance); 0, the default,
+# is the task before it bit for bit: nothing is loaded or computed. A reward weight only.
+# head_rise (iteration 57, working value 3): −w·max(0, v_z − 0.8 m/s), v_z the head top's vertical speed over the
+# control step, every step (g1_tensor_math.head_rise); 0, the default, is the task before it bit for bit and computes
+# nothing. A reward weight only.
+# sole_slip (iteration 62, working value 0.1): −w·Σ over the feet with the sole below 1 cm of their horizontal speed²
+# (g1_tensor_math.sole_slip); 0, the default, is the task before it bit for bit and computes nothing. A reward weight
+# only.
+# amp (iteration 55, working value 1): +w·[0.3 < head < 1.1]·max(0, 1 − 0.25·(D − 1)²), D the AMP discriminator of
+# the step's state pair (humanoid_sim/getup_amp), paid by the full-GPU learner (TensorPPO.collect), not by the task: the
+# CPU task and its stage evaluation do not see it (no reward component). 0, the default, builds no discriminator.
 G1_GETUP_REWARD_WEIGHTS = dict(head=1., upright=.5, stand=1., stand_pose=.5, stand_still=1., effort=2e-5,
                                joint_speed=1e-4, action_change=.01, joint_limits=1., impact=0., sole_impact=0.,
-                               stance_width=0.)
+                               stance_width=0., arm_press=0., style=0., head_rise=0., sole_slip=0., amp=0.)
+# The reward weights the task itself pays (its reward components); amp is paid by the learner.
+G1_GETUP_TASK_WEIGHTS = tuple(key for key in G1_GETUP_REWARD_WEIGHTS if key != 'amp')
 # g1_getup's robot, fixed by the task (not settings; part of its identity): the walking candidates' real-robot model
 # with Unitree's foot and hand capsules, locked wrists, the knee floor and the action box, and the walking observation
 # layout (history 5, the phase stopped, critic extras) with heading hold off; the command is always zero.
@@ -590,10 +608,72 @@ def g1_config_identity(identity, config):
 # swings at up to 29 rad/s. The PD, the delay queue and the observed last action keep the applied action, PPO the
 # policy's. A reward setting only: the contract and branching are unchanged. False (missing) is the original term, bit
 # for bit; without a bound the two actions are the same.
+# style_library (iteration 53): the name of the style term's human frame library, the file
+# runs/humanoid_lab/getup_style/<name>.npz (tasks/g1_getup_style; scripts/lab/getup_style_library.py makes it; LAFAN1
+# is CC BY-NC-ND 4.0, so the library stays out of the repository). Read only while the style weight is non-zero, so
+# the default name changes nothing for a task without that weight.
+# style_judge (iteration 55, bool): the full-GPU task computes rollout/style_dist and rollout/style_band (the distance
+# to the style library) without paying the style term, an independent judge of a run whose style weight is 0; on by
+# itself while the amp weight is non-zero. False (missing) with both weights at 0 reads nothing, as before.
+# human_starts (iteration 56, reference state init): {share, md5}, a share of training resets starts from a human frame
+# getting up (tasks/g1_getup_human: runs/humanoid_lab/getup_bank/human_starts.npz, its md5) instead of a bank row;
+# their episodes do not step the assist or pd_bound curricula. Evaluation, probes and held-out bank rows are unchanged.
+# None (missing) is the task before it, bit for bit. Not part of the contract.
+# stance_pelvis (iteration 60, m; the critic's lab-critic/it53/split59.py): the stance_width term counts with the pelvis
+# above it (and both soles down). At GETUP_STANCE_PELVIS (missing), the original 0.5, a split below it is not charged:
+# stage 1164 jumps out of one, the feet 1.01-1.10 m apart before the jump, 0.31-0.41 m after. Working value 0.25.
+GETUP_STANCE_PELVIS = .5
+GETUP_STANCE_PELVIS_RANGE = (.1, .8)
+# hip_roll_out (iteration 63, rad; the critic's lab-critic/it63, pose63.py, hum63.py): the hip roll PD target's limit
+# outwards, per leg (the left leg's +, the right leg's −, g1_getup.outward_signs), through target_low / target_high
+# as knee_floor: the PD, the delay queue and arm_press; the action and the observed last action are not changed.
+# Why: 1164's "spider", the hips spread in roll by 2.0-2.4 rad (p90 3.5) from the front to standing, the feet
+# 1.2-1.4 m apart; a human's spread over 100 LAFAN1 rises median 0.88, p90 1.46 (its feet 0.50 m). Its own action
+# contract (…-hiproll<v>, g1_getup_config_identity), a stage moves there with warm_start.carry_over. None (missing):
+# off, bit for bit. Getting up only: walking keeps its joint ranges.
+GETUP_HIP_ROLL_RANGE = (.2, 2.5)
+# track_clip (iteration 64; the user's decision: the robot gets up as a human does, not as a "spider"): {file, md5}, the
+# motion tracking mode of g1_getup, BeyondMimic / mjlab style: the policy follows one human clip getting up
+# (tasks/g1_getup_track: runs/humanoid_lab/getup_track/<file>.npz, made by scripts/lab/getup_track_clip.py from LAFAN1,
+# CC BY-NC-ND 4.0: a research prototype, never published, scripts/robot/package.py refuses such a stage), then holds
+# its last frame for TRACK_HOLD_SECONDS. The getting-up terms (head, upright, stand…, head_rise, stance, style, amp)
+# and the assist are off; the reward is the tracking terms of G1_GETUP_TRACK_WEIGHTS (g1_tensor_math.
+# track_reward_components) with the impact and sole_impact weights of reward_weights. The actor's 490 inputs, the
+# actions and the export are unchanged; the critic gets the clip's phase and the anchor's errors after the six extras
+# (TRACK_CRITIC_EXTRAS more: its own observation contract, …-critic6-track11, g1_getup_config_identity). Not with
+# pd_bound, human_starts, style_judge or the style / amp weights. None (missing): off, the task bit for bit.
+GETUP_TRACK_NAME = r'[A-Za-z0-9_-]{1,64}'  # a file name under getup_track, never a path
+TRACK_CRITIC_EXTRAS = 11  # sin/cos of the clip phase, the anchor's position (3) and orientation (6) error
+# Tracking weights (mjlab / BeyondMimic G1 tracking; exp(−e/σ²) terms, σ in g1_tensor_math.TRACK_SIGMA): the anchor
+# (torso_link) position and orientation, the 14 bodies' positions relative to the anchor, orientations, linear and
+# angular velocities; penalties: action rate, joints beyond their soft limits (rad), self_contact on our scale (the
+# share of substeps with a robot-robot contact above 10 N).
+G1_GETUP_TRACK_WEIGHTS = dict(anchor_pos=.5, anchor_ori=.5, body_pos=1., body_ori=1., body_lin_vel=1., body_ang_vel=1.,
+                              action_rate=.1, joint_limit=10., self_contact=10.)
+# settle_clip (iteration 66; the user: get up from any fall pose, as a human does): [{file, md5}, …], one to
+# SETTLE_CLIPS_MAX human clips getting up (tasks/g1_getup_track's files, as track_clip's) whose first frames are the
+# settling targets: from any bank start (g1_tensor_math.SETTLE_CLASSES) the policy rolls and lays its limbs into the
+# nearest of these start poses (the back's cmu-140_09, the front's cmu-140_01), where a tracker of that clip takes
+# over. The reward (g1_tensor_math.settle_reward_components, G1_GETUP_SETTLE_WEIGHTS with reward_weights' impact and
+# sole_impact): the pelvis gravity and the free joints against the nearest target, stillness once near it,
+# regularization; success (the hand-over to g1_ctrl's tracker) the pose within SETTLE_DONE_ANGLE / SETTLE_DONE_POSE,
+# every free joint slower than SETTLE_DONE_SPEED for SETTLE_DONE_SECONDS. Episodes SETTLE_EPISODE_SECONDS, no assist.
+# The actor's 490 inputs, the critic's six extras, the actions and the export are unchanged: not part of the contract.
+# Not with track_clip, pd_bound, human_starts, style_judge or the style / amp weights. None (missing): off, bit for bit.
+SETTLE_CLIPS_MAX = 4
+# Settling weights: the orientation and pose kernels (σ in g1_tensor_math.SETTLE_ORI_STD / SETTLE_POSE_STD), the
+# stillness penalty near the target, action rate as getting up's action_change, the joints beyond their soft limits
+# (all joints, rad), self_contact on our scale (the share of substeps with a robot-robot contact above 10 N).
+G1_GETUP_SETTLE_WEIGHTS = dict(settle_ori=1., settle_pose=1., settle_still=1., action_rate=.01, joint_limit=1.,
+                               self_contact=1.)
 GETUP_POSE_STD = .1
 GETUP_POSE_STD_RANGE = (.02, 2.)
+GETUP_STYLE_LIBRARY = 'lafan1'
+GETUP_STYLE_NAME = r'[A-Za-z0-9_-]{1,64}'  # a file name under getup_style, never a path
 G1_GETUP_DEFAULTS = dict(assist_force=200., action_delay=.02, motor_friction=1.25, body_friction=[.3, 1.],
-                         pd_bound=None, stand_pose_std=GETUP_POSE_STD, action_change_unbounded=False)
+                         pd_bound=None, stand_pose_std=GETUP_POSE_STD, action_change_unbounded=False,
+                         style_library=GETUP_STYLE_LIBRARY, style_judge=False, human_starts=None,
+                         stance_pelvis=GETUP_STANCE_PELVIS, hip_roll_out=None, track_clip=None, settle_clip=None)
 GETUP_ASSIST_RANGE = (0., 500.)
 GETUP_BODY_FRICTION_RANGE = (.05, 2.)
 PD_BOUND_RANGE = (.1, 1.)
@@ -608,7 +688,17 @@ G1_GETUP_LABELS = dict(head='Высота макушки: от 0,15 до 1,20 м
                        sole_impact=('Штраф за жёсткую постановку стоп (приземление после прыжка): сумма по стопам '
                                     'квадратов превышения скорости сближения подошвы с полом над 0,5 м/с'),
                        stance_width=('Штраф за широкую стойку: на сколько метров стопы шире 0,30 м поперёк курса таза '
-                                     '(при тазе выше 0,5 м и обеих подошвах на полу)'))
+                                     '(при тазе выше 0,5 м и обеих подошвах на полу)'),
+                       arm_press=('Штраф за давление рук стоя: сумма по суставам рук без закреплённых запястий '
+                                  '(цель мотора до границы мягкости − угол)², рад² (только в стойке)'),
+                       style=('Награда за стиль: exp(−d/2), d — расстояние до ближайшего кадра вставания человека '
+                              '(поза и скорости суставов, гравитация и высота таза), пока макушка на 0,3–1,1 м'),
+                       head_rise=('Штраф за слишком быстрый подъём головы: на сколько м/с макушка поднимается '
+                                  'быстрее 0,8 м/с (на каждом шаге)'),
+                       sole_slip=('Штраф за скольжение стоп: сумма по стопам на полу (подошва ниже 1 см) квадрата '
+                                  'скорости стопы по полу, м²/с²'),
+                       amp=('Награда за стиль от дискриминатора AMP: max(0, 1 − 0,25·(D − 1)²) по паре соседних '
+                            'состояний, пока макушка на 0,3–1,1 м (только полный GPU; первые 5 млн шагов — прогрев)'))
 G1_GETUP_PARAMETERS = (
     dict(group=None, key='assist_force', default=G1_GETUP_DEFAULTS['assist_force'], min=GETUP_ASSIST_RANGE[0],
          max=GETUP_ASSIST_RANGE[1],
@@ -637,6 +727,32 @@ G1_GETUP_PARAMETERS = (
          type='bool',
          label=('Штраф за резкие действия — по действию до границы мягкости (а не по ограниченному: граница '
                 'не прячет шум)')),
+    # Read only while the style weight is non-zero.
+    dict(group=None, key='style_library', default=G1_GETUP_DEFAULTS['style_library'], type='text',
+         label='Библиотека кадров человека для награды за стиль (файл runs/humanoid_lab/getup_style/<имя>.npz)'),
+    # Missing means off; the amp weight turns the judge on by itself.
+    dict(group=None, key='style_judge', default=G1_GETUP_DEFAULTS['style_judge'], type='bool',
+         label='Считать расстояние до кадров человека в журнале обучения без награды за стиль (судья)'),
+    # Missing or null means off (every training episode starts from the bank).
+    dict(group=None, key='human_starts', default=G1_GETUP_DEFAULTS['human_starts'], type='json',
+         label=('Старты из кадров вставания человека: {"share": доля обучающих сбросов, "md5": md5 файла '
+                'runs/humanoid_lab/getup_bank/human_starts.npz} (пусто — все старты из банка)')),
+    # Missing means GETUP_STANCE_PELVIS (the original stance_width term).
+    dict(group=None, key='stance_pelvis', default=G1_GETUP_DEFAULTS['stance_pelvis'],
+         min=GETUP_STANCE_PELVIS_RANGE[0], max=GETUP_STANCE_PELVIS_RANGE[1],
+         label='Штраф за широкую стойку действует, когда таз выше этой высоты, м (0,5 — прежний)'),
+    # Missing or null means off (the hip roll target anywhere in its joint range); a different action contract.
+    dict(group=None, key='hip_roll_out', default=G1_GETUP_DEFAULTS['hip_roll_out'], min=GETUP_HIP_ROLL_RANGE[0],
+         max=GETUP_HIP_ROLL_RANGE[1],
+         label='Предел цели крена бедра наружу, рад, на каждую ногу (пусто — без предела)'),
+    # Missing or null means off (the getting-up task); a different critic contract.
+    dict(group=None, key='track_clip', default=G1_GETUP_DEFAULTS['track_clip'], type='json',
+         label=('Следование записи человека: {"file": имя клипа runs/humanoid_lab/getup_track/<имя>.npz, "md5": md5 '
+                'файла} (пусто — обычная задача вставания)')),
+    # Missing or null means off (the getting-up task); not part of the contract.
+    dict(group=None, key='settle_clip', default=G1_GETUP_DEFAULTS['settle_clip'], type='json',
+         label=('Укладка в начальную позу клипа вставания: [{"file": имя клипа runs/humanoid_lab/getup_track/<имя>.npz, '
+                '"md5": md5 файла}, …], цель — ближайший из первых кадров (пусто — обычная задача вставания)')),
     *(dict(group='reward_weights', key=key, label=G1_GETUP_LABELS[key], default=G1_GETUP_REWARD_WEIGHTS[key], min=0,
            max=100) for key in G1_GETUP_REWARD_WEIGHTS),
 )
@@ -655,7 +771,8 @@ def g1_getup_config(values):
         raise ValueError('Reward weights must be finite and in [0,100]')
     result = {**G1_GETUP_DEFAULTS, **{key: value for key, value in values.items() if key != 'reward_weights'}}
     for key, (low, high) in (('assist_force', GETUP_ASSIST_RANGE), ('action_delay', ACTION_DELAY_RANGE),
-                             ('motor_friction', MOTOR_FRICTION_RANGE), ('stand_pose_std', GETUP_POSE_STD_RANGE)):
+                             ('motor_friction', MOTOR_FRICTION_RANGE), ('stand_pose_std', GETUP_POSE_STD_RANGE),
+                             ('stance_pelvis', GETUP_STANCE_PELVIS_RANGE)):
         value = result[key]
         if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
             raise ValueError(f'G1 getup {key} must be in [{low:g},{high:g}]')
@@ -672,20 +789,70 @@ def g1_getup_config(values):
                          'start >= lowest')
     if type(result['action_change_unbounded']) is not bool:
         raise ValueError('G1 getup action_change_unbounded must be true or false')
+    if not isinstance(result['style_library'], str) or not re.fullmatch(GETUP_STYLE_NAME, result['style_library']):
+        raise ValueError('G1 getup style_library must be a library name (letters, digits, _ and -)')
+    if type(result['style_judge']) is not bool:
+        raise ValueError('G1 getup style_judge must be true or false')
+    human = result['human_starts']
+    if human is not None:
+        share = human.get('share') if isinstance(human, dict) else None
+        if not isinstance(human, dict) or set(human) != {'share', 'md5'} or type(share) not in (int, float) \
+                or not math.isfinite(share) or not 0 < share <= 1 or not isinstance(human['md5'], str) \
+                or not re.fullmatch(r'[0-9a-f]{32}', human['md5']):
+            raise ValueError('G1 getup human_starts must be null or {"share": (0, 1], "md5": the file\'s md5}')
+        human = {'share': float(share), 'md5': human['md5']}
+    roll, (low, high) = result['hip_roll_out'], GETUP_HIP_ROLL_RANGE
+    if roll is not None and (type(roll) not in (int, float) or not math.isfinite(roll) or not low <= roll <= high):
+        raise ValueError(f'G1 getup hip_roll_out must be null or in [{low:g},{high:g}] rad')
+    clip = result['track_clip']
+    if clip is not None:
+        if not isinstance(clip, dict) or set(clip) != {'file', 'md5'} or not isinstance(clip['file'], str) \
+                or not re.fullmatch(GETUP_TRACK_NAME, clip['file']) or not isinstance(clip['md5'], str) \
+                or not re.fullmatch(r'[0-9a-f]{32}', clip['md5']):
+            raise ValueError('G1 getup track_clip must be null or {"file": a clip name (letters, digits, _ and -), '
+                             '"md5": the file\'s md5}')
+        if bound is not None or human is not None or result['style_judge'] or any(
+                weights.get(key) for key in ('style', 'amp')):
+            raise ValueError('G1 getup track_clip does not go with pd_bound, human_starts, style_judge or the style '
+                             'and amp weights')
+        clip = {'file': clip['file'], 'md5': clip['md5']}
+    settle = result['settle_clip']
+    if settle is not None:
+        if not isinstance(settle, (list, tuple)) or not 1 <= len(settle) <= SETTLE_CLIPS_MAX or any(
+                not isinstance(entry, dict) or set(entry) != {'file', 'md5'} or not isinstance(entry['file'], str)
+                or not re.fullmatch(GETUP_TRACK_NAME, entry['file']) or not isinstance(entry['md5'], str)
+                or not re.fullmatch(r'[0-9a-f]{32}', entry['md5']) for entry in settle) \
+                or len({entry['md5'] for entry in settle}) != len(settle):
+            raise ValueError(f'G1 getup settle_clip must be null or a list of 1 to {SETTLE_CLIPS_MAX} different '
+                             '{"file": a clip name (letters, digits, _ and -), "md5": the file\'s md5}')
+        if clip is not None or bound is not None or human is not None or result['style_judge'] or any(
+                weights.get(key) for key in ('style', 'amp')):
+            raise ValueError('G1 getup settle_clip does not go with track_clip, pd_bound, human_starts, style_judge '
+                             'or the style and amp weights')
+        settle = [{'file': entry['file'], 'md5': entry['md5']} for entry in settle]
     return {'reward_weights': {**G1_GETUP_REWARD_WEIGHTS, **{k: float(v) for k, v in weights.items()}},
             'assist_force': float(result['assist_force']), 'action_delay': float(result['action_delay']),
             'motor_friction': float(result['motor_friction']), 'body_friction': [float(v) for v in friction],
             'pd_bound': None if bound is None else [float(v) for v in bound],
             'stand_pose_std': float(result['stand_pose_std']),
-            'action_change_unbounded': result['action_change_unbounded']}
+            'action_change_unbounded': result['action_change_unbounded'], 'style_library': result['style_library'],
+            'style_judge': result['style_judge'], 'human_starts': human,
+            'stance_pelvis': float(result['stance_pelvis']), 'hip_roll_out': None if roll is None else float(roll),
+            'track_clip': clip, 'settle_clip': settle}
 
 
 def g1_getup_config_identity(identity, config):
     """g1_getup's contract refined by its normalized task_config (TaskSpec.config_identity): pd_bound bounds what the
     actions do, its own action contract (…-pdbound<lowest>: g1_getup:action-v2-limit10-wristlock-knee0.061-pdbound0.6
-    for [1, 0.6]); without it the identity of g1_getup_identity, bit for bit."""
+    for [1, 0.6]), and so does hip_roll_out (…-hiproll<v>, after it); track_clip adds TRACK_CRITIC_EXTRAS critic inputs,
+    its own observation contract (…-critic6-track11; the actor's inputs as before); without them the identity of
+    g1_getup_identity, bit for bit."""
     if config.get('pd_bound') is not None:
         identity = {**identity, 'action_schema': f"{identity['action_schema']}-pdbound{config['pd_bound'][1]:g}"}
+    if config.get('hip_roll_out') is not None:  # hip roll actions beyond the limit no longer move the target
+        identity = {**identity, 'action_schema': f"{identity['action_schema']}-hiproll{config['hip_roll_out']:g}"}
+    if config.get('track_clip') is not None:  # the critic's inputs grow; the actor's stay
+        identity = {**identity, 'observation_schema': f"{identity['observation_schema']}-track{TRACK_CRITIC_EXTRAS}"}
     return identity
 
 

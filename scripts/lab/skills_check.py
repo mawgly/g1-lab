@@ -20,14 +20,16 @@ the lab's probes, called, not copied (scripts/lab/probes):
      stage_select's crouched walk in the bridge copy;
  11. arms on targets (task_config arm_targets): arm_joints.run on the carry poses at 0 / 1 kg, train_falls.run
      'free' and 'target:1' (FALLS_EPISODES each, the exact 95 % Poisson interval);
- 12. torque chattering: chatter.run's six scenarios x 3 seeds, against Unitree v0 at the stage's delay;
+ 12. torque chattering: chatter.run's six scenarios x 3 seeds, against Unitree v0 at the stage's delay (and the
+     stop-start alone, where a switch at the command threshold would show);
  13. the hoist: scripts/robot/reference/hoist.py 'air5' in our physics, the legs at command 0 in the air.
 A row passes when it meets its threshold (the rules already in use: goal_check, stage_select, prefilter, speed_accept,
 arm_probe, the robot package's hoist, the stage 3 milestones of iterations 41-44) or the reference misses it too, and
 is not worse than the reference beyond a margin (falls: + 1 + runs // 20; falls per episode: overlapping 95 %
 intervals; drift, distances, speeds: a share of the reference's value or a floor, whichever is larger); the note says
 which held. A row a policy cannot run is 'н/п' with the reason (no height command, no arm targets, a probe that does
-not take an export folder). The reference: the stage its branch started from (the manifest's source, or a warm_start's
+not take an export folder: train_falls, which needs the stage's σ; the other probes run an export's policy.onnx in its
+stage's task). The reference: the stage its branch started from (the manifest's source, or a warm_start's
 for a root), 'n8' candidate 8 (exp-28691193718e4d0e @ 7221510144), or any stage. The same stage as its own reference
 runs once. --journal records the table as the «Дневник» tab's skills check, next to the goal check (journal.set_skills).
 About 10 minutes for a stage and its reference on 8 processes, ~800 runs.
@@ -93,6 +95,13 @@ GETUP_PHYSICS = ('ours', 'delay20', 'foot0.3')  # getup_probe.PHYSICS
 GETUP_PER_CLASS = 24  # fresh starts per class (getup_stance.fresh_starts: ready38's seeds), 120 in all
 HAND_OVER_AT = 1.  # s after up: the hand-over to candidate 8's Velocity (ready38's h1, turn39)
 LOCKED_WRISTS = (20, 21, 27, 28)
+# Unitree's shipped velocity policy as a third column (the user's request of 25.10: where we are behind, where ahead):
+# the walking rows it can run in our physics and the bridge copy; its runs never change, so each is kept by its job in
+# V0_CACHE (with the policy file's md5) and run once.
+V0 = 'unitree_v0'
+V0_CACHE = ROOT / 'runs' / 'humanoid_lab' / 'skills_v0.json'
+V0_TAGS = ('goal:', 'turn:', 'speed:', 'brake:', 'side:', 'push:', 'phys:', 'feet:')  # jobs_of's tags v0 runs
+V0_ROWS = ('goal:', 'speed:', 'turn:', 'side:', 'brake:', 'push:', 'phys:', 'feet:', 'chatter:')  # rows it has
 
 
 # --- What to run --------------------------------------------------------------------------------------------------
@@ -195,11 +204,12 @@ def jobs_of(owner, t, arms_group):
         for k in range(CROUCH_WALK_SEEDS):
             add(f'crouch:walk:{k}', 'crouch', dict(stage=p, name='walk', plan=walk, seed=cr.SEED + k))
         add('crouch:bridge', 'run', ss.height_jobs(p)[0])
-    if arms_group and not t['export']:
+    if arms_group and not t['export']:  # train_falls needs the stage's own σ: not an export folder
         conditions = ('free', 'target:1') if t['arms'] else ('free',)
         for condition in conditions:
             for k in range(FALLS_EPISODES):
                 add(f'falls:{condition}:{k}', 'falls', dict(stage=p, condition=condition, seed=FALLS_SEED + k, beta=1.))
+    if arms_group:
         if t['arms']:
             for name, names, pose in aj.poses():
                 if name.startswith('carry'):
@@ -208,8 +218,7 @@ def jobs_of(owner, t, arms_group):
                             dict(stage=p, pose_name=name, names=names, pose=pose, load=load))
     for job in ch.jobs(p, t['arms']):
         add(f'chatter:{job["scenario"]}:{job["seed"]}', 'chatter', job)
-    if not t['export']:
-        add('hoist', 'hoist', dict(path=p, physics=HOIST[0], plan=HOIST[1]))
+    add('hoist', 'hoist', dict(path=p, physics=HOIST[0], plan=HOIST[1]))
     return out
 
 
@@ -259,14 +268,20 @@ def acting(path):
 
 
 def goal(job):
-    """goal_check's two parts or extra turns, as plain lists (picklable, JSON)."""
+    """goal_check's two parts or extra turns, as plain lists (picklable, JSON). Unitree v0 (V0) acts in stand_turn's
+    task for it (stand_turn.stage_data: the walking task of its STAGE3 at history 1), STAGE3 giving the identity."""
     from humanoid_sim.goal_check import walks
     from humanoid_sim.supervise import check_stage
-    stage, actor = acting(job['path'])
+    config = None
+    if job['path'] == V0:
+        policy, norm, config = st.stage_data(V0)
+        stage, actor = Path(st.STAGE3), (policy, norm)
+    else:
+        stage, actor = acting(job['path'])
     if job['part'] == 'check':
-        return check_stage(stage, seeds=job['seeds'], acting=actor)
+        return check_stage(stage, seeds=job['seeds'], acting=actor, config=config)
     extra = {} if job['part'] == 'walks' else dict(turns=[tuple(t) for t in job['turns']], straight=())
-    walk = walks(stage, seeds=job['seeds'], acting=actor, **extra)
+    walk = walks(stage, seeds=job['seeds'], acting=actor, config=config, **extra)
     return dict(turn=[[s, y, v] for (s, y), v in walk['turn'].items()],
                 drift=[[s, start, rates] for (s, start), rates in walk['drift'].items()],
                 pelvis=walk['pelvis'], feet=walk['feet'])
@@ -425,6 +440,10 @@ def measures(got, t, v0=None):
         for key in ch.GATED:
             out[f'chatter:{key}'] = dict(v=summary.get(key), falls=len(summary['falls']),
                                          v0=None if reference is None else reference.get(key))
+        stops, reference = ch.summary_of(chatter, ('stopstart',)), ch.summary_of(v0, ('stopstart',)) if v0 else None
+        if stops:  # the stop-start alone: where a switch at the command threshold would show
+            out['chatter:stopstart'] = dict(v=stops.get(ch.GATED[0]), falls=len(stops['falls']),
+                                            v0=None if reference is None else reference.get(ch.GATED[0]))
     hoisted = got.get('hoist')
     if hoisted:
         segments = pk.segments([hoisted], (HOIST[1],), ('stand',))
@@ -712,19 +731,19 @@ def table():
         ('crouch:bridge', 'Присед', 'Ходьба 0,5 м/с на 0,70, копия связки: увод, рад/с', '< 0,03',
          below(ss.CROUCH_DRIFT_LIMIT), (lower, .25, .006), ('height',), drift),
         ('joints:roll0', 'Руки по целям', 'Поза «нести», 0 кг: крен плеча |e|, худшая рука, рад', '≤ 0,15',
-         at_most(.15), (lower, .2, .03), ('arms', 'stage'), num),
+         at_most(.15), (lower, .2, .03), ('arms',), num),
         ('joints:roll1', 'Руки по целям', 'Поза «нести», 1 кг: крен плеча |e|, худшая рука, рад', '≤ 0,15',
-         at_most(.15), (lower, .2, .03), ('arms', 'stage'), num),
+         at_most(.15), (lower, .2, .03), ('arms',), num),
         ('joints:pitch', 'Руки по целям', 'Поза «нести»: провис тангажа плеча, рад', '≤ 0,15', at_most(.15),
-         (lower, .2, .03), ('arms', 'stage'), num),
+         (lower, .2, .03), ('arms',), num),
         ('joints:elbow', 'Руки по целям', 'Поза «нести»: локоть |e|, рад', '≤ 0,10', at_most(.1), (lower, .2, .02),
-         ('arms', 'stage'), num),
+         ('arms',), num),
         ('joints:error0', 'Руки по целям', 'Поза «нести», 0 кг: средняя |e|, рад', '≤ 0,07', at_most(.07),
-         (lower, .2, .014), ('arms', 'stage'), num),
+         (lower, .2, .014), ('arms',), num),
         ('joints:error1', 'Руки по целям', 'Поза «нести», 1 кг: средняя |e|, рад', '≤ 0,09', at_most(.09),
-         (lower, .2, .018), ('arms', 'stage'), num),
+         (lower, .2, .018), ('arms',), num),
         ('joints:palms', 'Руки по целям', 'Поза «нести»: ладони против цели, см', '≤ 5', at_most(5.), (lower, .2, 1.),
-         ('arms', 'stage'), lambda m: num(m, 1)),
+         ('arms',), lambda m: num(m, 1)),
         ('falls:free', 'Руки по целям', 'Падения в обучающих условиях, руки свободны, на эпизод', '≤ 1,5%',
          at_most(.015), ('rate',), ('stage',), rate),
         ('falls:target:1', 'Руки по целям', 'Падения в обучающих условиях, цели рук, 1 кг, на эпизод', '≤ 4%',
@@ -733,8 +752,10 @@ def table():
          v0_gate, (lower, .2, 0.), None, chatter),
         ('chatter:action_hf_rms_rad', 'Дрожание моментов', 'Цель выше 5 Гц, худший сустав, рад', '≤ 1,5 × v0',
          v0_gate, (lower, .2, 0.), None, chatter),
+        ('chatter:stopstart', 'Дрожание моментов', 'Стоп-старт: момент выше 10 Гц, худший сустав, Н·м', '≤ 1,5 × v0',
+         v0_gate, (lower, .2, 0.), None, chatter),
         ('hoist', 'Подвес', 'В воздухе при команде 0: скорость ног p95, рад/с, и |Δa|', '≤ 2,0 и ≤ 0,03',
-         lambda m: pk.air_calm([dict(qv_leg_p95=m['v'], da=m['da'])]), (lower, .25, .4), ('stage',), hoist),
+         lambda m: pk.air_calm([dict(qv_leg_p95=m['v'], da=m['da'])]), (lower, .25, .4), None, hoist),
     ]
     return rows
 
@@ -794,9 +815,24 @@ def verdict(judged, reference_ok, relative, mine_na, theirs_na):
     return ok, 'порог и эталон'
 
 
-def rows(mine, theirs, t_mine, t_theirs, arms_group, getup=False):
+VERSUS = {'better': 'лучше', 'same': 'так же', 'worse': 'хуже'}  # versus()'s codes, as printed
+
+
+def versus(compare, mine, theirs):
+    """The stage against Unitree v0 on one row: 'worse' when it is worse than v0 beyond the row's margin, 'better'
+    when v0 is worse than it, 'same' otherwise; None with nothing to compare."""
+    if compare is None or theirs is None or mine is None:
+        return None
+    worse, better = compared(compare, mine, theirs), compared(compare, theirs, mine)
+    if worse is None or better is None:
+        return None
+    return 'worse' if not worse else 'better' if not better else 'same'
+
+
+def rows(mine, theirs, t_mine, t_theirs, arms_group, getup=False, v0=None):
     """Table rows: {key, skill, label, target, value, reference, ok, note} from both policies' measures; getup: the
-    rows of a getting-up stage (getup_table)."""
+    rows of a getting-up stage (getup_table); v0: Unitree v0's measures, each row then also {v0: its value or 'н/п (у
+    v0 нет)', v0_vs: versus()}."""
     out = []
     for key, skill, label, target, good, compare, needs, show in (getup_table() if getup else table()):
         mine_na = not_applicable(needs, t_mine)
@@ -809,9 +845,14 @@ def rows(mine, theirs, t_mine, t_theirs, arms_group, getup=False):
             label, target = known.get('label'), known.get('target')
             show, good = (lambda x: x['text']), (lambda x: x['ok'])
         reference = '—' if theirs is None else 'н/п' if theirs_na else '—' if r is None else show(r)
+        third = {}
+        if v0 is not None:
+            m0 = v0.get(key) if key.startswith(V0_ROWS) and not not_applicable(needs, v0_traits()) else None
+            third = dict(v0='н/п (у v0 нет)', v0_vs=None) if not key.startswith(V0_ROWS) else dict(
+                v0='—' if m0 is None else show(m0), v0_vs=None if mine_na or m is None else versus(compare, m, m0))
         if m is None and not mine_na:
             out.append(dict(key=key, skill=skill, label=label or key, target=target or '', value='—',
-                            reference=reference, ok=False, note='не измерено'))
+                            reference=reference, ok=False, note='не измерено', **third))
             continue
         judged = None if mine_na or good is None else good(m)
         reference_ok = None if r is None or good is None else good(r)
@@ -821,8 +862,42 @@ def rows(mine, theirs, t_mine, t_theirs, arms_group, getup=False):
         if key.startswith('chatter:') and m.get('v0') is not None:
             target = f'≤ 1,5 × v0 ({m["v0"]:.3f})'.replace('.', ',')
         out.append(dict(key=key, skill=skill, label=label, target=target, ok=ok, note=note,
-                        value='—' if mine_na else show(m), reference=reference))
+                        value='—' if mine_na else show(m), reference=reference, **third))
     return out
+
+
+def v0_traits():
+    return dict(path=V0, export=False, height=False, arms=False, delay=0., label='Unitree v0')
+
+
+def v0_jobs(delays):
+    """[(tag, kind, job)] Unitree v0 runs: jobs_of's walking runs (V0_TAGS) and its chatter at each delay (s)."""
+    jobs = [(tag, kind, job) for _, tag, kind, job in jobs_of('v0', v0_traits(), False) if tag.startswith(V0_TAGS)]
+    return jobs + [(f'chatter:{job["scenario"]}:{job["seed"]}:{delay:g}', 'chatter', job) for delay in delays
+                   for job in ch.reference_jobs(delay)]
+
+
+def job_key(kind, job):
+    """A run's key in V0_CACHE: the sha256 of its kind and job."""
+    import hashlib
+    return hashlib.sha256(json.dumps([kind, job], sort_keys=True, default=str).encode()).hexdigest()
+
+
+def v0_policy_md5():
+    """md5 of Unitree v0's policy.onnx, None when it cannot be read (WSL not running)."""
+    import hashlib
+    path = Path(st.UNITREE_V0)
+    return hashlib.md5(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def v0_cache():
+    """{key: result} of V0_CACHE's runs, empty when made with another v0 policy file."""
+    from humanoid_sim.core import read_json
+    saved = read_json(V0_CACHE, {}) or {}
+    md5 = v0_policy_md5()
+    if md5 is not None and saved.get('policy_md5') not in (None, md5):
+        return {}
+    return saved.get('runs', {})
 
 
 # --- Main ---------------------------------------------------------------------------------------------------------
@@ -849,19 +924,31 @@ def unclean(value):
     return float(value) if value in ('inf', '-inf') else value
 
 
+def versus_counts(table_rows):
+    """{'better': n, 'same': n, 'worse': n} of the stage against Unitree v0 (rows with a v0 comparison)."""
+    return {code: sum(r.get('v0_vs') == code for r in table_rows) for code in VERSUS}
+
+
 def print_rows(table_rows, stage_label, reference_label):
     marks = {True: '✓', False: '✗', None: '·'}
-    print(f'{"":2}{"навык · мера":<70} {"порог":<22} {"этап":>16} {"эталон":>16}  итог')
+    third = any('v0' in r for r in table_rows)
+    print(f'{"":2}{"навык · мера":<70} {"порог":<22} {"этап":>16} {"эталон":>16}  '
+          + (f'{"Unitree v0":>16} {"":8}  ' if third else '') + 'итог')
     skill = None
     for row in table_rows:
         if row['skill'] != skill:
             skill = row['skill']
             print(f'— {skill}')
+        v0 = f'{row["v0"][:16]:>16} {VERSUS.get(row["v0_vs"], ""):8}  ' if third else ''
         print(f'{marks[row["ok"]]} {row["label"][:70]:<70} {row["target"][:22]:<22} {row["value"]:>16} '
-              f'{row["reference"]:>16}  {row["note"]}')
+              f'{row["reference"]:>16}  {v0}{row["note"]}')
     judged = [r for r in table_rows if r['ok'] is not None]
     print(f'{stage_label} против {reference_label}: выполнено {sum(r["ok"] for r in judged)} из {len(judged)}, '
           f'н/п {len(table_rows) - len(judged)}')
+    if third:
+        counts = versus_counts(table_rows)
+        print(f'{stage_label} против Unitree v0: лучше {counts["better"]}, так же {counts["same"]}, '
+              f'хуже {counts["worse"]}')
 
 
 def title_of(path):
@@ -876,15 +963,36 @@ def title_of(path):
     return title, branch, steps
 
 
-def run_check(path, reference, workers, getup=False):
-    """Every run of the stage, the reference (none when it is the same) and Unitree v0's chatter; the measures.
-    getup: a getting-up stage, getup_jobs on fresh starts (getup_stance.fresh_starts, made first) instead."""
+def save_v0(cache):
+    """V0_CACHE with these runs (written whole, then moved into place; NaN and infinity as JSON's extensions)."""
+    payload = dict(policy_md5=v0_policy_md5(), at=time.time(), runs=cache)
+    text = json.dumps(payload, default=lambda o: o.item() if isinstance(o, np.generic) else str(o))
+    temporary = V0_CACHE.with_suffix('.tmp')
+    temporary.write_text(text, encoding='utf-8')
+    os.replace(temporary, V0_CACHE)
+
+
+def run_check(path, reference, workers, getup=False, with_v0=True):
+    """Every run of the stage, the reference (none when it is the same) and Unitree v0's (its chatter for the chatter
+    rows' threshold; with_v0 also its walking rows, the third column); the measures. v0's runs come from V0_CACHE where
+    there, the rest run and are added to it. getup: a getting-up stage, getup_jobs on fresh starts
+    (getup_stance.fresh_starts, made first) instead, without v0."""
     same = reference == path
     t_mine = traits(path)
     t_theirs = t_mine if same else traits(reference)
     arms_group = t_mine['arms']
-    v0 = not getup and Path(st.UNITREE_V0).is_file()
     delays = sorted({t_mine['delay'], t_theirs['delay']})
+    cache, cached, v0_items = {}, {}, []
+    if not getup:
+        cache, reachable = v0_cache(), v0_policy_md5() is not None
+        for tag, kind, job in v0_jobs(delays):
+            if not (with_v0 or tag.startswith('chatter:')):
+                continue
+            key = job_key(kind, job)
+            if key in cache:
+                cached[tag] = cache[key]
+            elif reachable:
+                v0_items.append(('v0', tag, kind, job))
     if getup:
         started = time.time()
         starts = gs.fresh_starts(GETUP_PER_CLASS, workers)
@@ -892,11 +1000,11 @@ def run_check(path, reference, workers, getup=False):
         print(f'стартов {len(starts)}, {time.time() - started:.0f} с', flush=True)
         items = getup_jobs('stage', t_mine, starts, limits) + ([] if same else getup_jobs('reference', t_theirs,
                                                                                             starts, limits))
-    else:
-        items = jobs_of('stage', t_mine, arms_group) + ([] if same else jobs_of('reference', t_theirs, arms_group))
-    if v0:
-        items += [(f'v0:{delay:g}', f'chatter:{job["scenario"]}:{job["seed"]}', 'chatter', job)
-                  for delay in delays for job in ch.reference_jobs(delay)]
+    else:  # an export cannot run train_falls: then neither does its reference (the rows are н/п either way)
+        items = jobs_of('stage', t_mine, arms_group) + ([] if same else [
+            item for item in jobs_of('reference', t_theirs, arms_group)
+            if not (t_mine['export'] and item[1].startswith('falls:'))])
+    items += v0_items
     order = sorted(range(len(items)), key=lambda k: -cost(items[k][2], items[k][3]))
     for key in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
         os.environ.setdefault(key, '1')
@@ -914,18 +1022,31 @@ def run_check(path, reference, workers, getup=False):
 
     def of(owner):
         return {items[k][1]: results[k] for k in range(len(items)) if items[k][0] == owner}
-    v0_runs = {delay: list(of(f'v0:{delay:g}').values()) for delay in delays} if v0 else {}
+    v0_got = {**cached, **of('v0')}
+    if v0_items:
+        cache.update({job_key(kind, job): v0_got[tag] for _, tag, kind, job in v0_items})
+        save_v0(cache)
+
+    def v0_chatter(delay):  # v0's chatter runs at a delay, tagged as the measures read them
+        return {':'.join(tag.split(':')[:3]): r for tag, r in v0_got.items()
+                if tag.startswith('chatter:') and tag.split(':')[3] == f'{delay:g}'}
+    v0_runs = {delay: list(v0_chatter(delay).values()) for delay in delays}
+    v0m = None
     if getup:
         mine = getup_measures(of('stage'))
         theirs = mine if same else getup_measures(of('reference'))
     else:
-        mine = measures(of('stage'), t_mine, v0_runs.get(t_mine['delay']))
-        theirs = mine if same else measures(of('reference'), t_theirs, v0_runs.get(t_theirs['delay']))
+        mine = measures(of('stage'), t_mine, v0_runs.get(t_mine['delay']) or None)
+        theirs = mine if same else measures(of('reference'), t_theirs, v0_runs.get(t_theirs['delay']) or None)
+        walking = {tag: r for tag, r in v0_got.items() if not tag.startswith('chatter:')}
+        if with_v0 and walking:  # v0's own chatter at the stage's delay, against itself
+            own = v0_runs.get(t_mine['delay']) or None
+            v0m = measures({**walking, **v0_chatter(t_mine['delay'])}, v0_traits(), own)
     return dict(mode='getup' if getup else 'walking', stage=t_mine, reference=t_theirs, same=same,
-                measures=dict(stage=mine, reference=theirs), runs=len(items), seconds=time.time() - started,
+                measures=dict(stage=mine, reference=theirs, v0=v0m), runs=len(items), seconds=time.time() - started,
                 process_seconds=sum(seconds), workers=workers,
                 counts={owner: sum(item[0] == owner for item in items) for owner in ('stage', 'reference')}
-                | {'v0': sum(item[0].startswith('v0') for item in items)})
+                | {'v0': len(v0_items), 'v0_cached': len(cached)})
 
 
 def main(argv=None):
@@ -939,6 +1060,7 @@ def main(argv=None):
     parser.add_argument('--json', type=Path)
     parser.add_argument('--journal', action='store_true', help='записать в «Дневник» рядом с проверкой цели')
     parser.add_argument('--rejudge', type=Path, help='--json прошлого прогона: судить его меры заново, без прогонов')
+    parser.add_argument('--no-v0', action='store_true', help='без столбца Unitree v0')
     args = parser.parse_args(argv)
     if (args.stage is None) == (args.rejudge is None):
         parser.error('нужен этап или --rejudge <json>, что-то одно')
@@ -951,16 +1073,18 @@ def main(argv=None):
         getup = task_of(path) == 'g1_getup'
         if getup != (task_of(reference) == 'g1_getup'):
             raise SystemExit(f'Этап и эталон — разные задачи ({task_of(path)} и {task_of(reference)})')
-        check = run_check(path, reference, args.workers, getup)
+        check = run_check(path, reference, args.workers, getup, not args.no_v0)
     getup = check.get('mode') == 'getup'
     t_mine, t_theirs = check['stage'], check['reference']
+    v0 = None if args.no_v0 else check['measures'].get('v0')
     table_rows = rows(check['measures']['stage'], check['measures']['reference'], t_mine, t_theirs, t_mine['arms'],
-                      getup)
+                      getup, v0)
     check['rows'] = table_rows
     print_rows(table_rows, t_mine['label'], t_theirs['label'])
     counts, wall = check['counts'], check['seconds']
     print(f'{wall:.0f} с на {check["workers"]} процессах ({check["process_seconds"]:.0f} с процессов), прогонов '
-          f'{check["runs"]}: этап {counts["stage"]}, эталон {counts["reference"]}, v0 {counts["v0"]}')
+          f'{check["runs"]}: этап {counts["stage"]}, эталон {counts["reference"]}, v0 {counts["v0"]}'
+          + (f' (и {counts["v0_cached"]} из {V0_CACHE.name})' if counts.get('v0_cached') else ''))
     if args.json:
         args.json.write_text(json.dumps(clean(check), ensure_ascii=False, indent=1), encoding='utf-8')
     if args.journal:

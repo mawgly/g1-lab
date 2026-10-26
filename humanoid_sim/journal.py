@@ -28,8 +28,9 @@ CONTENT_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp
 FIGURE_NAME = re.compile(r'^[A-Za-z0-9_-]{1,80}\.html$')
 ENTRY_ID = re.compile(r'^[a-z0-9-]{1,80}$')
 EMPTY = {'roadmap': [], 'check': None, 'entries': [], 'iterations': []}
-# Who speaks in «Совет лаборатории»: the lead (Claude) and the lab's agents (.claude/agents/lab-*.md).
-ROLES = {'lead': 'Руководитель', 'critic': 'Критик', 'scout': 'Разведчик', 'analyst': 'Аналитик',
+# Who speaks in «Совет лаборатории»: Pavel (the lab's owner), the lead agent (Claude) and the lab's agents
+# (.claude/agents/lab-*.md).
+ROLES = {'owner': 'Павел', 'lead': 'Ведущий агент', 'critic': 'Критик', 'scout': 'Разведчик', 'analyst': 'Аналитик',
          'watch': 'Дежурный', 'chronicler': 'Летописец', 'engineer': 'Инженер', 'reviewer': 'Ревизор'}
 
 
@@ -154,8 +155,9 @@ def set_check(root, branch, stage, title, items, at=None):
 
 def set_skills(root, branch, stage, title, against, items, seconds=None, runs=None, at=None):
     """The latest skills check (scripts/lab/skills_check.py), shown beside the goal check: against {branch, stage,
-    title}, the reference; items: [{skill, label, target, value, reference, ok: bool | None (н/п), note}] — one row
-    per measure; seconds, runs: how long it took and how many runs. Stored under 'skills' (absent until the first)."""
+    title}, the reference; items: [{skill, label, target, value, reference, ok: bool | None (н/п), note, and with
+    Unitree v0's column v0 (its value) and v0_vs: 'better' | 'same' | 'worse' | None}] — one row per measure;
+    seconds, runs: how long it took and how many runs. Stored under 'skills' (absent until the first)."""
     if not isinstance(items, list) or not items:
         raise ValueError('Проверка навыков: нужен хотя бы один пункт')
     if not isinstance(against, dict):
@@ -164,8 +166,11 @@ def set_skills(root, branch, stage, title, against, items, seconds=None, runs=No
     for item in items:
         if not isinstance(item, dict) or item.get('ok') not in (True, False, None):
             raise ValueError('Пункт проверки: ok — true, false или null')
+        if item.get('v0_vs') not in (None, 'better', 'same', 'worse'):
+            raise ValueError('Пункт проверки: сравнение с v0 — better, same, worse или null')
         rows.append({'skill': _text(item.get('skill'), 'Навык', 200), 'label': _text(item.get('label'), 'Мера', 300),
                      **{key: str(item.get(key, '')) for key in ('target', 'value', 'reference', 'note')},
+                     **({'v0': str(item['v0']), 'v0_vs': item.get('v0_vs')} if 'v0' in item else {}),
                      'ok': item['ok']})
     skills = {'at': time.time() if at is None else float(at), 'branch': branch, 'stage': int(stage),
               'title': _text(title, 'Проверка', 300),

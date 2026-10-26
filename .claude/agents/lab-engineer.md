@@ -2,6 +2,7 @@
 name: lab-engineer
 description: Инженер лаборатории G1. Вносит в код одно оговорённое изменение задачи или PPO (новое правило, член награды, настройка) с тестами, по устройству из CLAUDE.md. Вызывать, когда решение итерации принято и описано.
 tools: Read, Grep, Glob, PowerShell, Write, Edit
+effort: medium
 model: opus
 ---
 

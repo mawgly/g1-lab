@@ -29,14 +29,16 @@ def find_stage(lab, item):
     return next((s for s in stages if steps and int(s.name[6:]) == int(steps)), stages[-1])
 
 
-def rollout(stage, identity, policy, norm, scenario, seed, seconds, on_step=None):
+def rollout(stage, identity, policy, norm, scenario, seed, seconds, on_step=None, config=None):
     """One deterministic CPU episode under the scenario's fixed commands.
 
-    on_step(seconds, raw_env, torso_lean_deg, fell) runs after every control step (lean is None without a torso)."""
+    on_step(seconds, raw_env, torso_lean_deg, fell) runs after every control step (lean is None without a torso).
+    config: the task_config to run in instead of the stage's (a policy with no stage of its own: Unitree v0)."""
     from .tasks.catalog import make_task
     dt = identity['control_dt']
     limit = math.ceil(seconds / dt)
-    env = make_task(identity['task_id'], identity['robot_id'], {**stage_task_config(stage), 'max_episode_steps': limit})
+    env = make_task(identity['task_id'], identity['robot_id'],
+                    {**(stage_task_config(stage) if config is None else config), 'max_episode_steps': limit})
     try:
         raw = env.unwrapped
         commanded = hasattr(raw, 'set_command')
@@ -82,18 +84,19 @@ def rollout(stage, identity, policy, norm, scenario, seed, seconds, on_step=None
         env.close()
 
 
-def check_stage(stage, seconds=10., seeds=3, seed_start=73000, scenarios=SCENARIOS, acting=None):
+def check_stage(stage, seconds=10., seeds=3, seed_start=73000, scenarios=SCENARIOS, acting=None, config=None):
     """acting: (policy, norm) that act in the stage's environment instead of its own (an export folder's
-    export_g1.ExportedPolicy as both); σ stays the stage's training noise."""
+    export_g1.ExportedPolicy as both); σ stays the stage's training noise. config (with acting): the task_config they
+    act in instead of the stage's, the stage giving only the identity (Unitree v0); then no σ (policy_std None)."""
     from .evaluation.scenarios import get_scenario
     identity = checkpoint_identity(read_json(Path(stage) / 'metadata.json'))
-    policy, norm = load_stage(stage)
+    policy, norm = (None, None) if config is not None and acting else load_stage(stage)
     actor, normalizer = acting or (policy, norm)
     result = {}
     try:
         for name in scenarios:
             scenario = get_scenario(name)
-            rows = [rollout(stage, identity, actor, normalizer, scenario, seed, seconds)
+            rows = [rollout(stage, identity, actor, normalizer, scenario, seed, seconds, config=config)
                     for seed in range(seed_start, seed_start + seeds)]
             falls = [r['fell_at'] for r in rows if r['fell_at'] is not None]
             result[name] = dict(
@@ -106,9 +109,11 @@ def check_stage(stage, seconds=10., seeds=3, seed_start=73000, scenarios=SCENARI
                 clipped=float(np.mean([r['clipped'] for r in rows])),
                 torso_lean_deg=None if rows[0]['torso_lean_deg'] is None else float(np.mean([r['torso_lean_deg'] for r in rows])))
         # Training noise of the policy: with actions clipped to ±1 an exploding std means random bang-bang.
-        std = float(np.exp(policy.policy.log_std.detach().cpu().numpy()).mean()) if hasattr(policy.policy, 'log_std') else None
+        std = (float(np.exp(policy.policy.log_std.detach().cpu().numpy()).mean())
+               if policy is not None and hasattr(policy.policy, 'log_std') else None)
     finally:
-        norm.close()
+        if norm is not None:
+            norm.close()
     return dict(stage=int(Path(stage).name[6:]), seconds=seconds, seeds=seeds, policy_std=std, scenarios=result)
 
 

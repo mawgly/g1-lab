@@ -89,8 +89,10 @@ def run(job):
 
 
 def label(stage):
-    """exp-xxxxxxxx:steps of a stage folder."""
+    """exp-xxxxxxxx:steps of a stage folder, the folder's name of an export."""
     stage = Path(stage)
+    if (stage / 'policy.onnx').is_file():
+        return stage.name
     return f'{stage.parent.name[:12]}:{int(stage.name[6:])}'
 
 

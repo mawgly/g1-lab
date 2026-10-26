@@ -86,7 +86,12 @@ def make_learner(config, stage=None):
             from .symmetry import Mirror
             mirror = Mirror(base.envs[0])
         bounds = range_bounds(base.envs[0].unwrapped) if config.get('range_bounds') else None
-        learner = TensorPPO(model, env, config, norm, mirror=mirror, bounds=bounds)
+        amp = None
+        if getattr(env, 'amp_weight', 0.):  # g1_getup's amp reward weight: the AMP discriminator (getup_amp)
+            from .getup_amp import GetupAMP, load_library
+            amp = GetupAMP(env.amp_weight, load_library(env.amp_library), env.device, env.amp_joints, stage=stage)
+            print(f'AMP: {amp.status}', flush=True)
+        learner = TensorPPO(model, env, config, norm, mirror=mirror, bounds=bounds, amp=amp)
         return learner, export
     except BaseException:
         base.close()
@@ -112,9 +117,12 @@ def train_full_gpu(args, config):
             logger = configure(str(session), ['stdout', 'csv'])
             model.set_logger(logger)
             # training_state: the worlds' state each stage keeps (g1_getup: assist forces); None for other tasks.
+            # extras: the AMP discriminator's amp.pt in every stage (g1_getup with the amp weight).
+            amp = getattr(learner, 'amp', None)
             callback = StageCallback(run, config['every'], model.num_timesteps + config['steps'], duration,
                                      getattr(args, 'parent_stop', None),
-                                     training_state=getattr(learner.env, 'training_state', None))
+                                     training_state=getattr(learner.env, 'training_state', None),
+                                     extras=None if amp is None else amp.save)
             callback.init_callback(model)
             callback.initial_steps = model.num_timesteps
             parameters = {key: config.get(key) for key in ('learning_rate', 'n_steps', 'batch_size', 'n_epochs',
@@ -128,7 +136,8 @@ def train_full_gpu(args, config):
                 'parameters': parameters, 'backend': 'full_gpu', 'physics_variant': 'MuJoCo Warp Newton',
                 'pipeline': 'CUDA physics, normalization, rollout buffers and PPO; CPU checkpoint evaluation',
                 'versions': {name: version(name) for name in ('mujoco', 'gymnasium', 'stable-baselines3', 'numpy', 'torch')},
-                'duration_seconds': duration, 'device': torch.cuda.get_device_name()})
+                'duration_seconds': duration, 'device': torch.cuda.get_device_name(),
+                **({} if amp is None else {'amp': amp.describe()})})
 
             def snapshot():
                 learner.normalizer.export_normalizer(export)

@@ -1,4 +1,5 @@
-"""English and Chinese for the lab's own Russian text (the «Дневник» journal, branch names, branch notes) and for
+"""English and Chinese for the lab's own Russian text (the «Дневник» journal, the home page's data, branch names,
+branch notes) and for
 interface strings the catalogs humanoid_sim/web/i18n/{en,zh}.json do not have yet.
 
 Only what is new or changed gets translated. The unit of lab text is a paragraph (text between blank lines, as the
@@ -121,10 +122,12 @@ def glossary():
 
 
 def texts(root):
-    """Every Russian text the browser shows from the lab's own files: journal, branch names, current notes."""
-    from . import journal
+    """Every Russian text the browser shows from the lab's own files: journal, the home page's data (home.json),
+    branch names, current notes."""
+    from . import home, journal
     found = []
     i18n.map_journal(journal.load(root), lambda text, kind, field: found.append(text) or text)
+    found += home.texts(home.load(root))
     for path in sorted(Path(root).glob('exp-*/experiment.json')):
         found.append((read_json(path, {}) or {}).get('name'))
     for note in (read_json(Path(root) / 'notes.json', {}) or {}).values():

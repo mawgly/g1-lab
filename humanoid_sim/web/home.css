@@ -1,6 +1,6 @@
 /* The home page (site.html): the layout of its sections on top of site.css. */
 main [id] {
-  scroll-margin-top: 76px;
+  scroll-margin-top: 88px; /* the sticky header (~67 px) and some air */
 }
 .page-nav {
   display: flex;
@@ -74,6 +74,112 @@ main [id] {
 }
 .clip-card.accent {
   border: 1.5px solid var(--accent);
+}
+/* «What the robot can do», built from the lab's data (home.js): one block per candidate; each number is a line in the
+   site's font (tabular figures, the value bolder) with where it comes from on a quiet grey line; a weak spot in red;
+   a card shows its first numbers and folds the rest under «Подробнее». */
+.candidate + .candidate {
+  margin-top: 48px;
+}
+.candidate-head {
+  margin-bottom: 20px;
+}
+.candidate-head h3 {
+  margin: 0 0 6px;
+  font-size: 21px;
+}
+.candidate-head p {
+  margin: 0 0 10px;
+  font-size: 14px;
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
+}
+.facts {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.facts.summary {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 8px 28px;
+  margin: 0;
+  font-size: 15px;
+}
+.facts .value {
+  font-weight: 700;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.facts .meta {
+  display: block;
+  margin-top: 1px;
+  font-size: 12.5px;
+  color: var(--ink-4);
+}
+.facts.summary .meta {
+  display: inline;
+  margin-left: 6px;
+}
+.facts .weak,
+.facts .weak .value {
+  color: var(--bad);
+}
+.facts .flag {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+/* Cards of a row as tall as the tallest, the clips the same height on top, «Подробнее» at the bottom. */
+.clips .clip-card {
+  display: flex;
+  flex-direction: column;
+}
+.clips .clip-card figcaption {
+  flex: 1;
+  gap: 4px;
+}
+.more {
+  margin-top: auto;
+  padding-top: 10px;
+  font-size: 14px;
+}
+.facts-card .more {
+  margin-top: 0;
+}
+#home-research h2 {
+  margin-bottom: 18px;
+}
+.research .text {
+  font-size: 15px;
+}
+.research .licence {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+.more summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--link);
+}
+.more[open] summary {
+  margin-bottom: 4px;
+}
+.facts-grid {
+  margin-top: 18px;
+  align-items: start;
+}
+.facts-card {
+  gap: 6px;
 }
 .grid.cards-270 {
   grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));

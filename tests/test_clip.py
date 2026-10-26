@@ -23,7 +23,7 @@ CYRILLIC = re.compile('[А-Яа-яЁё]')
 NEW = ('back', 'side_left', 'side_right', 'turn_left', 'turn_right', 'walk_turn', 'side_stop', 'push_back',
        'push_forward', 'push_left', 'push_right', 'push_walk')
 ARMS = ('arms_stand', 'arms_push', 'arms_walk', 'arms_poses')
-GETUP = ('getup_back', 'getup_front', 'getup_side')
+GETUP = ('getup_back', 'getup_front', 'getup_side', 'getup_track')
 HELD = ('arm_pose_stand', 'arm_pose_walk')
 HEIGHT = ('crouch_stand', 'crouch_walk')
 FAST = ('side_left_fast', 'side_right_fast')

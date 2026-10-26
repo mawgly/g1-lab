@@ -76,9 +76,11 @@ def list_stages(run_dir):
                   if p.is_dir() and all((p / name).is_file() for name in ('policy.zip', 'normalize.pkl', 'metadata.json')))
 
 
-def save_stage(run_dir, model, normalizer, training_state=None):
+def save_stage(run_dir, model, normalizer, training_state=None, extras=None):
     """training_state: what the environments keep of the training beyond the weights and the normalization, per world
-    ({key: [one value per world]}, g1_getup's assist forces), stored in metadata.json for a resumed run; None: none."""
+    ({key: [one value per world]}, g1_getup's assist forces), stored in metadata.json for a resumed run; None: none.
+    extras: extras(folder) writes more files of the stage into its pending folder (getup_amp's amp.pt), so they appear
+    with it; None: none."""
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     destination = run_dir / f'stage_{model.num_timesteps:012d}'
@@ -88,6 +90,8 @@ def save_stage(run_dir, model, normalizer, training_state=None):
     pending.mkdir()
     model.save(pending / 'policy.zip')
     normalizer.save(pending / 'normalize.pkl')
+    if extras is not None:
+        extras(pending)
     from .tasks.identity import task_identity
     config = read_json(run_dir / 'run_config.json', {})
     identity = task_identity(config.get('robot_id', 'humanoid'), config.get('task_id', 'humanoid_v5'),

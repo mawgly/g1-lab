@@ -268,6 +268,60 @@ def test_symmetric_export_is_the_mirrored_mean_and_mirror_equivariant(tmp_path):
         export(stage, tmp_path / 'both', np.zeros(29), symmetric=True)
 
 
+def run_onnx(path, obs, inputs=490):
+    session = onnxruntime.InferenceSession(str(path), providers=['CPUExecutionProvider'])
+    return np.concatenate([session.run(['actions'], {'obs': row[None, :inputs]})[0] for row in obs])
+
+
+def test_symmetric_walk_stands_as_the_plain_graph_bit_for_bit_and_walks_mirror_equivariant(tmp_path):
+    """--symmetric-walk: below the command threshold (turning included in the norm) the output is the plain graph's
+    bit for bit, also with the stand trim; at or above it the mirrored mean, so a mirrored walking input gives the
+    mirrored output (1e-5); check() samples both, half or more walking; not together with --symmetric."""
+    import onnx
+    stage = make_stage(tmp_path, LOCKED, gain=50.)
+    plain = export(stage, tmp_path / 'plain')['onnx']
+    result = export(stage, tmp_path / 'walk', symmetric_walk=True)
+    properties = onnx_properties(result['onnx'])
+    assert (properties['symmetric_walk'], properties['symmetric_walk_command']) == ('true', '[42, 45]')
+    assert result['symmetric_walk'] and 'symmetric' not in properties
+    assert '# symmetric_walk' in result['deploy'].read_text(encoding='utf-8').split('joint_ids_map')[0]
+    assert ExportedPolicy(tmp_path / 'walk').symmetric_walk
+    assert 'Gather' in {node.op_type for node in onnx.load(str(result['onnx'])).graph.node}
+    commands = np.array([[0., 0., 0.], [.09, 0., 0.], [0., -.05, .08], [0., 0., .099], [.11, 0., 0.], [0., 0., -.12],
+                         [.5, 0., .2], [0., .3, 0.], [-.5, 0., 0.], [0., 0., .5]] * 2)
+    standing = np.linalg.norm(commands, axis=1) < .1
+    obs = np.random.default_rng(5).normal(0, 1, (len(commands), 494)).astype(np.float32)
+    obs[:, 42:45] = commands
+    got, old = run_onnx(result['onnx'], obs), run_onnx(plain, obs)
+    assert np.array_equal(got[standing], old[standing])  # the standing branch is the plain graph's, bit for bit
+    config, env = stage_env(stage)
+    mirror = mirror_maps(env)
+    obs_index, obs_sign, action_index, action_sign = mirror
+    policy, norm = load_stage(stage)
+    try:
+        expected = np.array([reference_action(policy, norm, row, config, env, command=(42, 45), mirror=mirror,
+                                              walk_only=True) for row in obs])
+        np.testing.assert_allclose(got, expected, atol=1e-4, rtol=0)
+        assert np.abs(got[~standing] - old[~standing]).max() > 1e-3  # walking, the mean differs from π itself
+        mirrored = run_onnx(result['onnx'], obs[:, obs_index] * obs_sign)
+        np.testing.assert_allclose(mirrored[~standing], got[~standing][:, action_index] * action_sign, atol=1e-5,
+                                   rtol=0)
+    finally:
+        norm.close()
+        env.close()
+    verdict = check(stage, result['onnx'], samples=10, stride=2)
+    assert verdict['ok'] and 5 <= verdict['walking'] < 10, verdict
+    trim = np.full(29, .3)
+    trim[WRISTS] = 0.
+    trimmed, both = export(stage, tmp_path / 'trim', trim, {})['onnx'], export(stage, tmp_path / 'both', trim, {},
+                                                                              symmetric_walk=True)['onnx']
+    assert np.array_equal(run_onnx(both, obs)[standing], run_onnx(trimmed, obs)[standing])
+    np.testing.assert_allclose(run_onnx(both, obs)[~standing], got[~standing], atol=1e-6, rtol=0)
+    assert check(stage, both, samples=10, stride=2)['ok']
+    with pytest.raises(ValueError, match='Симметризация целиком и на ходу'):
+        export(stage, tmp_path / 'no', symmetric=True, symmetric_walk=True)
+
+
 KNEES = [3, 9]
 FLOORED = {**LOCKED, 'knee_floor': .061}
 
