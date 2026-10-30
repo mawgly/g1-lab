@@ -339,7 +339,8 @@ def test_package_takes_a_cmu_clip_with_the_acknowledgement_and_refuses_lafan1(tm
                 package.check_licence(folder)
         else:
             clip = package.check_licence(folder)
-            assert clip == dict(file='cmu-140_09-1-2', dataset='cmu', source='140_09.amc', frames=[1, 2])
+            assert clip == dict(file='cmu-140_09-1-2', dataset='cmu', source='140_09.amc', frames=[1, 2],
+                                datasets=['cmu'])
             note = package.track_clip_note(clip)
             assert package.CMU_ACKNOWLEDGEMENT in note and '140_09.amc' in note
     assert package.track_clip_note(None) == ''

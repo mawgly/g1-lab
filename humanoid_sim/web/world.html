@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="site-mode" content="live" />
+    <title>Модель мира · G1 Lab</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="site.css" />
+    <script type="module" src="world.js"></script>
+    <style>
+      /* This page only; the shared tokens and components are in site.css. */
+      .world-head {
+        padding-top: 44px;
+      }
+      .world-head h1 {
+        margin-bottom: 10px;
+      }
+      .chapters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 18px;
+        margin-top: 18px;
+      }
+      .world-part h2 {
+        margin-bottom: 8px;
+      }
+      .world-part .note {
+        margin-bottom: 18px;
+      }
+      .world-clip {
+        margin: 18px 0 6px;
+      }
+      .world-clip > img,
+      .world-clip .clip-player {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+      }
+      .world-clip .clip-player {
+        display: inline-block;
+        overflow: hidden;
+        vertical-align: top;
+      }
+      .world-clip figcaption {
+        font-size: 13px;
+        opacity: 0.75;
+        margin-top: 6px;
+      }
+      .world-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 14px 0 6px;
+        font-size: 15px;
+      }
+      .world-table th,
+      .world-table td {
+        text-align: left;
+        padding: 8px 10px;
+        border-bottom: 1px solid var(--line);
+      }
+      .world-table td.num {
+        font: 500 15px/1.2 'IBM Plex Mono', monospace;
+        white-space: nowrap;
+      }
+      .world-table tr.best td {
+        font-weight: 700;
+      }
+      .world-figures {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 14px;
+        margin-top: 18px;
+      }
+      .world-figures div {
+        border-top: 1px solid var(--line);
+        padding-top: 10px;
+        font-size: 14px;
+      }
+      .world-figures span {
+        display: block;
+        font: 700 30px/1.1 Manrope, sans-serif;
+        margin-bottom: 4px;
+      }
+      .world-steps {
+        margin: 10px 0 0;
+        padding-left: 22px;
+      }
+      .world-steps li {
+        margin-bottom: 6px;
+      }
+    </style>
+  </head>
+  <body>
+    <main id="top">
+      <section class="world-head wrap">
+        <h1>Модель мира</h1>
+        <p class="lead">
+          Модель мира — это нейросеть, которая выучивает, как двигается робот: по состоянию сейчас и команде моторам она
+          предсказывает, что будет в следующий миг. Внутри неё можно учить навыки, не трогая ни симулятор, ни робота.
+          Здесь я рассказываю, что у нас получилось, где она помогла и где нет.
+        </p>
+        <div class="world-figures">
+          <div><span>10 из 10</span>целей настоящая рука достала навыком, выученным только внутри модели мира</div>
+          <div><span>0,29°</span>ошибка модели мира настоящей руки на 0,2 с вперёд; у симулятора 1,77°</div>
+          <div><span>15 минут</span>записей настоящей руки хватило, чтобы построить её модель мира</div>
+        </div>
+        <nav class="chapters" aria-label="Главы">
+          <a href="#what">Что это и откуда</a><a href="#ladder">Как мы её проверяли</a><a href="#arm">Настоящая рука</a
+          ><a href="#skill">Навык на железе</a><a href="#g1">Где она не помогла</a><a href="#why">Вывод</a>
+        </nav>
+      </section>
+
+      <section class="world-part section wrap" id="what" aria-labelledby="what-title">
+        <h2 id="what-title">Что это и откуда</h2>
+        <p>
+          Обычно робот учится в симуляторе: тысячи его копий пробуют, падают и получают награду. Модель мира заменяет
+          симулятор выученной копией. У неё два плюса: она гладкая, поэтому через неё можно сразу посчитать, как поправить
+          движение, а не искать это пробами; и её можно выучить по записям настоящего робота, со всеми его люфтами и
+          трением, которых симулятор не знает.
+        </p>
+        <p>
+          Идею мы взяли из работы SuperMimic (Калифорнийский университет в Беркли, 2026): там политика гуманоида Unitree G1
+          училась следовать человеческим движениям через модель мира за 1,2 часа, а обычный способ (PPO) за 18 часов не
+          догнал. Кода у них нет, нашу модель мы построили по описанию в статье.
+        </p>
+      </section>
+
+      <section class="world-part section wrap" id="ladder" aria-labelledby="ladder-title">
+        <h2 id="ladder-title">Как мы её проверяли</h2>
+        <p class="note">
+          От простого к сложному: сначала рука в симуляции, потом ходьба G1, потом вставание. Ошибка — насколько модель
+          ошибается за 8 шагов (0,16 с) по сравнению с тем, как сильно меняется само движение; порог для всех 0,02.
+        </p>
+        <table class="world-table">
+          <thead>
+            <tr><th>Что предсказывает модель</th><th>Ошибка</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Рука SO-101 в симуляции</td><td class="num">0,0177</td></tr>
+            <tr><td>Ходьба G1, одна модель</td><td class="num">0,0102</td></tr>
+            <tr class="best"><td>Ходьба G1, ансамбль из трёх моделей</td><td class="num">0,0081</td></tr>
+            <tr><td>Вставание G1 по записи человека</td><td class="num">0,0177</td></tr>
+          </tbody>
+        </table>
+        <p>
+          Самая полезная находка — разбирать ошибку по суставам. Долго казалось, что модели не хватает размера или данных,
+          а оказалось, что почти всю ошибку давали четыре заблокированных запястья, которые просто мелко дрожат на месте.
+        </p>
+      </section>
+
+      <section class="world-part section wrap" id="arm" aria-labelledby="arm-title">
+        <h2 id="arm-title">Настоящая рука</h2>
+        <p class="note">
+          Я собрал руку SO-101 (6 моторов STS3215) и записал 15 минут её движений по всему рабочему объёму. Потом сравнил,
+          кто точнее предскажет руку на 0,2 с вперёд: наш симулятор MuJoCo или модель мира, выученная по этим записям.
+        </p>
+        <figure class="world-clip">
+          <img data-media="world-model-real-so101-clip.webp" data-poster="world-model-real-so101-clip-poster.webp" alt="Настоящая рука SO-101 делает плавные случайные движения" loading="lazy" />
+          <figcaption>Настоящая SO-101 делает плавные случайные движения для записи.</figcaption>
+        </figure>
+        <table class="world-table">
+          <thead>
+            <tr><th>Копия руки</th><th>Ошибка за 0,2 с</th></tr>
+          </thead>
+          <tbody>
+            <tr class="best"><td>Модель мира по 15 минутам записей</td><td class="num">0,29°</td></tr>
+            <tr><td>MuJoCo, как он есть</td><td class="num">1,77°</td></tr>
+            <tr><td>«Рука стоит на месте»</td><td class="num">3,26°</td></tr>
+          </tbody>
+        </table>
+        <p>
+          Симулятор ошибался потому, что его моторы в 30–60 раз жёстче настоящих: настоящая рука мягкая и отстаёт от
+          команды. Подгонкой параметров моторов симулятор можно сильно улучшить, но модель мира всё равно точнее.
+        </p>
+      </section>
+
+      <section class="world-part section wrap" id="skill" aria-labelledby="skill-title">
+        <h2 id="skill-title">Навык на железе</h2>
+        <p class="note">
+          Навык «дотянуться до точки» я выучил только внутри модели мира руки: без симулятора в обучении и без подстройки
+          на самой руке. Потом запустил его на настоящей руке.
+        </p>
+        <figure class="world-clip">
+          <img data-media="so101-reach-10-of-10-clip.webp" data-poster="so101-reach-10-of-10-clip.jpg" alt="Навык руки в подогнанной симуляции и в модели мира" loading="lazy" />
+          <figcaption>Итоговая версия навыка до запуска на руке: слева подогнанная симуляция, справа модель мира руки, зелёный шарик — цель.</figcaption>
+        </figure>
+        <ol class="world-steps">
+          <li>
+            Первая попытка: у цели рука дрожала, и я выключил питание. Награда не запрещала рывки, а скорость суставов на
+            настоящей руке шумная, в модели же она гладкая.
+          </li>
+          <li>
+            Исправил: цель меняется не быстрее, чем в записях; команды сглаживаются; рывки штрафуются; попадание только
+            когда рука замерла; при обучении в скорость добавлен шум, как у настоящих датчиков.
+          </li>
+          <li>
+            Итог: 10 целей из 10, рука замирает в 0,3–1,2 см от цели за 0,8–3,6 с. Расстояние пока считаю по углам
+            суставов, камеры нет — погрешность около 1 см.
+          </li>
+        </ol>
+        <p>Теперь перед каждым запуском на железе я сначала смотрю ролик навыка в симуляции и в модели.</p>
+      </section>
+
+      <section class="world-part section wrap" id="g1" aria-labelledby="g1-title">
+        <h2 id="g1-title">Где она не помогла</h2>
+        <p class="note">
+          Я проверил, может ли G1 научиться ходить с нуля только внутри модели мира. 12 раундов: робот ходит в
+          симуляторе, модель доучивается на этих записях, политика учится дальше — 12,3 млн шагов, около 6 часов.
+        </p>
+        <figure class="world-clip">
+          <img data-media="wm-walk-12-rounds-clip.webp" data-poster="wm-walk-12-rounds-clip.jpg" alt="Ходьба G1: PPO рядом с политикой из модели мира" loading="lazy" />
+          <figcaption>Команда «вперёд 0,5 м/с»: слева кандидат 8 (PPO) идёт 0,48 м/с, справа политика, выученная через модель мира, — 0,35 м/с.</figcaption>
+        </figure>
+        <p>
+          Падать он перестал, но ходит осторожно и медленно, а на 1 м/с просто стоит. Тот же путь обычным способом
+          проходится за минуты: наш симулятор на видеокарте считает около 50 тысяч шагов в секунду и сам по себе точен.
+          Вставание по записи человека через модель мира за час тоже не получилось: робот держался до 3,7 с, а до конца
+          движения не доходил.
+        </p>
+      </section>
+
+      <section class="world-part section wrap" id="why" aria-labelledby="why-title">
+        <h2 id="why-title">Вывод</h2>
+        <p>
+          Модель мира нужнее всего там, где каждый опыт дорог: на настоящем роботе. Схема, которую мы прошли на руке
+          целиком: записал робота → построил его модель мира → выучил навык внутри неё → запустил на железе.
+        </p>
+        <p>
+          Для G1 в симуляции она сама по себе не нужна — быстрый и точный симулятор справляется лучше. Её место будет,
+          когда появится настоящий G1: дообучать навыки, выученные в симуляции, под конкретного робота.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

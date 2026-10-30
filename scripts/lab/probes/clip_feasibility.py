@@ -16,11 +16,15 @@ Is a g1_getup track clip (runs/humanoid_lab/getup_track/<clip>.npz) physically d
   locked wrists' (target home) are printed, not judged;
 - the floor's normal force on each hand (the wrist links' geoms: Unitree's rubber hand capsules), N;
 - the noise of the accelerations: RMS of the raw q̈ about its average over ±ACCEL_SMOOTH frames (LAFAN 8, the CMU clips
-  of iteration 64-66 54-76 rad/s²), and the fastest joint.
+  of iteration 64-66 54-76 rad/s²), and the fastest joint;
+- the penetration between two parts of the robot (iteration 79, the critic's lab-critic/it79 clippen79.py): the deepest
+  MuJoCo contact between two robot geoms (the floor left out), the frames deeper than SELF_DEEP (1 cm) and their body
+  pairs (BONES A473 v2 from the back: the right hand 85 of 238 frames into hip_yaw / hip_roll, up to 9.2 cm).
 
 Verdict «годен» (the lead's criteria, iteration 67): the centre of mass at most COM_OUTSIDE (5 cm) outside the support,
 the residual at most RESIDUAL_FORCE (0.05 m·g) and moment m·g·RESIDUAL_ARM (5 cm) in every frame, no driven joint
-needing more than it has (ratio ≤ 1). Prints a summary per clip, side by side, and a timeline every --timeline seconds
+needing more than it has (ratio ≤ 1). A penetration deeper than SELF_DEEP is a warning beside the verdict (summary
+warnings), not a reason: the lead decides. Prints a summary per clip, side by side, and a timeline every --timeline seconds
 (support by body group, the centre of mass margin, the residual, the worst joint, the hands' loads); --json writes
 every frame. About 2 s a clip.
 """
@@ -51,6 +55,8 @@ TORQUE_PASSES = 3  # the forces solved again with each joint's cost by what it h
 FORCE_COST = 1e-3  # per m·g: the floor forces' own small cost (the solution with the least force)
 HAND_LOAD = 150.  # N on one hand: the most a rubber hand should carry (the lead, iteration 67)
 WAIST_FREE = ('waist',)  # joints (name parts) the second verdict leaves out of the torque rule
+SELF_DEEP = .01  # m: a contact between two robot geoms deeper than this is a penetration (a warning)
+SELF_PAIRS = 4  # the pairs the summary names, by their frames deeper than SELF_DEEP
 GROUPS = (('ankle', 'foot'), ('wrist', 'hand'), ('knee', 'knee'), ('elbow', 'elbow'), ('shoulder', 'arm'),
           ('hip', 'thigh'))
 
@@ -181,6 +187,24 @@ def frame_support(model, data, env, floor, robot, soles, touch):
     return out
 
 
+def self_penetration(model, data, robot, deep=SELF_DEEP):
+    """(the deepest penetration between two robot geoms, m ≥ 0; {(body, body): depth} of the pairs deeper than deep,
+    the bodies' names without _link, sorted) of data's contacts (after mj_forward or mj_collision; with the robot geoms'
+    margin 0 MuJoCo reports only the touching pairs). robot: the robot geoms' mask, so the floor is left out."""
+    depth, pairs = 0., {}
+    contact = data.contact
+    for c in range(data.ncon):
+        g1, g2 = int(contact.geom1[c]), int(contact.geom2[c])
+        if not (robot[g1] and robot[g2]):
+            continue
+        dist = -float(contact.dist[c])
+        depth = max(depth, dist)
+        if dist > deep:
+            key = tuple(sorted(model.body(model.geom_bodyid[g]).name.removesuffix('_link') for g in (g1, g2)))
+            pairs[key] = max(pairs.get(key, 0.), dist)
+    return depth, pairs
+
+
 class FrameChecker:
     """The per-frame check on env (a G1VelocityEnv of the getting-up model): its own model copies (the floor's margin
     at touch; the constraints off for the inverse dynamics)."""
@@ -228,6 +252,7 @@ class FrameChecker:
         data.qpos[:], data.qvel[:] = row, 0.
         mujoco.mj_forward(model, data)
         support = frame_support(model, data, env, self.floor, self.robot, self.soles, self.touch)
+        self_depth, self_pairs = self_penetration(model, data, self.robot)
         columns, owners = [], []
         for point, body, mu, _ in support:
             mujoco.mj_jac(model, data, self.jacp, None, point, body)
@@ -268,7 +293,7 @@ class FrameChecker:
         return dict(com_margin=margin(com, polygon), residual_force=float(np.linalg.norm(residual[:3]) / self.weight),
                     residual_moment=float(np.linalg.norm(residual[3:]) / self.weight), torque=torque, have=have,
                     ratio=ratio, hands=hands, load=load, support=[(p, b) for p, b, *_ in support], forces=forces,
-                    qd=qd)
+                    qd=qd, self_depth=self_depth, self_pairs=self_pairs)
 
 
 def check_clip(clip, env=None, touch=TOUCH, lower=True, static=False):
@@ -306,7 +331,8 @@ def check_clip(clip, env=None, touch=TOUCH, lower=True, static=False):
             hands=[round(h, 1) for h in f['hands']],
             load={key: round(v / weight, 2) for key, v in f['load'].items() if v > 1.},
             torque=torque.round(2).tolist(), have=have.round(2).tolist(), qd_max=float(np.abs(qd).max()),
-            qd_joint=names[int(np.argmax(np.abs(qd)))]))
+            qd_joint=names[int(np.argmax(np.abs(qd)))], self_depth=f['self_depth'],
+            self_pairs={'-'.join(key): round(v, 4) for key, v in f['self_pairs'].items()}))
     summary = summarize(rows, names, noise, *accel, locked, peak)
     summary.update(float_max=float(lowest.max()), float_frames=int((lowest > touch).sum()), lowered=bool(lower),
                    static=bool(static))
@@ -374,7 +400,30 @@ def summarize(rows, names, noise, accel_rms, accel_max, locked, peak):
         balance.append(f'момент {names[joint]} {abs(torque[at, joint]):.0f} при доступных {have[at, joint]:.0f} Н·м '
                        f'({times[at]:.2f} с)')
     summary.update(feasible=not reasons, reasons=reasons, feasible_waist_free=not balance, reasons_waist_free=balance)
+    summary.update(self_penetration_summary(rows, times))
     return summary
+
+
+def self_penetration_summary(rows, times):
+    """The summary's penetration between robot parts of check_clip's rows: self_deep_frames (deeper than SELF_DEEP),
+    self_depth_max (m) and its time, self_pairs {pair: [frames, first s, last s, deepest m]} of the SELF_PAIRS pairs
+    with the most such frames, warnings (Russian; not reasons, the verdict is unchanged)."""
+    depth = np.array([r.get('self_depth', 0.) for r in rows])
+    pairs = {}
+    for t, r in zip(times, rows):
+        for key, value in r.get('self_pairs', {}).items():
+            frames, first, _, deepest = pairs.get(key, (0, float(t), 0., 0.))
+            pairs[key] = [frames + 1, first, float(t), max(deepest, value)]
+    named = dict(sorted(pairs.items(), key=lambda item: -item[1][0])[:SELF_PAIRS])
+    deep = int((depth > SELF_DEEP).sum())
+    out = dict(self_deep_frames=deep, self_depth_max=float(depth.max()) if len(depth) else 0.,
+               self_depth_at=float(times[int(np.argmax(depth))]) if len(depth) else 0., self_pairs=named, warnings=[])
+    if deep:
+        out['warnings'].append(
+            f'проникновение между частями робота: {deep} кадров глубже {SELF_DEEP * 100:.0f} см, до '
+            f'{out["self_depth_max"] * 100:.1f} см ({out["self_depth_at"]:.2f} с; '
+            + ', '.join(f'{key} {v[0]}' for key, v in named.items()) + ')')
+    return out
 
 
 def run(job):
@@ -389,10 +438,13 @@ def run(job):
 
 
 def verdict_text(summary, waist_free=False):
-    """«годен» or «не годен: <reasons>»; waist_free: the verdict without the waist's torque rule."""
+    """«годен» or «не годен: <reasons>», then «; предупреждение: <warnings>» if any; waist_free: the verdict without
+    the waist's torque rule."""
+    warned = ''.join(f'; предупреждение: {w}' for w in summary.get('warnings', ()))
     if waist_free:
-        return 'годен' if summary['feasible_waist_free'] else 'не годен: ' + '; '.join(summary['reasons_waist_free'])
-    return 'годен' if summary['feasible'] else 'не годен: ' + '; '.join(summary['reasons'])
+        return ('годен' if summary['feasible_waist_free'] else 'не годен: ' + '; '.join(summary['reasons_waist_free'])) \
+            + warned
+    return ('годен' if summary['feasible'] else 'не годен: ' + '; '.join(summary['reasons'])) + warned
 
 
 def print_summary(results):
@@ -420,6 +472,10 @@ def print_summary(results):
         ('шум ускорений, рад/с² (сигнал rms / max)',
          lambda s: f'{s["noise"]:.1f} ({s["accel_rms"]:.1f} / {s["accel_max"]:.0f})'),
         ('скорость суставов max, рад/с', lambda s: f'{s["qd_max"]:.1f} ({s["qd_joint"]})'),
+        (f'проникновение между частями робота: кадров глубже {SELF_DEEP * 100:.0f} см / max, см / какие пары',
+         lambda s: f'{s["self_deep_frames"]} / {s["self_depth_max"] * 100:.1f} ({s["self_depth_at"]:.2f} с) / '
+                   + (', '.join(f'{k} {v[0]} кадров {v[1]:.2f}–{v[2]:.2f} с' for k, v in s['self_pairs'].items())
+                      or '—')),
     ]
     print('Выполнимость клипа (без физики): ' + ' | '.join(r['clip'] for r in results))
     for title, value in lines:

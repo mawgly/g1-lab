@@ -20,6 +20,8 @@ def getup_metrics(initial: dict, final: dict, terminated: bool) -> dict:
                    head_m=final.get('head_height'), start_class=initial.get('start_class'))
     if 'track_done' in final:
         metrics['track_done'] = bool(final['track_done'])
+    if 'track_clip_index' in initial:  # track_clips: which clip the episode followed
+        metrics['track_clip_index'] = int(initial['track_clip_index'])
     if 'settle_done' in final:
         metrics.update(success=bool(final['settle_done']), settle_done=bool(final['settle_done']),
                        settle_s=final.get('settle_seconds'), settle_target=final.get('settle_target'))

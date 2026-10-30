@@ -75,7 +75,11 @@ def test_settings_are_bounded_and_spelled_out():
                                      'pd_bound': None, 'stand_pose_std': .1, 'action_change_unbounded': False,
                                      'style_library': 'lafan1', 'style_judge': False, 'human_starts': None,
                                      'stance_pelvis': .5, 'hip_roll_out': None, 'track_clip': None,
-                                     'settle_clip': None}
+                                     'settle_clip': None, 'track_starts': None, 'track_noise': 1.,
+                                     'track_bank_classes': None, 'track_bank_nearest': False,
+                                     'track_sampling': None, 'track_clips': None, 'track_end_reach': None,
+                                     'track_weights': None, 'track_handover_starts': None, 'settle_success': None,
+                                     'settle_starts': None}
     assert G1_GETUP_REWARD_WEIGHTS == dict(head=1., upright=.5, stand=1., stand_pose=.5, stand_still=1., effort=2e-5,
                                            joint_speed=1e-4, action_change=.01, joint_limits=1., impact=0.,
                                            sole_impact=0., stance_width=0., arm_press=0., style=0., head_rise=0.,

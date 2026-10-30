@@ -38,7 +38,10 @@ Every scenario but getup starts the same way (Passive -> FixStand on the band ->
              the push, once on its front without one). --fall stand: the usual start, then standing in Velocity
              --fall-push pushes it (needed here; 24.10: forward from 1.5 m/s on its front, back or sideways as
              pushed) and --fall-passive s after the push LT + B (Passive, limp), unless Velocity's tilt check went
-             there first; without --fall-passive only a fall gets it to Passive
+             there first; without --fall-passive only a fall gets it to Passive. With --chain-log (run.sh
+             --getup-track, the getting-up chain of g1_ctrl-getupchain.patch) GetUp hands over by itself; the
+             scenario follows g1_ctrl's log (events handover, track, chain_left) and presses RT + A --track-seconds
+             after GetUpTrack's entry, or at --getup-seconds if it never comes
 --ry holds the right stick's vertical axis (-1..1, down negative: a crouch) through the commanded part of the other
 scenarios (walk: while walking); segments with the stick down are named <name>@<height> (the standing height; the
 patch keeps a walk at 0.70 m or above).
@@ -50,6 +53,7 @@ pose's keys.
 
 import argparse
 import os
+import re
 import struct
 import time
 from pathlib import Path
@@ -96,6 +100,13 @@ PUSH_DV = {'weak': 0.5, 'strong': 1.0}
 PUSH_BASE = 0.5  # m/s, a push key without modifiers
 PUSH_MODIFIERS = (('Ctrl', 0.25), ('Shift', 0.5), ('Alt', 1.0))  # m/s each adds (the patch's user_key_cb)
 PUSH_LEAD = 3.0  # s of walking before the first push of `push --push-walking`
+# The getting-up chain (g1_ctrl-getupchain.patch): its states and g1_ctrl's lines for its changes; the log is read
+# every CHAIN_POLL s.
+CHAIN_STATES = ('GetUp', 'GetUpBlend', 'GetUpTrack')
+CHAIN_HANDOVER = 'FSM: Change state from GetUp to GetUpBlend'
+CHAIN_TRACK = 'FSM: Change state from GetUpBlend to GetUpTrack'
+CHAIN_CHANGE = re.compile(r'FSM: Change state from (\w+) to (\w+)')
+CHAIN_POLL = 0.05
 
 
 def push_modifiers(dv):
@@ -446,7 +457,11 @@ class Scenario:
         self.mark('lying')
         time.sleep(args.lie_seconds)
         self.combo(AXIS_LT, lambda on: self.pad.axis(AXIS_DY, AXIS_MAX if on else 0), 'getup')
-        time.sleep(args.getup_seconds)
+        if args.chain_log:  # the getting-up chain: RT + A --track-seconds after GetUpTrack's entry
+            if self.wait_chain(Path(args.chain_log), time.monotonic() + args.getup_seconds):
+                time.sleep(args.track_seconds)
+        else:
+            time.sleep(args.getup_seconds)
         if args.getup_velocity:
             self.velocity('velocity_after_getup')
             for name, vx, seconds in (('stand', 0., args.stand_seconds), ('walk', args.walk, args.walk_seconds),
@@ -459,6 +474,28 @@ class Scenario:
             self.fixstand('fixstand')
             time.sleep(3.0)
         self.mark('end')
+
+    def wait_chain(self, log, deadline):
+        """getup with --chain-log (run.sh --getup-track): follows g1_ctrl's log until GetUpTrack is entered or the
+        deadline (time.monotonic) passes; marks `handover` (GetUp -> GetUpBlend), `track` (GetUpBlend -> GetUpTrack) or
+        `chain_left` (a chain state to another, e.g. Passive), each once. True once GetUpTrack is entered."""
+        marks = ((CHAIN_HANDOVER, 'handover'), (CHAIN_TRACK, 'track'))
+        seen = set()
+        while time.monotonic() < deadline:
+            text = log.read_text(encoding='utf-8', errors='replace') if log.exists() else ''
+            for line, name in marks:
+                if line in text and name not in seen:
+                    seen.add(name)
+                    self.mark(name)
+            if 'track' in seen:
+                return True
+            left = [m for m in CHAIN_CHANGE.finditer(text) if m.group(1) in CHAIN_STATES
+                    and m.group(2) not in CHAIN_STATES]
+            if left:
+                self.mark('chain_left', left[0].group(2))
+                return False
+            time.sleep(CHAIN_POLL)
+        return False
 
     def passive(self, args):
         """Velocity -> Passive (LT + B.on_pressed: kp 0, kd 3), then the way back: band on, FixStand, Velocity."""
@@ -513,6 +550,12 @@ def main():
     parser.add_argument('--lie-seconds', type=float, default=5.0, help='getup: seconds lying in Passive before GetUp')
     parser.add_argument('--getup-seconds', type=float, default=12.0,
                         help='getup: seconds after LT + down (before RT + A or LT + up)')
+    parser.add_argument('--chain-log', help='getup, the getting-up chain (run.sh --getup-track gives it): g1_ctrl\'s '
+                                            'log; RT + A (or LT + up) --track-seconds after GetUpTrack\'s entry, or '
+                                            'at --getup-seconds after LT + down without it')
+    parser.add_argument('--track-seconds', type=float, default=6.6,
+                        help='getup with --chain-log: seconds in GetUpTrack before RT + A (run.sh: the clip\'s rest '
+                             'from the hand-over frame plus 1.5)')
     parser.add_argument('--getup-fixstand', action='store_true', help='getup: then LT + up, GetUp -> FixStand')
     parser.add_argument('--getup-velocity', action='store_true',
                         help='getup: then RT + A, GetUp -> Velocity: stand --stand-seconds, walk --walk m/s '

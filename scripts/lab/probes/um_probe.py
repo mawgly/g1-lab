@@ -76,7 +76,12 @@ def apply_physics(raw, physics):
     raw.motors = None
     if physics == 'nomotor':
         return
-    fresh, _ = load_model(foot_collision=raw.foot_collision)  # the stage's geoms (task_config foot_collision)
+    # the stage's geoms (task_config foot_collision, hand_collision, terrain's tiles)
+    from humanoid_sim.tasks.config import terrain_generator, terrain_seed
+    terrain = getattr(raw, 'terrain', None)
+    fresh, _ = load_model(foot_collision=raw.foot_collision, hand_collision=raw.hand_collision,
+                          terrain=terrain is not None, terrain_seed=terrain_seed(terrain),
+                          terrain_generator=terrain_generator(terrain))
     raw.model.dof_armature[:] = fresh.dof_armature
     raw.model.dof_damping[:] = fresh.dof_damping
     raw.model.dof_frictionloss[:] = fresh.dof_frictionloss

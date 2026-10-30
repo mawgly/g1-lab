@@ -36,6 +36,15 @@ horizontal speed over the step, squared and summed over the feet in contact (tas
 reference's yaw and offset, the starts of task.TRACK_START_SHARES drawn at its reset (noisy ones raised out of the floor
 by their deepest contact, read from Warp's contact distances), the tracking reward, terminations and critic inputs of
 g1_tensor_math, every substep's contact forces decoded for self_contact and the hands' floor force (_clip_step).
+task_config track_sampling (iteration 77, SuperMimic's bins): the RSI starts' frames drawn from the clip's bins by
+task.TrackBinSampler (its own generator; the task's draws as before), each bin's normalized discounted return estimated
+from the episodes started there; the CUDA task only (the CPU task keeps its uniform RSI).
+task_config track_clips (iteration 78): many clips in one set of tensors (frames laid one after another, each clip's
+first row clips_start), a clip per world (clip_index; clip_last and clip_end per world), no graph recaptured; the bank
+starts' nearest clip frames in a table made once per bank row (_nearest_rows); the critic sees the reference ahead.
+task_config track_handover_starts (iteration 83): a share of the training resets starts a world from a row of the CPU
+task's hand-over bank (no noise, the actions in flight its row's, the clock at the bank's frame, a longer grace), drawn
+with a generator of its own, so the other starts are the old ones bit for bit.
 task_config settle_clip (iteration 66): settling into the nearest of the clips' first frames from the bank's fall
 classes (task.SETTLE_CLASSES): per world the success clock, its time and target, the settling reward of g1_tensor_math
 and the same contact decode (_settle_step); no assist.
@@ -56,8 +65,13 @@ from .g1_tensor_env import ENCODER_BIAS, TensorG1Env
 from .tasks import g1_getup_style
 from .tasks import g1_tensor_math as task
 from .tasks.config import G1_GETUP_DEFAULTS, G1_GETUP_PROFILE
-from .tasks.g1_getup import EPISODE_STEPS, HUMAN_START_STREAM, SETTLE_STEPS, G1GetupEnv, saved_bounds
+from .tasks.g1_getup import (EPISODE_STEPS, HANDOVER_START_STREAM, HUMAN_START_STREAM, SETTLE_STEPS, G1GetupEnv,
+                             saved_bounds)
 from .tasks.g1_tensor_math import pd_torque
+
+# track_clips' table of the bank rows' nearest clip frames: at most this many float64 elements (rows × frames × free
+# joints, ~160 MB) per chunk of rows (64 clips of ~250 frames: ~50 rows a chunk, the back's 12 000 training rows in ~1 s).
+NEAREST_CHUNK = 2e7
 
 
 def floor_entries(reference, impact, sole_impact):
@@ -91,13 +105,27 @@ class TensorG1GetupEnv(TensorG1Env):
                  human_starts=G1_GETUP_DEFAULTS['human_starts'], human_bank=None,
                  stance_pelvis=G1_GETUP_DEFAULTS['stance_pelvis'], hip_roll_out=G1_GETUP_DEFAULTS['hip_roll_out'],
                  track_clip=G1_GETUP_DEFAULTS['track_clip'], track_bank=None,
-                 settle_clip=G1_GETUP_DEFAULTS['settle_clip'], settle_bank=None):
+                 settle_clip=G1_GETUP_DEFAULTS['settle_clip'], settle_bank=None,
+                 track_starts=G1_GETUP_DEFAULTS['track_starts'], track_noise=G1_GETUP_DEFAULTS['track_noise'],
+                 track_bank_classes=G1_GETUP_DEFAULTS['track_bank_classes'],
+                 track_bank_nearest=G1_GETUP_DEFAULTS['track_bank_nearest'],
+                 track_sampling=G1_GETUP_DEFAULTS['track_sampling'],
+                 track_clips=G1_GETUP_DEFAULTS['track_clips'], track_clips_bank=None,
+                 track_end_reach=G1_GETUP_DEFAULTS['track_end_reach'],
+                 track_weights=G1_GETUP_DEFAULTS['track_weights'],
+                 track_handover_starts=G1_GETUP_DEFAULTS['track_handover_starts'], handover_bank=None,
+                 settle_success=G1_GETUP_DEFAULTS['settle_success'],
+                 settle_starts=G1_GETUP_DEFAULTS['settle_starts']):
         """The CPU task's settings (task_config: reward_weights, assist_force, action_delay, motor_friction,
         body_friction, pd_bound, stand_pose_std, action_change_unbounded, style_library, style_judge, human_starts,
-        stance_pelvis, hip_roll_out, track_clip, settle_clip; bank, human_bank, track_bank and settle_bank as
-        G1GetupEnv's); observation_noise and randomize as TensorG1Env's (tests switch them off to compare with the CPU
-        task)."""
+        stance_pelvis, hip_roll_out, track_clip, settle_clip, track_starts, track_noise, track_bank_classes,
+        track_bank_nearest, track_sampling (acted on here only), track_clips, track_end_reach, track_weights (the
+        reference's track_weights, read by _setup_clip and the sampler's G_max), track_handover_starts,
+        settle_success, settle_starts; bank,
+        human_bank, track_bank, settle_bank, track_clips_bank and handover_bank as G1GetupEnv's); observation_noise and
+        randomize as TensorG1Env's (tests switch them off to compare with the CPU task)."""
         self.clip = None  # track_clip's reference frames (set up at the end), None while off
+        self.clips_start = None  # track_clips: each clip's first frame in the frames laid one after another, None while off
         self.settle = None  # settle_clip's targets (set up at the end), None while off
         self._getup = dict(reward_weights=reward_weights, assist_force=assist_force, action_delay=action_delay,
                            motor_friction=motor_friction, body_friction=list(body_friction), pd_bound=pd_bound,
@@ -105,7 +133,13 @@ class TensorG1GetupEnv(TensorG1Env):
                            style_library=style_library, style_judge=style_judge, human_starts=human_starts,
                            human_bank=human_bank, stance_pelvis=stance_pelvis, hip_roll_out=hip_roll_out,
                            track_clip=track_clip, track_bank=track_bank, settle_clip=settle_clip,
-                           settle_bank=settle_bank)
+                           settle_bank=settle_bank, track_starts=track_starts, track_noise=track_noise,
+                           track_bank_classes=track_bank_classes, track_bank_nearest=track_bank_nearest,
+                           track_sampling=track_sampling, track_clips=track_clips, track_clips_bank=track_clips_bank,
+                           track_end_reach=track_end_reach, track_weights=track_weights,
+                           track_handover_starts=track_handover_starts, handover_bank=handover_bank,
+                           settle_success=settle_success, settle_starts=settle_starts)
+        self.sampler = None  # track_sampling's TrackBinSampler (set up with the clip), None while off
         if settle_clip is not None:  # settling episodes are shorter, as on the CPU task
             max_episode_steps = min(max_episode_steps, SETTLE_STEPS)
         super().__init__(n_envs, seed=seed, max_episode_steps=max_episode_steps, nconmax=nconmax, njmax=njmax,
@@ -287,12 +321,33 @@ class TensorG1GetupEnv(TensorG1Env):
         self._episodes = torch.zeros((), device=device)
         self._episodes_up = torch.zeros((), device=device)
         self._bad_states = torch.zeros((), device=device)
+        # track_handover_starts (iteration 83): the share of training resets that start from a hand-over row (None:
+        # off, nothing drawn), drawn with a generator of its own (seed + HANDOVER_START_STREAM), so the task's own
+        # stream stays the old one; the CPU task's hand-over bank on the device (_setup_handover).
+        self.handover_share = self.handover_qpos = None
         # track_clip (iteration 64): None while off (nothing set up, the task the old one).
         if ref.clip is not None:
             self._setup_clip()
+            if ref.track_handover is not None:
+                self._setup_handover()
+                self.handover_generator = torch.Generator(device=device).manual_seed(seed + HANDOVER_START_STREAM)
+            # track_clips (iteration 78): every clip on the device, a clip per world (None while off).
+            if ref.clips is not None:
+                self._setup_clips()
+            # track_sampling (iteration 77): the RSI starts' bins over the clip's frames (track_clips: every clip's, one
+            # table), drawn with a generator of its own (seed + TRACK_SAMPLING_STREAM); G_max from the kernel terms'
+            # weights.
+            if ref.track_sampling is not None:
+                frames = self.clip_last + 1 if ref.clips is None else [entry['last'] + 1 for entry in ref.clips]
+                self.sampler = task.TrackBinSampler(
+                    ref.track_sampling, frames, self.dt,
+                    sum(self.track_weights[key] for key in task.TRACK_SIGMA), n_envs, device, seed)
         # settle_clip (iteration 66): None while off (nothing set up, the task the old one).
         if ref.settle is not None:
             self._setup_settle()
+            # settle_starts (iteration 85): the target starts' draws from a generator of their own (seed +
+            # SETTLE_START_STREAM), so the task's own stream stays the old one; also there for set_target_starts.
+            self.settle_generator = torch.Generator(device=device).manual_seed(seed + task.SETTLE_START_STREAM)
 
     def _setup_settle(self):
         """settle_clip on the device: the CPU task's targets (pelvis gravity directions, joints), free joints, weights
@@ -315,9 +370,32 @@ class TensorG1GetupEnv(TensorG1Env):
         self.track_floor = int(ref.floor)
         self.hand_geoms = constant(ref.hand_geoms, torch.bool)
         bank = ref.bank
-        classes = [bank['classes'].index(kind) for kind in task.SETTLE_CLASSES if kind in bank['classes']]
-        self.training_rows = constant(np.flatnonzero(~bank['holdout'] & np.isin(bank['start_class'], classes)),
-                                      torch.long)
+        classes = [bank['classes'].index(kind) for kind in ref.settle_classes if kind in bank['classes']]
+        rows = np.flatnonzero(~bank['holdout'] & np.isin(bank['start_class'], classes))
+        if not len(rows):
+            raise ValueError('settle_starts: the bank has no training rows of these classes')
+        self.training_rows = constant(rows, torch.long)
+        # settle_success (iteration 85): the rule (None: the old one) and the free arm joints it bounds one by one.
+        self.settle_success = ref.settle_success
+        self.settle_arms = tuple(ref.settle_arms)
+        # settle_starts (iteration 85): the share of training resets from a target pose (None: off, nothing drawn), the
+        # targets' first frames, their noise multiple, the joint ranges a noisy start keeps, Warp's contact distances
+        # (the start's lift out of the floor).
+        self.settle_share = None if ref.settle_starts is None else ref.settle_starts['target']
+        self.settle_noise = 1. if ref.settle_starts is None else ref.settle_starts['noise']
+        self.settle_qpos = constant(ref.settle['qpos'])
+        self.range_low, self.range_high = constant(ref.range_low), constant(ref.range_high)
+        self.contact_dist = self.wp.to_torch(self.data.contact.dist)
+        # Each world's start class (an index of settle_class_names: the bank's classes, then the target starts'), and
+        # with either setting the logs per class and of the worst arm joint at the episodes' ends.
+        self.settle_class_names = tuple(bank['classes']) + (task.SETTLE_TARGET_CLASS,)
+        self.bank_class = constant(bank['start_class'], torch.long)
+        self.settle_class = torch.zeros(n, dtype=torch.long, device=device)
+        self.settle_logged = ref.settle_success is not None or ref.settle_starts is not None
+        if self.settle_logged:
+            self._settle_class_ended = torch.zeros(len(self.settle_class_names), device=device)
+            self._settle_class_done = torch.zeros(len(self.settle_class_names), device=device)
+            self._settle_arm_worst = []  # per step (n,) the ended worlds' worst arm joint, NaN for the others
         self.assist.zero_()
         self.settle_count = torch.zeros(n, dtype=torch.long, device=device)
         self.settle_at = torch.full((n,), -1, dtype=torch.long, device=device)
@@ -357,8 +435,18 @@ class TensorG1GetupEnv(TensorG1Env):
         self.hand_geoms = constant(ref.hand_geoms, torch.bool)
         self.range_low, self.range_high = constant(ref.range_low), constant(ref.range_high)
         bank = ref.bank
-        rows = np.flatnonzero(~bank['holdout'] & (bank['start_class'] == bank['classes'].index(task.TRACK_BANK_CLASS)))
-        self.clip_rows = constant(rows if len(rows) else ref.training_rows, torch.long)
+        if ref.track_classes == (task.TRACK_BANK_CLASS,):  # the back's rows (any training row in a bank without them)
+            back = bank['classes'].index(task.TRACK_BANK_CLASS)
+            rows = np.flatnonzero(~bank['holdout'] & (bank['start_class'] == back))
+            self.clip_rows = constant(rows if len(rows) else ref.training_rows, torch.long)
+        else:  # track_bank_classes
+            self.clip_rows = constant(ref.track_rows, torch.long)
+        # The starts' settings (the CPU task's): TRACK_START_KINDS' shares, the noise multiple, the nearest frame and
+        # what it compares (the clip frames' pelvis gravity, joints and anchor height; the free joints).
+        self.track_shares, self.track_noise, self.track_nearest = ref.track_shares, ref.track_noise, ref.track_nearest
+        self.clip_gravity, self.clip_joints = constant(ref.clip_gravity), constant(ref.clip_joints)
+        self.clip_anchor_height = constant(ref.clip_anchor_height)
+        self.nearest_joints = ref.nearest_joints
         self.contact_dist = self.wp.to_torch(self.data.contact.dist)
         self.clip_clock = torch.zeros(n, dtype=torch.long, device=device)
         self.clip_kind = torch.zeros(n, dtype=torch.long, device=device)
@@ -371,12 +459,122 @@ class TensorG1GetupEnv(TensorG1Env):
         self._clip_done = torch.zeros(len(task.TRACK_START_KINDS), device=device)  # ended, reached the last frame
         self._clip_ended = torch.zeros(len(task.TRACK_START_KINDS), device=device)
         self._clip_failed = torch.zeros((), device=device)
-        self._clip_standing = torch.zeros((), device=device)  # ended by the hold's end, standing (task.getup_standing)
+        # track_end_reach (iteration 78): the CPU task's distance (m) and ankles (None while off: nothing computed); the
+        # ended episodes it ended, for rollout/track_end_reach.
+        self.track_reach, self.track_reach_bodies = ref.track_reach, ref.track_reach_bodies
+        self._clip_reach = torch.zeros((), device=device)
+        # ended by the hold's end, standing (task.getup_standing), per start kind
+        self._clip_standing = torch.zeros(len(task.TRACK_START_KINDS), device=device)
         self._clip_errors = {key: torch.zeros((), device=device) for key in task.TRACK_SIGMA}
         self._hand_sum = torch.zeros((), device=device)
         self._clip_count = torch.zeros((), device=device)
 
+    def _setup_handover(self):
+        """track_handover_starts on the device: the CPU task's hand-over bank (its clip checked there) as qpos, qvel
+        and the actions in flight (newest first; the delay queue's depth of them), its clock frame and share, the steps
+        of its starts' grace; one clip only (the validator refuses track_clips)."""
+        ref, device = self.reference, self.device
+        bank = ref.handover
+        if self.delay_depth > bank['actions'].shape[1]:
+            raise ValueError('the hand-over bank keeps fewer actions in flight than the delay queue holds')
+        self.handover_share = ref.track_handover['share']
+        self.handover_qpos = torch.as_tensor(bank['qpos'], dtype=torch.float32, device=device)
+        self.handover_qvel = torch.as_tensor(bank['qvel'], dtype=torch.float32, device=device)
+        self.handover_actions = torch.as_tensor(bank['actions'][:, :self.delay_depth], dtype=torch.float32,
+                                                device=device)
+        self.handover_frame = int(bank['header']['frame'])
+        self.handover_grace = ref.handover_grace
+        self.handover_body = ref.handover_body  # the setting's grace: the anchor's rules wait too
+
+    def _setup_clips(self):
+        """track_clips on the device, over _setup_clip's of the first clip (bodies, weights, ranges, the bank's rows,
+        the counters): every clip's reference frames, qpos and qvel, each with its hold row (the last pose, zero
+        velocities), laid one after another (task.track_clip_frames; clips_start, a clip's first row there), each
+        clip's last frame, end and start class; its RSI frames' layout (rsi_starts, rsi_frames); a table of each bank
+        row's nearest clip and frame (_nearest_rows: the CPU task's bank_row_poses against every clip's RSI frames,
+        task.track_nearest_clip in float64 here), made now for the rows the training draws (clip_rows) and by set_starts
+        for its own; per start class the clips of the fallback draw (none within reach); per world its clip
+        (clip_index), whose last frame and end clip_last, clip_end now are ((n_envs,) tensors, not numbers); the
+        reference anchor's frames and the steps ahead (the critic's extras); per clip the counters of rollout_metrics."""
+        ref, device, n = self.reference, self.device, self.n_envs
+
+        def constant(value, dtype=torch.float32):
+            return torch.as_tensor(np.asarray(value), dtype=dtype, device=device)
+        entries = ref.clips
+        self.clip = {key: constant(np.concatenate([entry['frames'][key] for entry in entries]))
+                     for key in ('pos', 'rot', 'lin', 'ang')}
+        self.clip_qpos = constant(np.concatenate([entry['qpos'] for entry in entries]))
+        self.clip_qvel = constant(np.concatenate([np.concatenate([np.asarray(entry['clip']['qvel'], dtype=np.float64),
+                                                                  np.zeros((1, ref.model.nv))]) for entry in entries]))
+        starts, _ = task.track_clip_frames([entry['last'] + 2 for entry in entries])
+        self.clips_start = constant(starts, torch.long)
+        self.clips_last = constant([entry['last'] for entry in entries], torch.long)
+        self.clips_end = constant([entry['end'] for entry in entries], torch.long)
+        self.clips_class = constant(ref.clip_classes, torch.long)
+        self.clips_names = tuple(entry['name'] for entry in entries)
+        self.rsi_starts, self.rsi_frames = constant(ref.rsi_starts, torch.long), int(ref.rsi_frames)
+        self.clip_index = torch.zeros(n, dtype=torch.long, device=device)
+        self.clip_last = self.clips_last[self.clip_index].clone()
+        self.clip_end = self.clips_end[self.clip_index].clone()
+        anchor = self.track_anchor
+        self.clip_anchor = {key: value[:, anchor:anchor + 1] for key, value in self.clip.items()}
+        self.future_steps = ref.future_steps
+        self.free_joints = constant(ref.nearest_joints, torch.long)
+        # The bank starts' nearest clip and frame per bank row (−1: not made yet), against every clip's RSI frames.
+        bank = ref.bank
+        rows = len(bank['qpos'])
+        self.nearest_clip = torch.full((rows,), -1, dtype=torch.long, device=device)
+        self.nearest_frame = torch.zeros(rows, dtype=torch.long, device=device)
+        self.nearest_found = torch.zeros(rows, dtype=torch.bool, device=device)
+        self._nearest_made = np.zeros(rows, dtype=bool)
+        self.clips_frame = dict(gravity=constant(ref.clips_frame_gravity, torch.float64),
+                                joints=constant(ref.clips_frame_joints, torch.float64),
+                                anchor=constant(ref.clips_frame_anchor, torch.float64),
+                                start_class=constant(ref.clips_frame_class, torch.long))
+        names = bank['classes']
+        self.bank_row_class = constant([task.TRACK_CLASSES.index(names[int(c)]) if names[int(c)] in task.TRACK_CLASSES
+                                        else -1 for c in bank['start_class']], torch.long)
+        # The fallback: per start class (TRACK_CLASSES, then −1 last) its clips, every clip where none has it.
+        table = np.zeros((len(task.TRACK_CLASSES) + 1, len(entries)), dtype=np.int64)
+        count = np.zeros(len(table), dtype=np.int64)
+        for slot, kind in enumerate((*range(len(task.TRACK_CLASSES)), -1)):
+            chosen = np.flatnonzero(ref.clip_classes == kind)
+            chosen = chosen if len(chosen) else np.arange(len(entries))
+            table[slot, :len(chosen)], count[slot] = chosen, len(chosen)
+        self.fallback_clips, self.fallback_count = constant(table, torch.long), constant(count, torch.long)
+        self._nearest_rows(self.clip_rows.cpu().numpy())
+        # Per clip since the last rollout_metrics: ended episodes, those ended standing at the hold's end, and of the
+        # first-frame starts the ended ones and those that reached the clip's last frame.
+        clips = len(entries)
+        self._clips_ended, self._clips_standing = torch.zeros(clips, device=device), torch.zeros(clips, device=device)
+        self._clips_ended_first = torch.zeros(clips, device=device)
+        self._clips_done_first = torch.zeros(clips, device=device)
+
+    def _nearest_rows(self, rows):
+        """The nearest clip and frame (task.track_nearest_clip, float64 on the device in chunks of NEAREST_CHUNK
+        elements) of the bank rows `rows` (numpy) not in the table yet, from the CPU task's bank_row_poses."""
+        rows = np.unique(np.asarray(rows, dtype=np.int64))
+        rows = rows[~self._nearest_made[rows]]
+        if not len(rows):
+            return
+        ref, device = self.reference, self.device
+        gravity, joints, anchor, kinds = ref.bank_row_poses(rows)
+        frames = self.clips_frame
+        chunk = max(1, int(NEAREST_CHUNK // (len(frames['anchor']) * len(ref.nearest_joints))))
+        for first in range(0, len(rows), chunk):
+            part = slice(first, first + chunk)
+            values = [torch.as_tensor(value[part], device=device) for value in (gravity, joints, anchor, kinds)]
+            frame, found = task.track_nearest_clip(*values, frames['gravity'], frames['joints'], frames['anchor'],
+                                                   frames['start_class'], ref.nearest_joints)
+            clip, local = task.track_locate(frame, self.rsi_starts)
+            index = torch.as_tensor(rows[part], device=device)
+            self.nearest_clip[index], self.nearest_frame[index], self.nearest_found[index] = clip, local, found
+        self._nearest_made[rows] = True
+
     def _clip_reference(self):
+        if self.clips_start is not None:  # track_clips: each world's own clip
+            index = task.track_clips_index(self.clips_start[self.clip_index], self.clip_clock, self.clip_last)
+            return task.clip_reference(self.clip, index, self.clip_yaw, self.clip_offset)
         return task.clip_reference(self.clip, self.clip_clock, self.clip_yaw, self.clip_offset)
 
     def _clip_robot(self):
@@ -390,6 +588,19 @@ class TensorG1GetupEnv(TensorG1Env):
     def _clip_extras(self):
         anchor = self.track_bodies[self.track_anchor]
         position, rotation, _, _ = self._clip_reference()
+        if self.clips_start is not None:  # track_clips: the reference ahead too (the CPU task's _clip_extras)
+            start = self.clips_start[self.clip_index]
+            index = torch.stack([task.track_clips_index(start, self.clip_clock + steps, self.clip_last)
+                                 for steps in self.future_steps], 1)  # (n, H)
+            horizons = index.shape[1]
+            ahead, turned, _, _ = task.clip_reference(self.clip_anchor, index.reshape(-1),
+                                                      self.clip_yaw.repeat_interleave(horizons),
+                                                      self.clip_offset.repeat_interleave(horizons, 0))
+            joints = self.clip_qpos[index][..., 7:][..., self.free_joints] - self.home[self.free_joints]
+            return task.track_clips_critic_extras(
+                self.clip_clock, self.clip_last, self.clip_end, self.dt, self.xpos[:, anchor],
+                self.xmat[:, anchor].reshape(-1, 3, 3), position[:, self.track_anchor], rotation[:, self.track_anchor],
+                ahead.reshape(self.n_envs, horizons, 3), turned.reshape(self.n_envs, horizons, 3, 3), joints)
         return task.track_critic_extras(self.clip_clock, self.clip_last, self.xpos[:, anchor],
                                         self.xmat[:, anchor].reshape(-1, 3, 3), position[:, self.track_anchor],
                                         rotation[:, self.track_anchor])
@@ -418,38 +629,119 @@ class TensorG1GetupEnv(TensorG1Env):
         depth = torch.zeros(self.n_envs + 1, device=self.device)
         return depth.scatter_reduce_(0, world, torch.where(counted, self.contact_dist, 0.), 'amin')[:-1]
 
-    def _clip_masked_reset(self, mask, rows=None, frames=None, noise=True):
+    def _target_starts(self, positions, velocities, rows, targets=None):
+        """settle_starts' starts, the CPU task's _target_start per world, every draw from settle_generator: with
+        probability settle_share (targets (n_envs,): every world from its target) a world starts from a settle_clip
+        target's first frame (drawn uniformly) at rest with the tracking starts' noise times settle_noise
+        (task.track_start_pose / track_start_speed). Returns positions, velocities, rows (−1 for a target start) and
+        the target starts (n_envs,) bool; the caller raises them out of the floor after its forward."""
+        n, generator = self.n_envs, self.settle_generator
+        if targets is None:
+            chosen = torch.rand(n, device=self.device, generator=generator) < self.settle_share
+            targets = torch.randint(0, len(self.settle_names), (n,), device=self.device, generator=generator)
+        else:
+            chosen = torch.ones(n, dtype=torch.bool, device=self.device)
+        pose = 2 * torch.rand((n, task.TRACK_POSE_NOISE), device=self.device, generator=generator) - 1
+        speed = 2 * torch.rand((n, task.TRACK_SPEED_NOISE), device=self.device, generator=generator) - 1
+        start = task.track_start_pose(self.settle_qpos[targets], pose, self.range_low, self.range_high,
+                                      self.settle_noise)
+        still = task.track_start_speed(torch.zeros_like(velocities), speed, self.settle_noise)
+        return (torch.where(chosen[:, None], start, positions), torch.where(chosen[:, None], still, velocities),
+                torch.where(chosen, -1, rows), chosen)
+
+    @torch.no_grad()
+    def set_target_starts(self, targets):
+        """Reset every world now from settle_clip target targets[w] ((n_envs,) or one index) with settle_starts' noise
+        (its multiple, 1 without the setting), as the CPU task's reset option settle_target (tests, probes); the rest
+        drawn as at any reset. Returns the fresh observation."""
+        if self.settle is None:
+            raise ValueError('target starts need task_config settle_clip')
+        targets = torch.as_tensor(targets, dtype=torch.long, device=self.device).expand(self.n_envs).clone()
+        if bool((targets < 0).any()) or bool((targets >= len(self.settle_names)).any()):
+            raise ValueError('targets must be indices of the settle_clip targets')
+        with self.wp.ScopedStream(self.wp.stream_from_torch(torch.cuda.current_stream(self.device))):
+            everyone = torch.ones(self.n_envs, dtype=torch.bool, device=self.device)
+            self._masked_reset(everyone, targets=targets)
+            return self._obs('fill')
+
+    def _clip_masked_reset(self, mask, rows=None, frames=None, noise=True, clips=None, handover=None):
         """track_clip's reset of the masked worlds, as the CPU task's _clip_reset: rows (n_envs,) bank rows for every
         one (the reference aligned to each, task.track_align), or frames (n_envs,) clip frames (their velocities: the
-        CPU reset option track_frame), else per world a training draw (TRACK_START_SHARES: the clip's first frame, a
-        uniform frame, a bank row lying on the back); noise on the clip starts unless `noise` is false (the CPU
-        option track_noise); then the getting-up reset's randomization (encoder bias, delay, motor and body friction),
-        a forward, the clip starts raised by their deepest floor contact and another forward. No assist update."""
+        CPU reset option track_frame), or handover (n_envs,) rows of the hand-over bank (the CPU option
+        track_handover), else per world a training draw (TRACK_START_SHARES: the clip's first frame, a uniform frame,
+        a bank row lying on the back; with track_handover_starts first a hand-over row with probability share, its own
+        generator's draws); noise on the clip starts unless `noise` is false (the CPU option track_noise); then the
+        getting-up reset's randomization (encoder bias, delay, motor and body friction; a hand-over start's actions in
+        flight its row's), a forward, the clip starts raised by their deepest floor contact and another forward. No
+        assist update. A hand-over start: its row's state, no noise, the clock at the bank's frame, the reference
+        aligned under it as a bank row's. With track_clips each world's clip too: clips (n_envs,) with frames (the CPU
+        option track_clip_index), else a training draw's (the first frame's uniform over the clips, RSI's uniform over
+        every clip's frames or from track_sampling's one table), a bank row's nearest (the table of _nearest_rows; none
+        within reach: frame 0 of a clip of its class drawn uniformly)."""
         n, generator = self.n_envs, self.generator
+        many = self.clips_start is not None
         self.reset_mask.copy_(mask)
         self.wp.capture_launch(self.reset_graph)
-        if rows is not None:
+        sampled = None  # track_sampling: (bins (n,), −1 for a start it does not count; parts (n,))
+        handover_rows = None  # track_handover_starts: (n,) hand-over rows, −1 for another start; None while off
+        if handover is not None:
+            kinds, rows, frames = torch.full((n,), 3, dtype=torch.long, device=self.device), torch.zeros_like(
+                handover), torch.zeros_like(handover)
+            handover_rows = handover
+        elif rows is not None:
             kinds, frames = torch.full((n,), 2, dtype=torch.long, device=self.device), torch.zeros_like(rows)
+            clips = torch.zeros_like(rows) if many else None
+            if many:  # given rows (set_starts: probes, tests): their nearest clips and frames into the table
+                self._nearest_rows(rows.cpu().numpy())
         elif frames is not None:
             kinds, rows = torch.ones_like(frames), torch.zeros_like(frames)
+            if many and clips is None:
+                clips = torch.zeros_like(frames)
         else:
             draw = torch.rand(n, device=self.device, generator=generator)
-            first, second = task.TRACK_START_SHARES[0], task.TRACK_START_SHARES[0] + task.TRACK_START_SHARES[1]
+            first, second = self.track_shares[0], self.track_shares[0] + self.track_shares[1]
             kinds = (draw >= first).long() + (draw >= second).long()
-            frames = torch.randint(0, self.clip_last + 1, (n,), device=self.device, generator=generator)
+            if self.handover_share is not None:  # track_handover_starts: its own draws, the task's stream unchanged
+                chosen = torch.rand(n, device=self.device, generator=self.handover_generator) < self.handover_share
+                picked = torch.randint(0, len(self.handover_qpos), (n,), device=self.device,
+                                       generator=self.handover_generator)
+                kinds = torch.where(chosen, 3, kinds)
+                handover_rows = torch.where(chosen, picked, -1)
+            if not many:
+                frames = torch.randint(0, self.clip_last + 1, (n,), device=self.device, generator=generator)
+                if self.sampler is not None:  # the RSI frames from the bins' mixture, its own draws; the old ones unused
+                    part, bins, binned = self.sampler.draw(n)
+                    frames = binned
+                    sampled = torch.where(kinds == 1, bins, -1), part
+            else:  # track_clips: RSI over every clip's frames (or the bins' table), a first frame of any clip
+                if self.sampler is not None:
+                    part, bins, frames = self.sampler.draw(n)
+                    sampled = torch.where(kinds == 1, bins, -1), part
+                else:
+                    frames = torch.randint(0, self.rsi_frames, (n,), device=self.device, generator=generator)
+                rsi_clips, frames = task.track_locate(frames, self.rsi_starts)
+                first_clips = torch.randint(0, len(self.clips_last), (n,), device=self.device, generator=generator)
+                clips = torch.where(kinds == 1, rsi_clips, first_clips)
             frames = torch.where(kinds == 1, frames, 0)
             rows = self.clip_rows[torch.randint(0, len(self.clip_rows), (n,), device=self.device, generator=generator)]
         pose = 2 * torch.rand((n, task.TRACK_POSE_NOISE), device=self.device, generator=generator) - 1
         speed = 2 * torch.rand((n, task.TRACK_SPEED_NOISE), device=self.device, generator=generator) - 1
         bank = kinds == 2
-        positions, velocities = self.clip_qpos[frames], torch.where((kinds == 1)[:, None], self.clip_qvel[frames], 0.)
+        at = frames if not many else self.clips_start[clips] + frames  # the frames' rows in clip_qpos / clip_qvel
+        positions, velocities = self.clip_qpos[at], torch.where((kinds == 1)[:, None], self.clip_qvel[at], 0.)
+        clipped = kinds < 2  # the clip's own starts (first frame, RSI); a bank or hand-over start is a state as it was
         if noise:
-            noisy = ~bank[:, None]
-            positions = torch.where(noisy, task.track_start_pose(positions, pose, self.range_low, self.range_high),
-                                    positions)
-            velocities = torch.where(noisy, task.track_start_speed(velocities, speed), velocities)
+            noisy = clipped[:, None]
+            positions = torch.where(noisy, task.track_start_pose(positions, pose, self.range_low, self.range_high,
+                                                                 self.track_noise), positions)
+            velocities = torch.where(noisy, task.track_start_speed(velocities, speed, self.track_noise), velocities)
         positions = torch.where(bank[:, None], self.bank_qpos[rows], positions)
         velocities = torch.where(bank[:, None], self.bank_qvel[rows], velocities)
+        handing = None if handover_rows is None else handover_rows >= 0  # (n,) the hand-over starts
+        if handing is not None:
+            handover_rows = handover_rows.clamp(min=0)
+            positions = torch.where(handing[:, None], self.handover_qpos[handover_rows], positions)
+            velocities = torch.where(handing[:, None], self.handover_qvel[handover_rows], velocities)
         positions[:, 3:7] /= positions[:, 3:7].norm(dim=1, keepdim=True)
         self.qpos.copy_(torch.where(mask[:, None], positions, self.qpos))
         self.qvel.copy_(torch.where(mask[:, None], velocities, self.qvel))
@@ -471,6 +763,9 @@ class TensorG1GetupEnv(TensorG1Env):
             self.delay_steps.copy_(torch.where(mask, delay, self.delay_steps))
             self.delay_lags.copy_(task.action_lags(self.delay_steps, self.reference.frame_skip))
             self.delay_actions.masked_fill_(mask[:, None, None], 0)
+            if handing is not None:  # a hand-over start: the first policy's actions still in flight
+                self.delay_actions.copy_(torch.where((mask & handing)[:, None, None],
+                                                     self.handover_actions[handover_rows], self.delay_actions))
         if self.motor_frictions:
             scale = (task.motor_friction_draw(self._uniform, n, self.reference.motor_friction)
                      if self.reference.motor_friction else torch.ones_like(self.friction_scale))
@@ -479,33 +774,90 @@ class TensorG1GetupEnv(TensorG1Env):
         self._set_friction(torch.where(mask, low + (high - low) * self._uniform(n), self.friction))
         self.returns.masked_fill_(mask, 0)
         self.wp.capture_launch(self.forward_graph)
-        raised = torch.where(mask & ~bank, (-self._floor_depth()).clamp(min=0), 0.)
+        raised = torch.where(mask & clipped, (-self._floor_depth()).clamp(min=0), 0.)
         self.qpos[:, 2] += raised
         self.wp.capture_launch(self.forward_graph)
-        yaw, offset = task.track_align(self.qpos[:, 0:3], self.xmat[:, self.pelvis].reshape(-1, 3, 3),
-                                       self.clip['pos'][0, 0], self.clip['rot'][0, 0])
+        pelvis = self.xmat[:, self.pelvis].reshape(-1, 3, 3)
+        if many:  # track_clips: a bank start's nearest clip and frame (the table), else frame 0 of a clip of its class
+            near_clip, near_frame, found = self.nearest_clip[rows], self.nearest_frame[rows], self.nearest_found[rows]
+            slot = self.bank_row_class[rows]
+            slot = torch.where(slot < 0, len(task.TRACK_CLASSES), slot)
+            count = self.fallback_count[slot]
+            pick = torch.minimum((torch.rand(n, device=self.device, generator=generator) * count).long(), count - 1)
+            clips = torch.where(bank, torch.where(found, near_clip, self.fallback_clips[slot, pick]), clips)
+            frames = torch.where(bank, torch.where(found, near_frame, 0), frames)
+            at = self.clips_start[clips] + frames
+            yaw, offset = task.track_align(self.qpos[:, 0:3], pelvis, self.clip['pos'][at, 0], self.clip['rot'][at, 0])
+        elif self.track_nearest:  # a bank start's clock at its nearest clip frame (task.track_nearest_frame)
+            nearest = task.track_nearest_frame(
+                task.projected_gravity(pelvis), self.qpos[:, self.qadr],
+                self.xpos[:, self.track_bodies[self.track_anchor], 2], self.clip_gravity, self.clip_joints,
+                self.clip_anchor_height, self.nearest_joints)
+            frames = torch.where(bank, nearest, frames)
+            yaw, offset = task.track_align(self.qpos[:, 0:3], pelvis, self.clip['pos'][frames, 0],
+                                           self.clip['rot'][frames, 0])
+        else:
+            yaw, offset = task.track_align(self.qpos[:, 0:3], pelvis, self.clip['pos'][0, 0], self.clip['rot'][0, 0])
         aligned = mask & bank
+        if handing is not None:  # a hand-over start: the clock at the bank's frame, the reference aligned there
+            frames = torch.where(handing, self.handover_frame, frames)
+            turned, moved = task.track_align(self.qpos[:, 0:3], pelvis, self.clip['pos'][frames, 0],
+                                             self.clip['rot'][frames, 0])
+            yaw, offset = torch.where(handing, turned, yaw), torch.where(handing[:, None], moved, offset)
+            aligned = mask & (bank | handing)
         self.clip_yaw.copy_(torch.where(aligned, yaw, torch.where(mask, 0., self.clip_yaw)))
         self.clip_offset.copy_(torch.where(aligned[:, None], offset, torch.where(mask[:, None], 0., self.clip_offset)))
         self.clip_clock.copy_(torch.where(mask, frames, self.clip_clock))
+        if many:  # each world's clip, its last frame and end
+            self.clip_index.copy_(torch.where(mask, clips, self.clip_index))
+            self.clip_last.copy_(self.clips_last[self.clip_index])
+            self.clip_end.copy_(self.clips_end[self.clip_index])
         self.clip_kind.copy_(torch.where(mask, kinds, self.clip_kind))
         self.clip_reached.copy_(torch.where(mask, frames >= self.clip_last, self.clip_reached))
         remaining = (self.clip_end - frames).clamp(min=1, max=self.max_episode_steps)
         self.episode_limit.copy_(torch.where(mask, remaining, self.episode_limit))
+        if self.sampler is not None:  # a training draw's RSI starts count for their bins; any other start does not
+            bins, part = sampled if sampled is not None else (torch.full_like(frames, -1), torch.zeros_like(frames))
+            self.sampler.start(mask, bins, part, remaining)
 
     @torch.no_grad()
-    def set_clip_starts(self, frames, noise=False):
+    def set_clip_starts(self, frames, noise=False, clips=None):
         """Reset every world now from clip frames[w] ((n_envs,) or one frame) with the clip's velocities there, without
-        noise unless `noise` (the CPU task's reset options track_frame, track_noise; tests, probes); track_clip only.
-        Returns the fresh observation."""
+        noise unless `noise` (the CPU task's reset options track_frame, track_noise; tests, probes); track_clip or
+        track_clips only; with track_clips of clip clips[w] ((n_envs,) or one; the CPU option track_clip_index;
+        default the first). Returns the fresh observation."""
         if self.clip is None:
-            raise ValueError('clip starts need task_config track_clip')
+            raise ValueError('clip starts need task_config track_clip or track_clips')
         frames = torch.as_tensor(frames, dtype=torch.long, device=self.device).expand(self.n_envs)
-        if bool((frames < 0).any()) or bool((frames > self.clip_last).any()):
+        if clips is not None and self.clips_start is None:
+            raise ValueError('clips need task_config track_clips')
+        if self.clips_start is not None:
+            clips = torch.as_tensor(0 if clips is None else clips, dtype=torch.long, device=self.device).expand(
+                self.n_envs).clone()
+            if bool((clips < 0).any()) or bool((clips >= len(self.clips_last)).any()):
+                raise ValueError('clips must be clips of track_clips')
+            last = self.clips_last[clips]
+        else:
+            last = self.clip_last
+        if bool((frames < 0).any()) or bool((frames > last).any()):
             raise ValueError('frames must be frames of the clip')
         with self.wp.ScopedStream(self.wp.stream_from_torch(torch.cuda.current_stream(self.device))):
             self._clip_masked_reset(torch.ones(self.n_envs, dtype=torch.bool, device=self.device), frames=frames.clone(),
-                                    noise=noise)
+                                    noise=noise, clips=clips)
+            return self._obs('fill')
+
+    @torch.no_grad()
+    def set_handover_starts(self, rows):
+        """Reset every world now from hand-over bank rows[w] ((n_envs,) or one row), as the CPU task's reset option
+        track_handover (tests, probes); track_handover_starts only; the rest drawn as at any reset. Returns the fresh
+        observation."""
+        if self.handover_qpos is None:
+            raise ValueError('hand-over starts need task_config track_handover_starts')
+        rows = torch.as_tensor(rows, dtype=torch.long, device=self.device).expand(self.n_envs).clone()
+        if bool((rows < 0).any()) or bool((rows >= len(self.handover_qpos)).any()):
+            raise ValueError('rows must be rows of the hand-over bank')
+        with self.wp.ScopedStream(self.wp.stream_from_torch(torch.cuda.current_stream(self.device))):
+            self._clip_masked_reset(torch.ones(self.n_envs, dtype=torch.bool, device=self.device), handover=rows)
             return self._obs('fill')
 
     def _make_reference(self, max_episode_steps, **settings):
@@ -542,13 +894,15 @@ class TensorG1GetupEnv(TensorG1Env):
             self.human_qvel = torch.as_tensor(human['qvel'], dtype=torch.float32, device=self.device)
         return self.human_qpos, self.human_qvel
 
-    def _masked_reset(self, mask, rows=None, human_rows=None):
+    def _masked_reset(self, mask, rows=None, human_rows=None, targets=None):
         """Resets the masked worlds: the episode that ended steps its assist down first (task.assist_update on the
         mean head height of its last GETUP_ASSIST_SECONDS; NaN, no step, for a shorter one; not after an episode from a
         human start), then a start from the bank (rows: (n_envs,) bank rows; None: a training row drawn per world,
         with human_starts a human row instead with probability share; human_rows: (n_envs,) human rows for every
         masked world), and the episode's delay, motor friction and body friction, as the CPU task's reset. With
-        track_clip: _clip_masked_reset (rows: bank starts)."""
+        settle_starts a drawn start is a target pose instead with probability target (its own generator's draws, after
+        the bank row; targets: (n_envs,) settle_clip targets for every world, set_target_starts), raised out of the
+        floor after the forward. With track_clip: _clip_masked_reset (rows: bank starts)."""
         if self.clip is not None:
             return self._clip_masked_reset(mask, rows=rows)
         full = self.lengths >= self.head_steps
@@ -561,6 +915,7 @@ class TensorG1GetupEnv(TensorG1Env):
         self.reset_mask.copy_(mask)
         self.wp.capture_launch(self.reset_graph)  # also zeroes the reset worlds' xfrc_applied
         human = None  # (n_envs,) bool: the worlds starting from a human row
+        drawn = rows is None
         if rows is None:
             draw = torch.randint(0, len(self.training_rows), (self.n_envs,), device=self.device,
                                  generator=self.generator)
@@ -581,6 +936,12 @@ class TensorG1GetupEnv(TensorG1Env):
         if human is not None or self.human_share is not None:
             started = torch.zeros_like(mask) if human is None else human
             self.human_episode.copy_(torch.where(mask, started, self.human_episode))
+        targeted = None  # settle_starts: (n_envs,) bool, the worlds starting from a target pose
+        if self.settle is not None and (targets is not None or (drawn and self.settle_share is not None)):
+            positions, velocities, rows, targeted = self._target_starts(positions, velocities, rows, targets)
+        if self.settle is not None:  # the start class: the bank row's, or a target start's
+            started = torch.where(rows >= 0, self.bank_class[rows.clamp(min=0)], len(self.settle_class_names) - 1)
+            self.settle_class.copy_(torch.where(mask, started, self.settle_class))
         positions[:, 3:7] /= positions[:, 3:7].norm(dim=1, keepdim=True)
         self.qpos.copy_(torch.where(mask[:, None], positions, self.qpos))
         self.qvel.copy_(torch.where(mask[:, None], velocities, self.qvel))
@@ -612,6 +973,9 @@ class TensorG1GetupEnv(TensorG1Env):
         self._set_friction(torch.where(mask, low + (high - low) * self._uniform(self.n_envs), self.friction))
         self.returns.masked_fill_(mask, 0)
         self.wp.capture_launch(self.forward_graph)
+        if targeted is not None:  # a target start out of the floor by the deepest contact its noise left
+            self.qpos[:, 2] += torch.where(mask & targeted, (-self._floor_depth()).clamp(min=0), 0.)
+            self.wp.capture_launch(self.forward_graph)
         if self.previous_head is not None:  # head_rise: a fresh episode's first speed is from its start pose
             self.previous_head.copy_(torch.where(mask, self._head(), self.previous_head))
         if self.amp_state is not None:  # amp: the reset worlds' first state, the start of their first pair
@@ -628,6 +992,8 @@ class TensorG1GetupEnv(TensorG1Env):
         (with track_clip within what is left of the clip and its hold)."""
         obs = super().reset()
         cut = torch.randint(1, self.max_episode_steps + 1, (self.n_envs,), device=self.device, generator=self.generator)
+        if self.sampler is not None:  # track_sampling: a first episode cut short does not count for its bin
+            self.sampler.discard(cut < self.episode_limit)
         self.episode_limit.copy_(cut if self.clip is None else torch.minimum(cut, self.episode_limit))
         return obs
 
@@ -709,16 +1075,19 @@ class TensorG1GetupEnv(TensorG1Env):
 
     def training_state(self):
         """What a stage keeps of this training beyond the weights: every world's assist force, with pd_bound every
-        world's bound (save_stage)."""
+        world's bound, with track_sampling the bins' G_b/G_max, episodes and history weights (save_stage)."""
         state = {'assist_force': [float(v) for v in self.assist.cpu().tolist()]}
         if self.pd_bound is not None:
             state['pd_bound'] = [float(v) for v in self.bound.cpu().tolist()]
+        if self.sampler is not None:
+            state.update(self.sampler.state())
         return state
 
     def restore_training_state(self, state):
         """The worlds' assist forces from a stage's training_state, spread over this run's world count
         (task.assist_resample), with pd_bound their bounds too, within [lowest, start] (a stage without bounds: the
-        start), as the CPU task's restore_training_state."""
+        start), as the CPU task's restore_training_state; with track_sampling the bins' estimates (TrackBinSampler.
+        restore: a stage without them or with another number of bins starts afresh)."""
         forces = np.asarray(state['assist_force'], dtype=np.float64)
         if forces.ndim != 1 or not len(forces) or not np.isfinite(forces).all() or (forces < 0).any():
             raise ValueError('Invalid saved assist forces')
@@ -729,6 +1098,8 @@ class TensorG1GetupEnv(TensorG1Env):
         if self.pd_bound is not None and 'pd_bound' in state:
             bounds = np.clip(task.assist_resample(saved_bounds(state), self.n_envs), self.pd_bound[1], self.pd_bound[0])
             self.bound.copy_(torch.as_tensor(bounds, dtype=torch.float32, device=self.device))
+        if self.sampler is not None:  # track_sampling: the bins' estimates (another bin count: afresh)
+            self.sampler.restore(state)
 
     def set_pd_bound(self, fraction):
         """Each world's PD error bound c ((n_envs,) or one number, a share of the peak torque, > 0) from the next step
@@ -991,8 +1362,20 @@ class TensorG1GetupEnv(TensorG1Env):
                 errors, action, self.previous_action, self.qpos[:, self.qadr], self.soft_low, self.soft_high,
                 self.track_weights, self_contact=self_contact, impact=impact, sole_impact=sole_impact)
             grace = (self.clip_kind == 2) & (self.lengths <= self.clip_grace)  # a bank start's limbs: not yet
+            body = None  # the anchor's rules: from the first step, but for track_handover_starts' grace
+            if self.handover_qpos is not None:  # a hand-over start's: longer (its own grace)
+                handing = (self.clip_kind == 3) & (self.lengths <= self.handover_grace)
+                grace = grace | handing
+                if self.handover_body:
+                    body = ~handing
             failed = task.track_terminated(robot[0], robot[1], reference[0], reference[1], self.track_anchor,
-                                           self.track_ends, ~grace) & ~bad
+                                           self.track_ends, ~grace, body) & ~bad
+            reach = None
+            if self.track_reach is not None:  # track_end_reach: an ankle too far from its place in the clip
+                distance = task.track_reach_distance(robot[0], robot[1], reference[0], reference[1], self.track_anchor,
+                                                     self.track_reach_bodies)
+                reach = task.track_reach_terminated(distance, self.track_reach, ~grace) & ~bad
+                failed = failed | reach
             self.clip_reached.logical_or_(self.clip_clock >= self.clip_last)
             reward = torch.where(bad, 0., sum(components.values()))
             head = self._head()
@@ -1011,6 +1394,10 @@ class TensorG1GetupEnv(TensorG1Env):
             terminated = bad | failed | (self.qvel[:, self.vadr].abs().amax(dim=1) > task.GETUP_MAX_JOINT_SPEED)
             truncated = (self.lengths >= self.episode_limit) | (self.clip_clock >= self.clip_end)
             done = terminated | truncated
+            if self.sampler is not None:  # track_sampling: the discounted return, the ended episodes to their bins
+                self.sampler.add(reward)
+                self.sampler.finish(done & ~bad)
+                self.sampler.discard(done)
             self._episodes.add_(done.sum())
             self._episodes_up.add_((done & ~bad & (head > task.GETUP_ASSIST_HEAD)).sum())
             self._bad_states.add_(bad.sum())
@@ -1018,9 +1405,17 @@ class TensorG1GetupEnv(TensorG1Env):
             self._clip_ended.add_((kinds * done[:, None]).sum(0))
             self._clip_done.add_((kinds * (done & self.clip_reached & ~bad)[:, None]).sum(0))
             self._clip_failed.add_((done & failed).sum())
+            if reach is not None:
+                self._clip_reach.add_((done & reach).sum())
             standing = task.getup_standing(head, self.qpos[:, 2], self.xmat[:, self.torso].reshape(-1, 3, 3),
                                            task.sole_height(self.geom_xpos[:, self.soles, 2], self.sole_radius))
-            self._clip_standing.add_((truncated & ~terminated & standing).sum())  # standing at the hold's end
+            self._clip_standing.add_((kinds * (truncated & ~terminated & standing)[:, None]).sum(0))  # at the hold's end
+            if self.clips_start is not None:  # track_clips: the same per clip, before the ended worlds draw another
+                first = done & (self.clip_kind == 0)
+                self._clips_ended.index_add_(0, self.clip_index, done.float())
+                self._clips_standing.index_add_(0, self.clip_index, (truncated & ~terminated & standing).float())
+                self._clips_ended_first.index_add_(0, self.clip_index, first.float())
+                self._clips_done_first.index_add_(0, self.clip_index, (first & self.clip_reached & ~bad).float())
             self.last_episode_lengths.copy_(self.lengths)
             self.last_episode_returns.copy_(self.returns)
             self._bad_state_seen.logical_or_(~torch.isfinite(terminal_obs).all() | ~torch.isfinite(reward).all())
@@ -1106,10 +1501,12 @@ class TensorG1GetupEnv(TensorG1Env):
                 self_contact = task.self_contact_share(self.self_contact_force)
                 self._self_contact_sum.add_(torch.where(bad, 0., self_contact).sum())
                 self._self_contact_count += self.n_envs
+            arm_worst = (None if self.settle_success is None
+                         else task.settle_arm_worst(position, self.settle['position'], self.settle_arms))
             components, nearest, near = task.settle_reward_components(
                 angle, pose, deviation, joint_velocity, self._velocity(), action, self.previous_action, position,
                 self.soft_low, self.soft_high, self.settle_joints, self.settle_weights, self_contact=self_contact,
-                impact=impact, sole_impact=sole_impact)
+                impact=impact, sole_impact=sole_impact, arm_worst=arm_worst, success=self.settle_success)
             # The success clock: steps on end near the nearest target and still; the first time it reaches
             # settle_hold is the world's success (its episode step and target), kept until its reset.
             self.settle_count.copy_(task.settle_update(self.settle_count, near & ~bad, joint_velocity,
@@ -1145,6 +1542,12 @@ class TensorG1GetupEnv(TensorG1Env):
             self._settle_seconds.add_(torch.where(settled, self.settle_at * self.dt, 0.).sum())
             targets = torch.nn.functional.one_hot(self.settle_target.clamp(min=0), len(self.settle_names)).float()
             self._settle_targets.add_((targets * settled[:, None]).sum(0))
+            if self.settle_logged:  # settle_success / settle_starts: per start class, the worst arm joint at the end
+                self._settle_class_ended.index_add_(0, self.settle_class, done.float())
+                self._settle_class_done.index_add_(0, self.settle_class, settled.float())
+                if arm_worst is not None:
+                    worst = arm_worst.gather(1, nearest[:, None])[:, 0]
+                    self._settle_arm_worst.append(torch.where(done & ~bad, worst, float('nan')))
             self.last_episode_lengths.copy_(self.lengths)
             self.last_episode_returns.copy_(self.returns)
             self._bad_state_seen.logical_or_(~torch.isfinite(terminal_obs).all() | ~torch.isfinite(reward).all())
@@ -1159,7 +1562,10 @@ class TensorG1GetupEnv(TensorG1Env):
         their mean time to it (s); rollout/settle_target<k>, the share of them that settled into clip k's first frame
         (settle_clip's order); rollout/settle_angle and rollout/settle_deviation, the mean gravity angle (deg) and mean
         |q − q0| (rad) to the nearest target per world-step; rollout/hand_force, the mean of each world-step's largest
-        floor force on the hands (N); rollout/self_contact while weighted."""
+        floor force on the hands (N); rollout/self_contact while weighted. With settle_success or settle_starts also
+        rollout/settle_done_<class> per start class (the bank's classes, then target: settle_starts' target starts);
+        with settle_success rollout/settle_arm_worst, the median over the ended episodes of the worst free arm joint's
+        |q − q0| to the nearest target at the end (rad). rollout/settle_done follows settle_success's rule."""
         ended, done = self._settle_ended.item(), self._settle_done.item()
         count = self._settle_steps.item()
         metrics = {'rollout/settle_done': done / ended if ended else float('nan'),
@@ -1169,6 +1575,17 @@ class TensorG1GetupEnv(TensorG1Env):
                    'rollout/hand_force': self._hand_sum.item() / count if count else float('nan')}
         for k, value in enumerate(self._settle_targets.cpu().tolist()):
             metrics[f'rollout/settle_target{k}'] = value / done if done else float('nan')
+        if self.settle_logged:  # settle_success / settle_starts: the success per start class, the worst arm joint
+            for name, ended_class, done_class in zip(self.settle_class_names, self._settle_class_ended.cpu().tolist(),
+                                                     self._settle_class_done.cpu().tolist()):
+                metrics[f'rollout/settle_done_{name}'] = done_class / ended_class if ended_class else float('nan')
+            self._settle_class_ended.zero_()
+            self._settle_class_done.zero_()
+            if self.settle_success is not None:
+                worst = torch.cat(self._settle_arm_worst) if self._settle_arm_worst else torch.zeros(0)
+                metrics['rollout/settle_arm_worst'] = float(worst.nanmedian()) if bool(
+                    (~torch.isnan(worst)).any()) else float('nan')
+                self._settle_arm_worst.clear()
         if self.self_contact_force is not None:
             calls = self._self_contact_count
             metrics['rollout/self_contact'] = self._self_contact_sum.item() / calls if calls else float('nan')
@@ -1206,13 +1623,25 @@ class TensorG1GetupEnv(TensorG1Env):
         rollout/human_start_share, the share of the ended episodes that started from a human row, and
         rollout/getup_success_bank, rollout/getup_success of the others. With track_clip: rollout/track_done, the share
         of the ended episodes whose clip clock reached the clip's last frame (no tracking termination before it),
-        rollout/track_done_clip of those started from the clip's first frame (TRACK_START_KINDS' 'clip'),
-        rollout/track_failed the share ended by a tracking termination, rollout/track_standing the share that ended by
+        rollout/track_done_clip of those started from the clip's first frame (TRACK_START_KINDS' 'clip'; also
+        rollout/track_done_first, with track_done_rsi and track_done_bank of the other two kinds, and
+        rollout/track_standing_bank, the share of the bank starts' ended episodes that ended the hold standing; with
+        track_handover_starts rollout/track_done_handover and rollout/track_standing_handover, the same of the
+        hand-over starts),
+        rollout/track_failed the share ended by a tracking termination (with track_end_reach also
+        rollout/track_end_reach, the share ended by an ankle too far from its place, whatever else ended it then),
+        rollout/track_standing the share that ended by
         the hold's end (truncated, not terminated) standing (task.getup_standing: head top above 1.15 m, torso tilt
         below 15°, pelvis above 0.70 m, both soles down; track_done passes a robot left on one knee within the
         anchor's 0.25 m); rollout/track_err_<term>, the mean √e of each
         tracking error per world-step (m, rad, m/s, rad/s; track_errors); rollout/hand_force, the mean of each
-        world-step's largest floor force on the hands (N); rollout/self_contact while weighted. With settle_clip:
+        world-step's largest floor force on the hands (N); rollout/self_contact while weighted; with track_sampling
+        TrackBinSampler.metrics' rollout/track_bin_hard_share, track_bin_g_min, track_bin_g_mean and
+        track_bin_hardest; with track_clips per start class of the clips (task.TRACK_CLASSES)
+        rollout/track_done_first_<class> (the first-frame starts' ended episodes that reached their clip's last frame)
+        and rollout/track_standing_<class> (ended standing at the hold's end, any start), NaN without one;
+        rollout/track_clips_done, how many clips had a first-frame episode reach their last frame, of
+        rollout/track_clips_started with an ended first-frame episode at all. With settle_clip:
         _settle_metrics' rollout/settle_done, settle_seconds, settle_target<k>, settle_angle, settle_deviation,
         hand_force and self_contact."""
         if self.clip is not None:
@@ -1289,13 +1718,25 @@ class TensorG1GetupEnv(TensorG1Env):
         """rollout_metrics' track_clip numbers (read before the shared episode counters are zeroed), the counters
         zeroed."""
         ended, done = self._clip_ended.cpu().numpy(), self._clip_done.cpu().numpy()
+        standing = self._clip_standing.cpu().numpy()
         count = self._clip_count.item()
         episodes = ended.sum()
         metrics = {'rollout/track_done': done.sum() / episodes if episodes else float('nan'),
                    'rollout/track_done_clip': done[0] / ended[0] if ended[0] else float('nan'),
                    'rollout/track_failed': self._clip_failed.item() / episodes if episodes else float('nan'),
-                   'rollout/track_standing': self._clip_standing.item() / episodes if episodes else float('nan'),
+                   'rollout/track_standing': standing.sum() / episodes if episodes else float('nan'),
                    'rollout/hand_force': self._hand_sum.item() / count if count else float('nan')}
+        # Per start kind (TRACK_START_KINDS 'clip', 'frame', 'bank' as first, rsi, bank): the share of its ended
+        # episodes that reached the clip's last frame, and for the bank's that ended the hold standing.
+        for index, name in enumerate(('first', 'rsi', 'bank')):
+            metrics[f'rollout/track_done_{name}'] = done[index] / ended[index] if ended[index] else float('nan')
+        metrics['rollout/track_standing_bank'] = standing[2] / ended[2] if ended[2] else float('nan')
+        if self.handover_qpos is not None:  # track_handover_starts: the same for the hand-over starts
+            metrics['rollout/track_done_handover'] = done[3] / ended[3] if ended[3] else float('nan')
+            metrics['rollout/track_standing_handover'] = standing[3] / ended[3] if ended[3] else float('nan')
+        if self.track_reach is not None:  # track_end_reach: the share of the ended episodes it ended
+            metrics['rollout/track_end_reach'] = self._clip_reach.item() / episodes if episodes else float('nan')
+            self._clip_reach.zero_()
         for key, value in self._clip_errors.items():
             metrics[f'rollout/track_err_{key}'] = value.item() / count if count else float('nan')
             value.zero_()
@@ -1307,5 +1748,22 @@ class TensorG1GetupEnv(TensorG1Env):
         for value in (self._clip_ended, self._clip_done, self._clip_failed, self._clip_standing, self._hand_sum,
                       self._clip_count):
             value.zero_()
+        if self.clips_start is not None:  # track_clips: by the clips' start class, and how many clips got through
+            counts = [value.cpu().numpy() for value in (self._clips_ended, self._clips_standing, self._clips_ended_first,
+                                                        self._clips_done_first)]
+            ended, standing, first, done_first = counts
+            classes = self.clips_class.cpu().numpy()
+            for k, name in enumerate(task.TRACK_CLASSES):
+                of = classes == k
+                metrics[f'rollout/track_done_first_{name}'] = (done_first[of].sum() / first[of].sum()
+                                                               if first[of].sum() else float('nan'))
+                metrics[f'rollout/track_standing_{name}'] = (standing[of].sum() / ended[of].sum() if ended[of].sum()
+                                                             else float('nan'))
+            metrics['rollout/track_clips_done'] = float((done_first > 0).sum())
+            metrics['rollout/track_clips_started'] = float((first > 0).sum())
+            for value in (self._clips_ended, self._clips_standing, self._clips_ended_first, self._clips_done_first):
+                value.zero_()
+        if self.sampler is not None:  # track_sampling: the hard share of the RSI starts, the bins' G_b/G_max
+            metrics.update(self.sampler.metrics())
         return {key: float(value) for key, value in metrics.items()}
 

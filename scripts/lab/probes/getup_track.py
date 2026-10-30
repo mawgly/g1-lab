@@ -1,5 +1,12 @@
 """CPU only. getup_track.py <stage | reference> [--clip NAME] [--compare NAME …] [--kinematics] [--episodes 10]
-[--workers 4] [--out <file.json>]
+[--clip-index K …] [--frame K] [--physics ours,delay20,foot0.3,motor1.25] [--workers 4] [--out <file.json>]
+--frame K (iteration 82, spliced clips: does a policy still rise from where the old clip begins in the new one?):
+the clip starts from frame K with its velocities and the same start noise (the reset option track_frame), not
+from the first frame with none.
+A track_clips stage (iteration 78) runs the first-frame starts of every clip of its list (or of --clip-index K, which
+may repeat; the reset option track_clip_index), --episodes per clip and physics, and adds a line per clip (reached the
+end, standing, the cut's median time) and how many clips reached the end at least once; its bank starts take their
+nearest clip.
 The acceptance of g1_getup's motion tracking (task_config track_clip, iteration 64): how far a policy follows its human
 clip, without the assist (force 0), deterministic.
 
@@ -76,7 +83,12 @@ def run(job):
     options = dict(assist_force=0., action_delay_steps=delay, motor_friction_scale=friction)
     if job['row'] is not None:
         options['start'] = job['row']
+    elif job.get('clip_index') is not None:  # track_clips: this clip's noisy first frame
+        options['track_clip_index'] = job['clip_index']
+    if job['row'] is None and job.get('frame') is not None:  # --frame: that clip frame, its velocities, the noise
+        options['track_frame'] = job['frame']
     obs, _ = env.reset(seed=job['seed'], options=options)
+    clip_index = getattr(raw, 'clip_index', None) if raw.clips is not None else None
     getup_probe.apply_friction(raw, sole)
     getup_probe.MONITOR = monitor = getup_probe.Monitor(raw)
     left, right = raw.hip_roll_joints
@@ -108,7 +120,8 @@ def run(job):
     speeds = np.array(speeds) if speeds else np.zeros((1, raw.model.nu))
     touched = [h for h in hands if h > 0]
     substeps = max(monitor.substeps, 1)
-    return dict(physics=job['physics'], start=job['start'], row=job['row'], seed=job['seed'],
+    return dict(physics=job['physics'], start=job['start'], row=job['row'], seed=job['seed'], clip_index=clip_index,
+                clip=None if clip_index is None else raw.clips[clip_index]['name'],
                 done=bool(info.get('track_done')), failed=bool(info.get('track_failed')),
                 standing=bool(truncated and not terminated and info.get('track_standing')),
                 head_end=info.get('head_height'),
@@ -300,11 +313,50 @@ def summary(runs, title):
           f'({max(runs, key=lambda r: r["speed_max"])["speed_joint"]})')
 
 
+def clip_table(runs, names, classes):
+    """track_clips: one line per clip of its first-frame runs (every physics): reached the end, standing, the median
+    time of a cut."""
+    print('по клипам (шумный первый кадр, все физики): клип, класс начала — до конца / стоят / прогонов; обрыв, с')
+    for index, name in enumerate(names):
+        mine = [r for r in runs if r['start'] == 'clip' and r['clip_index'] == index]
+        if not mine:
+            continue
+        done = sum(r['done'] for r in mine)
+        standing = sum(r.get('standing', False) for r in mine)
+        cut = [r['seconds'] for r in mine if not r['done']]
+        print(f'   {index:2d} {name} ({classes[index]}): {done} / {standing} / {len(mine)}'
+              + (f'; обрыв {np.median(cut):.2f}' if cut else ''))
+    done = sum(any(r['done'] for r in runs if r['start'] == 'clip' and r['clip_index'] == k) for k in range(len(names)))
+    print(f'   клипов, дошедших до конца хотя бы раз: {done} из {len(names)}')
+
+
+def stage_clips(policy):
+    """(names, start classes) of a track_clips stage's clips, None for another stage."""
+    from humanoid_sim.core import stage_task_config
+    from humanoid_sim.tasks import g1_getup_track
+    from humanoid_sim.tasks import g1_tensor_math as task
+    entries = stage_task_config(Path(policy)).get('track_clips')
+    if not entries:
+        return None
+    classes = []
+    for entry in entries:
+        clip = g1_getup_track.load(entry['file'], entry['md5'])
+        rotation = g1_getup_track.hold_frames(clip)['rot'][:1, 0]
+        kind = int(task.track_start_class(task.projected_gravity(rotation))[0])
+        classes.append(task.TRACK_CLASSES[kind] if kind >= 0 else '—')
+    return [entry['file'] for entry in entries], classes
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('policy', help='этап g1_getup с track_clip или reference (ПД по самому клипу, без политики)')
+    parser.add_argument('--clip-index', type=int, action='append', default=[],
+                        help='этап с track_clips: только этот клип (номер в списке, можно несколько раз; по умолчанию '
+                             'все, с итогом по каждому)')
+    parser.add_argument('--physics', default=','.join(PHYSICS), help='физики через запятую: ' + ', '.join(PHYSICS))
     parser.add_argument('--clip', default=DEFAULT_CLIP, help='клип для reference (runs/humanoid_lab/getup_track/<имя>.npz)')
     parser.add_argument('--episodes', type=int, default=10, help='стартов с шумного первого кадра на физику')
+    parser.add_argument('--frame', type=int, help='старты с этого кадра клипа (его скорости и тот же шум), а не с первого')
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--compare', action='append', default=[],
                         help='reference: ещё клип для таблицы кинематики (можно несколько раз)')
@@ -321,8 +373,17 @@ def main():
             if args.out:
                 args.out.write_text(json.dumps(dict(kinematics=kinematics), indent=1), encoding='utf-8')
             return
-    jobs = [dict(policy=policy, clip=args.clip, physics=p, start='clip', row=None, seed=SEED + k)
-            for p in PHYSICS for k in range(args.episodes)]
+    physics = [p for p in args.physics.split(',') if p]
+    if set(physics) - set(PHYSICS):
+        raise SystemExit(f'физики: {", ".join(PHYSICS)}')
+    clips = None if policy == 'reference' else stage_clips(policy)
+    if args.clip_index and clips is None:
+        raise SystemExit('--clip-index — для этапа с track_clips')
+    indices = [None] if clips is None else (args.clip_index or list(range(len(clips[0]))))
+    if clips is not None and any(not 0 <= k < len(clips[0]) for k in indices):
+        raise SystemExit(f'--clip-index: клипы 0…{len(clips[0]) - 1}')
+    jobs = [dict(policy=policy, clip=args.clip, physics=p, start='clip', row=None, seed=SEED + k, clip_index=index,
+                 frame=args.frame) for index in indices for p in physics for k in range(args.episodes)]
     bank = bank_module.load()
     for kind in BANK_CLASSES:
         rows = np.flatnonzero(bank['holdout'] & (bank['start_class'] == bank['classes'].index(kind)))
@@ -331,10 +392,13 @@ def main():
     with Pool(args.workers) as pool:
         runs = pool.map(run, jobs, chunksize=1)
     print(f'{policy}: следование клипу ({"ПД по клипу, без политики" if policy == "reference" else "политика"})')
-    for p in PHYSICS:
-        summary([r for r in runs if r['start'] == 'clip' and r['physics'] == p], f'шумный первый кадр, {p}')
+    first = 'шумный первый кадр' if args.frame is None else f'шумный кадр {args.frame} ({args.frame * .02:.2f} с)'
+    for p in physics:
+        summary([r for r in runs if r['start'] == 'clip' and r['physics'] == p], f'{first}, {p}')
     for kind in BANK_CLASSES:
         summary([r for r in runs if r['start'] == kind], f'банк, {kind} (отложенные строки, ours)')
+    if clips is not None:
+        clip_table(runs, *clips)
     if args.out:
         args.out.write_text(json.dumps(dict(policy=policy, clip=args.clip, runs=runs, kinematics=kinematics), indent=1),
                             encoding='utf-8')

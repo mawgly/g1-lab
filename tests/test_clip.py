@@ -271,9 +271,10 @@ class _Renderer:
         self.shape, self.pelvis = (height, width, 3), model.body('pelvis').id
         self.scene = mujoco.MjvScene(model, maxgeom=64)
 
-    def update_scene(self, data, camera):
+    def update_scene(self, data, camera, scene_option=None):
         _Renderer.shots.append(dict(distance=camera.distance, elevation=camera.elevation, azimuth=camera.azimuth,
                                     lookat=camera.lookat.copy(), pelvis=data.xpos[self.pelvis].copy(),
+                                    option=scene_option, qpos=data.qpos[:7].copy(),
                                     feet=data.xpos[[data.model.body(f'{side}_ankle_roll_link').id
                                                     for side in ('left', 'right')]].copy()))
 
@@ -515,4 +516,137 @@ def test_help_lists_the_scenarios_and_foci(monkeypatch, capsys):
         clip_module.main()
     text = capsys.readouterr().out
     assert all(name in text for name in (*ARMS, *GETUP, *HELD, *HEIGHT, *FAST, 'push_walk', 'three_quarter', 'hands',
-                                         'feet', 'carry_mid', 'random', '--draw', '--amplitude'))
+                                         'feet', 'carry_mid', 'random', '--draw', '--amplitude', '--terrain-type',
+                                         '--terrain-level', '--seed', 'curbs', 'stairs_up'))
+
+
+def test_a_terrain_tile_is_named_with_its_generator_number():
+    """terrain_parameter from the generators' constants (generator 3 level 5: steps 2 + 18·5/9 = 12 cm, curbs 2 +
+    13·5/9 = 9.2 cm; generator 2 level 9: slopes 15°); the footer in each language."""
+    from humanoid_sim.clip import terrain_label, terrain_parameter
+    assert terrain_parameter('stairs_up', 5, 3) == ('stairs', pytest.approx(12.))
+    assert terrain_parameter('curbs', 5, 3) == ('curbs', pytest.approx(2 + 13 * 5 / 9))
+    assert terrain_parameter('slope_down', 9, 2) == ('slope', pytest.approx(15.))
+    assert terrain_parameter('stairs_down', 0, 2) == ('stairs', pytest.approx(2.)) and terrain_parameter('flat', 3, 3) \
+        is None
+    assert footer(4., ('stairs_up', 5, 3, 2.06), False, 'terrain') == \
+        ' 4,0 с · лестница вверх, уровень 5 (ступень 12 см) · пройдено 2,1 м'
+    assert footer(3.2, ('curbs', 5, 3, 1.5), True, 'terrain', 'en') == \
+        'fell at 3.2 s · curbs, level 5 (height 9.2 cm) · walked 1.5 m'
+    assert footer(4., ('flat', 0, 2, .5), False, 'terrain', 'zh') == ' 4.0 s · 平地，第 0 级 · 行进 0.5 m'
+    assert terrain_label('pits', 9, 3) == 'ямы, уровень 9 (глубина 20 см)'
+    from humanoid_sim.tasks.g1_terrain import GENERATORS
+    kinds = {kind for spec in GENERATORS.values() for kind in spec.types}
+    for lang in TEXTS:
+        assert set(clip_module.TERRAIN_TEXTS[lang]['names']) == kinds
+        for kind in kinds:
+            for fell in (False, True):
+                text = footer(9.96, (kind, 9, 3 if kind in ('pits', 'curbs') else 2, -1.234), fell, 'terrain', lang)
+                if lang != 'ru':
+                    assert not CYRILLIC.search(text) and not re.search(r'\d,\d', text), text
+
+
+def test_terrain_options_go_with_walking_scenarios_only():
+    clip = configure(get_clip('slow'), terrain_type='stairs_up', terrain_level=5)
+    assert (clip.terrain, clip.measure, clip.view, clip.episode) == (('stairs_up', 5, None, None), 'terrain',
+                                                                    'three_quarter', True)
+    assert configure(get_clip('walk'), terrain_type='curbs', terrain_seed=1000).terrain == ('curbs', 0, 1000, None)
+    assert configure(get_clip('side_left_fast'), terrain_type='flat').view == 'front'  # a scenario's own view stays
+    assert configure(get_clip('walk')) == get_clip('walk')
+    for scenario, changes, message in (('arms_stand', dict(terrain_type='flat'), 'ходьбы'),
+                                       ('getup_back', dict(terrain_type='flat'), 'ходьбы'),
+                                       ('crouch_walk', dict(terrain_type='flat'), 'ходьбы'),
+                                       ('walk', dict(terrain_type='lava'), 'тип плитки'),
+                                       ('walk', dict(terrain_type='flat', terrain_level=10), 'Уровень'),
+                                       ('walk', dict(terrain_type='flat', terrain_level=True), 'Уровень'),
+                                       ('walk', dict(terrain_level=2), 'вместе'),
+                                       ('walk', dict(terrain_seed=2), 'вместе'),
+                                       ('walk', dict(terrain_type='flat', terrain_seed=-1), 'Карта'),
+                                       ('walk', dict(terrain_type='flat', load=1.), 'Груз')):
+        with pytest.raises(ValueError, match=message):
+            configure(get_clip(scenario), **changes)
+
+
+@pytest.fixture(scope='module')
+def terrain_stages(tmp_path_factory):
+    """Small walking stages on rough ground: generator 2 on map 7, generator 3 on its default map."""
+    from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
+    root = tmp_path_factory.mktemp('clip-terrain')
+    return {number: _small_stage(root / f'terrain{number}', 'g1_velocity', {'terrain': terrain},
+                                 lambda config: G1VelocityEnv(**config))
+            for number, terrain in ((2, {'seed': 7}), (3, {'generator': 3}))}
+
+
+def test_a_terrain_lane_starts_on_the_tile_facing_minus_y_with_the_camera_on_the_ground(terrain_stages, stages,
+                                                                                         monkeypatch):
+    """--terrain-type stairs_up --terrain-level 5 on a generator 3 stage: the reset with the command and the tile, the
+    robot on the tile's centre turned to -y with heading hold there, the three-quarter camera turned with it, looking
+    at the ground under the pelvis + 0.55 m from 3.2 m; the measure (type, level, generator, metres along -y); the
+    box tiles drawn by their boxes, their heightfields hidden."""
+    from humanoid_sim.tasks import g1_terrain
+    from humanoid_sim.tasks.g1_velocity import G1VelocityEnv
+    monkeypatch.setattr(mujoco, 'Renderer', _Renderer)
+    seen, reset = [], G1VelocityEnv.reset
+
+    def spy(self, **kwargs):
+        seen.append(dict(kwargs['options']))
+        out = reset(self, **kwargs)
+        seen.append(self.data.qpos[:2].copy())
+        return out
+    monkeypatch.setattr(G1VelocityEnv, 'reset', spy)
+    _Renderer.shots = []
+    clip = configure(get_clip('slow'), terrain_type='stairs_up', terrain_level=5)
+    frames = film_lane(terrain_stages[3], clip, .4)
+    centre = g1_terrain.tile_centres(3)[5, g1_terrain.TERRAIN_TYPES_3.index('stairs_up')]
+    assert seen[0] == {'command': (.5, 0., 0.), 'terrain_type': 'stairs_up', 'terrain_level': 5}
+    np.testing.assert_array_equal(seen[1], centre)
+    assert len(frames) == len(_Renderer.shots) == 10
+    first = _Renderer.shots[0]
+    assert (first['distance'], first['elevation'], first['azimuth']) == (3.2, -14., 45.)
+    assert abs(first['lookat'][2] - .55) < .05  # the platform: the ground at the heightfield's lift
+    assert np.linalg.norm(first['lookat'][:2] - first['pelvis'][:2]) < .01
+    assert all(frame[2][:3] == ('stairs_up', 5, 3) and abs(frame[2][3]) < .5 for frame in frames)
+    option = first['option']
+    assert option.geomgroup[g1_terrain.BOX_GROUP] and not option.geomgroup[clip_module.HIDDEN_GROUP]
+    yaw = [2 * math.atan2(shot['qpos'][6], shot['qpos'][3]) for shot in _Renderer.shots]
+    assert all(abs(math.remainder(angle + math.pi / 2, math.tau)) < .3 for angle in yaw)
+    composed = compose([frames], ['стало'], (64, 54), 'ru', clip.measure)
+    assert len(composed) == 10
+    with pytest.raises(ValueError, match='task_config terrain'):
+        film_lane(stages['walking'], clip, .1)
+    with pytest.raises(ValueError, match='генератора рельефа 2'):
+        film_lane(terrain_stages[2], configure(get_clip('slow'), terrain_type='pits'), .1)
+
+
+def test_the_terrain_option_draws_the_ground_the_robot_touches(terrain_stages):
+    from humanoid_sim.core import stage_task_config
+    from humanoid_sim.tasks import g1_terrain
+    from humanoid_sim.tasks.catalog import make_task
+    env = make_task('g1_velocity', 'g1_29dof', stage_task_config(terrain_stages[3]))
+    try:
+        model = env.unwrapped.model
+        ground = set(g1_terrain.ground_geoms(model))
+        boxed = [geom for geom in g1_terrain.terrain_geoms(model) if geom not in ground]
+        assert boxed and g1_terrain.terrain_boxes(model)
+        clip_module.terrain_option(model)
+        assert {int(model.geom_group[geom]) for geom in boxed} == {clip_module.HIDDEN_GROUP}
+        assert {int(model.geom_group[geom]) for geom in g1_terrain.terrain_geoms(model) if geom in ground} == {0}
+    finally:
+        env.close()
+
+
+def test_every_lane_of_a_terrain_clip_walks_the_first_lanes_map(terrain_stages, monkeypatch, tmp_path):
+    """render fills the map from the first lane's stage (or --seed) and films every lane on it."""
+    filmed = []
+
+    def film(stage, clip, *args, **kwargs):
+        filmed.append(clip.terrain)
+        return [(np.zeros((54, 64, 3), dtype=np.uint8), .04, (*clip.terrain[:2], clip.terrain[3], 0.), False, None,
+                 None)]
+    monkeypatch.setattr(clip_module, 'film_lane', film)
+    items = [('a', terrain_stages[2]), ('b', terrain_stages[3])]
+    clip_module.render(items, 'slow', tmp_path / 'c.webp', .04, size=(64, 54), terrain_type='stairs_down',
+                       terrain_level=2)
+    clip_module.render(items[::-1], 'slow', tmp_path / 'd.webp', .04, size=(64, 54), terrain_type='curbs',
+                       terrain_seed=11)
+    assert filmed == [('stairs_down', 2, 7, 2)] * 2 + [('curbs', 0, 11, 3)] * 2

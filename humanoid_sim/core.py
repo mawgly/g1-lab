@@ -43,14 +43,14 @@ def read_json(path, default=None):
 
 
 class RunLock:
-    """Windows byte-range lock: released by the OS even if a trainer crashes."""
+    """Byte-range lock released by the OS even if a trainer crashes: msvcrt on Windows, fcntl elsewhere (a rented
+    Linux GPU server)."""
 
     def __init__(self, run_dir):
         self.path = Path(run_dir) / 'trainer.lock'
         self.file = None
 
     def __enter__(self):
-        import msvcrt
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.file = self.path.open('a+b')
         if self.path.stat().st_size == 0:
@@ -58,16 +58,25 @@ class RunLock:
             self.file.flush()
         self.file.seek(0)
         try:
-            msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.lockf(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
         except OSError as exc:
             self.file.close()
             raise RuntimeError('Training is already running in this folder. Open humanoid_watch.cmd.') from exc
         return self
 
     def __exit__(self, *_):
-        import msvcrt
         self.file.seek(0)
-        msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.lockf(self.file, fcntl.LOCK_UN, 1, 0)
         self.file.close()
 
 

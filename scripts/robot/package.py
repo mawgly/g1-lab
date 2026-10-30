@@ -462,6 +462,10 @@ GETUP_HEADER = '# g1_getup: '
 GETUP_LABELS = ('getup', 'getup-off')
 GETUP_BOUND_TOL = 1e-5
 GETUP_STATE_NOTE = 'robot package: on with its policy in {policy_dir} (install_policy.sh getup)'
+# The getting-up chain's patch (iteration 82, sim2sim only for now): it edits GetUp's own lines of GETUP_PATCH, so with
+# it on that patch no longer checks out reversed and install_policy.sh getup would refuse the tree; no package carries
+# a tracker yet, so packages leave it out.
+CHAIN_PATCH = 'g1_ctrl-getupchain.patch'
 GETUP_ABOUT_37 = ('ветка 37 exp-9a88a0d1732f47f5 (итерация 37: `impact` 2, `pd_bound` c 0,6, `stand_pose_std` 0,7, '
                   '`action_change_unbounded`)')
 GETUP_ABOUT_39 = ('ветка 39 exp-f19f12fb1eff4ef3 (итерация 39: от этапа 753 ветки 37 с `stand_pose_std` 0,3; `impact` 2, '
@@ -690,12 +694,16 @@ LAFAN_WEIGHTS = ('style', 'amp')
 # (runs/humanoid_lab/getup_track/<file>.npz, its header's dataset). A LAFAN1 clip (the dataset missing in clips made
 # before CMU, or lafan1) is a research prototype and refused the same way; a CMU one (scripts/lab/getup_track_clip.py
 # --source cmu) may go to a robot: its licence allows commercial products (not reselling the data), with the
-# acknowledgement CMU_ACKNOWLEDGEMENT in the package's README.
+# acknowledgement CMU_ACKNOWLEDGEMENT in the package's README. So may a BONES-SEED one (--source bones): its licence
+# lets a Qualifying Startup (revenue under $1M) train and sell models on it, never redistribute the data, and asks a
+# model's README for BONES_ATTRIBUTION (LICENSE.md § 8, the text for machine learning models).
 LAFAN_SETTINGS = ('track_clip',)
 TRACK_DIR = SIM / 'runs' / 'humanoid_lab' / 'getup_track'
-COMMERCIAL_CLIPS = ('cmu',)
+COMMERCIAL_CLIPS = ('cmu', 'bones_seed')
 CMU_ACKNOWLEDGEMENT = ('The data used in this project was obtained from mocap.cs.cmu.edu. The database was created with '
                        'funding from NSF EIA-0196217.')
+BONES_ATTRIBUTION = ('Training data includes Motion Data by Bones Studio (https://bones.studio/). Use of the underlying '
+                     'dataset is subject to the BONES Motion Capture Dataset License Agreement.')
 
 
 def track_clip_header(folder, setting):
@@ -731,9 +739,11 @@ def check_licence(folder):
              '(лицензия CC BY-NC-ND 4.0 — без производных и без коммерческого использования): такую политику '
              'нельзя ставить в пакет для робота клиента')
     clip = None
-    # settle_clip (iteration 66): each clip whose first frame is a settling target, checked the same way.
+    # settle_clip (iteration 66): each clip whose first frame is a settling target, checked the same way; track_clips
+    # (iteration 78): each clip the tracker followed.
     settings = [(key, config[key]) for key in LAFAN_SETTINGS if config.get(key) is not None]
     settings += [('settle_clip', entry) for entry in config.get('settle_clip') or ()]
+    settings += [('track_clips', entry) for entry in config.get('track_clips') or ()]
     for key, setting in settings:
         header = track_clip_header(folder, setting)
         dataset = header.get('dataset', 'lafan1')
@@ -741,8 +751,13 @@ def check_licence(folder):
             fail(f'{folder.name}: этап обучен следовать записи человека из LAFAN1 ({key}: {setting["file"]}, '
                  f'данные {dataset}; лицензия CC BY-NC-ND 4.0 — без производных и без коммерческого использования): это '
                  'исследовательский прототип, такую политику нельзя ставить в пакет для робота')
+        found = dict(file=setting['file'], dataset=dataset, source=header.get('source'), frames=header.get('frames'))
         if clip is None:
-            clip = dict(file=setting['file'], dataset=dataset, source=header.get('source'), frames=header.get('frames'))
+            clip = found
+        # every dataset the clips came from, so README names each one's acknowledgement
+        clip.setdefault('datasets', [])
+        if dataset not in clip['datasets']:
+            clip['datasets'].append(dataset)
     return clip
 
 
@@ -1185,16 +1200,30 @@ Velocity — №8. Как вести сеанс — `PROTOCOL.md`, «Встав�
 
 def track_clip_note(clip):
     """README.md's paragraph on the human clip a getting-up policy was trained to follow (check_licence's track clip;
-    '' without one): the CMU database's acknowledgement, which its licence asks for."""
+    '' without one): the acknowledgement each dataset's licence asks for (CMU_ACKNOWLEDGEMENT, BONES_ATTRIBUTION), the
+    first clip's dataset described, every other dataset of the stage's clips (settle_clip) credited after it. A CMU-only
+    stage gets the paragraph of the packages built before BONES-SEED, byte for byte."""
     if not clip:
         return ''
     frames = clip.get('frames') or []
     span = f', кадры {frames[0]}–{frames[1]}' if len(frames) == 2 else ''
-    return (f"\n\n**Данные движения.** Политика обучена следовать записи человека: база захвата движений CMU, субъект "
-            f"140, запись `{clip.get('source')}`{span}\n(клип `{clip['file']}`, перенос на G1 — "
-            "`scripts/lab/cmu_mocap.py`). Лицензия базы разрешает коммерческие продукты, но не перепродажу самих\n"
-            f"данных, даже в переработанном виде; данных в пакете нет. Благодарность, о которой просит база:\n\n"
-            f"> {CMU_ACKNOWLEDGEMENT}")
+    if clip.get('dataset') == 'bones_seed':
+        note = (f"\n\n**Данные движения.** Политика обучена следовать записи человека: набор BONES-SEED (Bones Studio), "
+                f"файл\n`{clip.get('source')}`{span} (клип `{clip['file']}`, перенос на G1 — NVIDIA, подгонка к нашей "
+                "модели —\n`scripts/lab/getup_track_clip.py`). Лицензия набора разрешает обучать и продавать модели, "
+                "но не передавать\nсами данные; данных в пакете нет. Указание источника, которого требует лицензия:\n\n"
+                f"> {BONES_ATTRIBUTION}")
+    else:
+        note = (f"\n\n**Данные движения.** Политика обучена следовать записи человека: база захвата движений CMU, "
+                f"субъект 140, запись `{clip.get('source')}`{span}\n(клип `{clip['file']}`, перенос на G1 — "
+                "`scripts/lab/cmu_mocap.py`). Лицензия базы разрешает коммерческие продукты, но не перепродажу самих\n"
+                f"данных, даже в переработанном виде; данных в пакете нет. Благодарность, о которой просит база:\n\n"
+                f"> {CMU_ACKNOWLEDGEMENT}")
+    credits = dict(cmu=CMU_ACKNOWLEDGEMENT, bones_seed=BONES_ATTRIBUTION)
+    for dataset in clip.get('datasets') or ():
+        if dataset != clip.get('dataset') and dataset in credits:
+            note += f"\n\nДругие клипы этапа (доводка) взяты и из этих данных:\n\n> {credits[dataset]}"
+    return note
 
 
 def getup_readme(getup):
@@ -2054,6 +2083,7 @@ def build(name, key, getup_dir=None):
         fail(f'в scripts/sim2sim/patches нет {HEIGHT_PATCH}, а без него g1_ctrl политику с высотой не примет')
     if not height:
         found.pop(HEIGHT_PATCH, None)
+    found.pop(CHAIN_PATCH, None)
     if getup is not None:
         if GETUP_PATCH not in found:
             fail(f'в scripts/sim2sim/patches нет {GETUP_PATCH}, а без него g1_ctrl состояния GetUp не знает')

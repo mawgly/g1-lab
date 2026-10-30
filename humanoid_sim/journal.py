@@ -22,8 +22,9 @@ from pathlib import Path
 from .core import read_json, write_json
 
 ROADMAP_STATUS = ('done', 'active', 'next')
-IMAGE_NAME = re.compile(r'^[A-Za-z0-9_-]{1,80}\.(png|jpg|webp)$')  # webp: animated clips (humanoid_sim.clip)
-CONTENT_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp'}
+IMAGE_NAME = re.compile(r'^[A-Za-z0-9_-]{1,80}\.(png|jpg|webp|mp4)$')  # webp: animated clips (humanoid_sim.clip); mp4: a
+# finished video a page names by data-media (the home page's crowd, 30.10)
+CONTENT_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp', '.mp4': 'video/mp4'}
 # Interactive explanatory figures (humanoid_sim/figures, anatomy kit): standalone pages the tab shows sandboxed.
 FIGURE_NAME = re.compile(r'^[A-Za-z0-9_-]{1,80}\.html$')
 ENTRY_ID = re.compile(r'^[a-z0-9-]{1,80}$')
@@ -72,7 +73,7 @@ def _race(race):
 def add_media(root, source, name):
     """Copies an image or clip into the journal folder under `name`; returns the name for entries to use."""
     if not isinstance(name, str) or not IMAGE_NAME.match(name) or not Path(source).is_file():
-        raise ValueError('Файл дневника: PNG, JPG или WebP')
+        raise ValueError('Файл дневника: PNG, JPG, WebP или MP4')
     folder(root).mkdir(parents=True, exist_ok=True)
     if Path(source).resolve() != (folder(root) / name).resolve():
         shutil.copyfile(source, folder(root) / name)
@@ -200,6 +201,30 @@ def add_entry(root, entry_id, title, text, image=None, race=None, at=None, clip=
     def change(data):
         data['entries'] = sorted([e for e in data['entries'] if e['id'] != entry_id] + [entry],
                                  key=lambda e: e['at'], reverse=True)
+    return _edit(root, change)
+
+
+def add_entry_clips(root, entry_id, clips, keep_main=True):
+    """Puts clips under an entry, after its text (28.10, Pavel: as many videos as there are): clips is
+    [(webp path, poster path, caption)], copied as «<id>-clip-<k>.webp/.jpg», shown in order with their caption.
+    They replace the entry's earlier extra clips; keep_main=False drops its single clip / poster (a wrong one)."""
+    if not isinstance(clips, (list, tuple)) or not 1 <= len(clips) <= 12:
+        raise ValueError('Запись: от 1 до 12 роликов')
+    rows = []
+    for k, (clip, poster, caption) in enumerate(clips, 1):
+        rows.append({'clip': add_media(root, clip, f'{entry_id}-clip-{k}.webp'),
+                     'poster': add_media(root, poster, f'{entry_id}-clip-{k}.jpg'),
+                     'caption': _text(caption, 'Подпись ролика', 600)})
+
+    def change(data):
+        for entry in data['entries']:
+            if entry['id'] == entry_id:
+                entry['clips'] = rows
+                if not keep_main:
+                    entry.pop('clip', None)
+                    entry.pop('poster', None)
+                return
+        raise ValueError(f'Запись {entry_id} не найдена')
     return _edit(root, change)
 
 

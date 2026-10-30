@@ -25,13 +25,24 @@
 #                                      it (gamepad.py --fall, --getup-velocity: then the first argument's walking
 #                                      export in Velocity). The getup scenario's report is g1_ctrl's state changes
 #                                      and getup_report.py (getup.json), no analyze.py.
+#   --getup-track <export dir>         with --getup: the getting-up chain (setup.sh's g1_ctrl-getupchain.patch,
+#                                      scripts/lab/probes/getup_chain.py): a tracker export (export_g1 of a
+#                                      track_clip stage with --handover-frame: its handover.yaml) installed into
+#                                      config/policy/getup_track and GetUpBlend / GetUpTrack turned on in config.yaml
+#                                      for this run, so GetUp hands over by itself (the pelvis rule), the PD takes it
+#                                      to the tracker's frame and the tracker runs; gamepad.py waits for GetUpTrack in
+#                                      g1_ctrl.log and presses RT + A --track-seconds later (default: the clip's rest
+#                                      from the frame plus TRACK_RT_HOLD s). The run's folder gets -chain.
 #   --hand-load <kg>[,<kg>]            loads in the hands of unitree_mujoco's G1 (both, or left,right), as
 #                                      task_config arm_targets trains them: hand_load.py writes scene_29dof_load.xml
 #                                      (each wrist_yaw_link's mass + kg, its COM moved toward the palm, x 0.11 in the
 #                                      link) next to Unitree's and the run puts it into simulate/config.yaml's
 #                                      robot_scene (the original put back when it ends, as with --fixstand-wrist).
+#   --hand-capsules                    Unitree's hand capsules (task_config hand_collision) on unitree_mujoco's G1,
+#                                      whose rubber hands do not collide: hand_load.py --capsules, the same scene as
+#                                      --hand-load (load 0 unless given). The run's folder gets -caps.
 # Results: $ROOT/sim2sim_logs/<export>-<time>[-<scenario>[<side>|<fall>][-walking][-dv<v>[_<v>...]]]
-#   [-leftwrist|-rightwrist][-load<kg>]/ (CSV logs, process logs, g1_ctrl_config.yaml as used, report.txt /
+#   [-leftwrist|-rightwrist][-load<kg>][-caps]/ (CSV logs, process logs, g1_ctrl_config.yaml as used, report.txt /
 #   report.json);
 #   <side> is --side's value for side / sidestop when given (side0.5, sidestop-0.3), <fall> getup's --fall,
 #   --fall-push and --fall-passive when given (-stand-back2.25-limp, -forward1).
@@ -46,13 +57,19 @@ shift $(( $# > 0 ? 1 : 0 ))
 WRIST_DEFAULT=0.699999988
 WRIST=""  # left|right[=rad]
 GETUP=""  # a g1_getup export dir
+TRACK=""  # a tracker export dir (the getting-up chain)
+TRACK_RT_HOLD=1.5  # s after the clip's end (the tracker holds the last pose 3 s) before RT + A
 LOAD=""  # hand loads, kg (one number or left,right)
+CAPSULES=""  # --hand-capsules: Unitree's hand capsules on unitree_mujoco's G1 (hand_load.py --capsules)
 ARGS=()  # gamepad.py's options
 while [ $# -gt 0 ]; do
   case $1 in
     --getup) GETUP=${2:-}; shift ;;
     --getup=*) GETUP=${1#*=} ;;
+    --getup-track) TRACK=${2:-}; shift ;;
+    --getup-track=*) TRACK=${1#*=} ;;
     --hand-load) LOAD=${2:-}; shift ;;
+    --hand-capsules) CAPSULES=--capsules ;;
     --hand-load=*) LOAD=${1#*=} ;;
     --fixstand-wrist) WRIST=${2:-}; shift ;;
     --fixstand-wrist=*) WRIST=${1#*=} ;;
@@ -94,6 +111,8 @@ SCENARIO=$SCENARIO$WALKING${DV//,/_}
 TAG=""
 [ -n "$WRIST_SIDE" ] && TAG=-${WRIST_SIDE}wrist
 [ -n "$LOAD" ] && TAG=$TAG-load${LOAD//,/_}
+[ -n "$CAPSULES" ] && TAG=$TAG-caps
+[ -n "$TRACK" ] && TAG=$TAG-chain
 NAME=$(basename "$EXPORT")-$(date +%Y%m%d-%H%M%S)$SCENARIO$TAG
 OUT=$ROOT/sim2sim_logs/$NAME
 FIFO=/tmp/sim2sim_js0
@@ -141,6 +160,25 @@ if [ -n "$GETUP" ]; then
   grep -q 'sim2sim getup patch' "$G1/build/g1_ctrl" ||
     { echo "g1_ctrl is built without patches/g1_ctrl-getup.patch, --getup needs it: run setup.sh g1ctrl"; exit 1; }
 fi
+# The getting-up chain: a tracker export with its hand-over frame, g1_ctrl with the getupchain patch, GetUp's policy
+# first; the tracker goes to GetUpTrack's policy_dir (v9_lab), its handover.yaml to params/ (GetUp's rule and
+# GetUpBlend read it there).
+TRACK_POLICY=$G1/config/policy/getup_track/v9_lab
+TRACK_SECONDS=""
+if [ -n "$TRACK" ]; then
+  [ -n "$GETUP" ] || { echo "--getup-track needs --getup <export>: the chain starts in GetUp"; exit 1; }
+  for f in policy.onnx deploy.yaml handover.yaml; do
+    [ -f "$TRACK/$f" ] || { echo "no $TRACK/$f (handover.yaml: export_g1 --handover-frame)"; exit 1; }
+  done
+  grep -q '^# track_clip: ' "$TRACK/deploy.yaml" || { echo "$TRACK is not a track_clip export (export_g1)"; exit 1; }
+  grep -q 'sim2sim getupchain patch' "$G1/build/g1_ctrl" ||
+    { echo "g1_ctrl is built without patches/g1_ctrl-getupchain.patch, --getup-track needs it: run setup.sh g1ctrl"; exit 1; }
+  CLIP_SECONDS=$(sed -n 's/^clip_seconds: //p' "$TRACK/handover.yaml")
+  [ -n "$CLIP_SECONDS" ] || { echo "$TRACK/handover.yaml has no clip_seconds"; exit 1; }
+  TRACK_SECONDS=$(awk -v a="$CLIP_SECONDS" -v b="$TRACK_RT_HOLD" 'BEGIN { printf "%.2f", a + b }')
+  # gamepad.py's options go first, so the command line's --track-seconds or --getup-seconds wins
+  ARGS=(--chain-log "$OUT/g1_ctrl.log" --track-seconds "$TRACK_SECONDS" "${ARGS[@]}")
+fi
 mkdir -p "$OUT" "$POLICY/exported" "$POLICY/params"
 cp "$EXPORT/policy.onnx" "$POLICY/exported/policy.onnx"
 cp "$EXPORT/deploy.yaml" "$POLICY/params/deploy.yaml"
@@ -153,6 +191,14 @@ if [ -n "$GETUP" ]; then
   cp "$GETUP/policy.onnx" "$GETUP/deploy.yaml" "$OUT/getup/"
   echo "$GETUP" > "$OUT/getup/export.txt"
   chown -R mawgly:mawgly "$GETUP_POLICY"
+fi
+if [ -n "$TRACK" ]; then
+  mkdir -p "$TRACK_POLICY/exported" "$TRACK_POLICY/params" "$OUT/getup_track"
+  cp "$TRACK/policy.onnx" "$TRACK_POLICY/exported/policy.onnx"
+  cp "$TRACK/deploy.yaml" "$TRACK/handover.yaml" "$TRACK_POLICY/params/"
+  cp "$TRACK/policy.onnx" "$TRACK/deploy.yaml" "$TRACK/handover.yaml" "$OUT/getup_track/"
+  echo "$TRACK" > "$OUT/getup_track/export.txt"
+  chown -R mawgly:mawgly "$TRACK_POLICY"
 fi
 chown -R mawgly:mawgly "$OUT" "$POLICY"
 
@@ -174,8 +220,9 @@ if [ -n "$WRIST_SIDE" ]; then
   "$ROOT/venv/bin/python" "$HERE/fixstand.py" "$CFG.sim2sim-orig" "$CFG" "$WRIST_JOINT=$WRIST_Q" ||
     { echo "fixstand.py failed"; exit 1; }
 fi
+[ -n "$CAPSULES" ] && [ -z "$LOAD" ] && LOAD=0
 if [ -n "$LOAD" ]; then  # the robot with loads in its hands: a scene next to Unitree's, in simulate/config.yaml
-  "$ROOT/venv/bin/python" "$HERE/hand_load.py" "$ROOT/unitree_mujoco/unitree_robots/g1" "$LOAD" > "$OUT/hand_load.txt" ||
+  "$ROOT/venv/bin/python" "$HERE/hand_load.py" "$ROOT/unitree_mujoco/unitree_robots/g1" "$LOAD" $CAPSULES     > "$OUT/hand_load.txt" ||
     { echo "hand_load.py failed"; exit 1; }
   cp -p "$SIMCFG" "$SIMCFG.sim2sim-orig"
   sed -i 's/^robot_scene: .*$/robot_scene: "scene_29dof_load.xml" # sim2sim run.sh --hand-load/' "$SIMCFG"
@@ -188,6 +235,12 @@ if [ -n "$GETUP" ]; then  # the getup patch's config.yaml lists GetUp commented 
   sed -i 's/^    # GetUp: {id: 4, type: RLBase}.*$/    GetUp: {id: 4, type: RLBase}/' "$CFG"
   grep -q '^    GetUp: {id: 4, type: RLBase}$' "$CFG" ||
     { echo "$CFG has no GetUp line of patches/g1_ctrl-getup.patch: run setup.sh g1ctrl"; exit 1; }
+fi
+if [ -n "$TRACK" ]; then  # the getupchain patch's config.yaml lists both states commented out, as GetUp
+  sed -i -e 's/^    # GetUpBlend: {id: 6, type: GetUpBlend}.*$/    GetUpBlend: {id: 6, type: GetUpBlend}/' \
+    -e 's/^    # GetUpTrack: {id: 7, type: RLBase}.*$/    GetUpTrack: {id: 7, type: RLBase}/' "$CFG"
+  grep -q '^    GetUpBlend: {id: 6, type: GetUpBlend}$' "$CFG" && grep -q '^    GetUpTrack: {id: 7, type: RLBase}$' "$CFG" ||
+    { echo "$CFG has no GetUpBlend / GetUpTrack lines of patches/g1_ctrl-getupchain.patch: run setup.sh g1ctrl"; exit 1; }
 fi
 cp "$CFG" "$OUT/g1_ctrl_config.yaml"
 md5sum "$G1/build/g1_ctrl" > "$OUT/g1_ctrl.md5"  # which build ran (with the height patch or without)
@@ -229,7 +282,7 @@ restore_all
 chown -R mawgly:mawgly "$OUT"
 
 if [[ $SCENARIO == -getup* ]]; then  # analyze.py follows Velocity; here what g1_ctrl did, from its log, and the rise
-  grep -E 'FSM: (Start|Change state)|GetUp|getup patch|fall-passive patch|kept the previous target' \
+  grep -E 'FSM: (Start|Change state)|GetUp|getup patch|getupchain patch|fall-passive patch|kept the previous target' \
     "$OUT/g1_ctrl.log" | tee "$OUT/report.txt"
   "${AS_USER[@]}" "$ROOT/venv/bin/python" "$HERE/getup_report.py" "$OUT" | tee -a "$OUT/report.txt"
   chown mawgly:mawgly "$OUT/report.txt"

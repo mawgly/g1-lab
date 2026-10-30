@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="site-mode" content="live" />
+    <title>Как это работает · G1 Lab</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="site.css" />
+    <script type="module" src="how.js"></script>
+    <style>
+      /* This page only; the shared tokens and components are in site.css. */
+      .how-head {
+        padding-top: 44px;
+      }
+      .how-head h1 {
+        margin-bottom: 10px;
+      }
+      .flow {
+        list-style: none;
+        margin: 26px 0 0;
+        padding: 0;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px;
+        counter-reset: step;
+      }
+      .flow li {
+        counter-increment: step;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 12px 14px;
+        background: var(--surface, transparent);
+      }
+      .flow li::before {
+        content: counter(step);
+        display: inline-grid;
+        place-items: center;
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        margin-bottom: 8px;
+        font: 600 12px/1 'IBM Plex Mono', monospace;
+        border: 1px solid currentColor;
+      }
+      .flow b {
+        display: block;
+        margin-bottom: 4px;
+      }
+      .flow span {
+        font-size: 13px;
+        opacity: 0.8;
+      }
+      .tool b {
+        display: block;
+        margin: 4px 0 6px;
+      }
+      .tool .version {
+        font: 500 13px/1 'IBM Plex Mono', monospace;
+        opacity: 0.75;
+        margin-left: 6px;
+      }
+      .tool p {
+        margin: 0 0 8px;
+      }
+      .tool small {
+        display: block;
+        opacity: 0.7;
+      }
+      .how-group h2 {
+        margin-bottom: 8px;
+      }
+      .chapters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 18px;
+        margin-top: 18px;
+      }
+      .lab-figures {
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        margin-top: 18px;
+      }
+      .lab-figures div {
+        border-top: 1px solid var(--line);
+        padding-top: 10px;
+        font-size: 14px;
+      }
+      .lab-figures span {
+        display: block;
+        font: 700 30px/1.1 Manrope, sans-serif;
+        margin-bottom: 4px;
+      }
+      .how-group .note {
+        margin-bottom: 18px;
+      }
+    </style>
+  </head>
+  <body>
+    <main id="top">
+      <section class="how-head wrap">
+        <h1>Как это работает</h1>
+        <p class="lead">
+          Здесь я по частям рассказываю, как устроена лаборатория. Числа и версии на странице берутся прямо из файлов
+          лаборатории, поэтому они всегда те, что есть сейчас.
+        </p>
+        <nav class="chapters" aria-label="Главы">
+          <a href="#tools">Глава 1. Чем мы пользуемся</a><a href="#team">Глава 2. ИИ-команда и как устроена работа</a>
+        </nav>
+      </section>
+
+      <section class="how-head wrap" id="tools" aria-labelledby="tools-title">
+        <p class="eyebrow">Глава 1</p>
+        <h2 id="tools-title">Чем мы пользуемся</h2>
+        <p class="note">Программы и данные лаборатории: что делает каждая и где её место на пути от физики до робота.</p>
+        <ol class="flow" aria-label="Путь навыка">
+          <li><b>Физика</b><span>MuJoCo и MuJoCo Warp</span></li>
+          <li><b>Обучение</b><span>PyTorch на видеокарте</span></li>
+          <li><b>Проверка у нас</b><span>MuJoCo на процессоре</span></li>
+          <li><b>Чужая физика</b><span>unitree_mujoco и g1_ctrl</span></li>
+          <li><b>Выгрузка</b><span>ONNX</span></li>
+          <li><b>Робот</b><span>пакет и паспорт кандидата</span></li>
+        </ol>
+      </section>
+
+      <section class="how-group section wrap" aria-labelledby="g-physics">
+        <h2 id="g-physics">Физика и обучение</h2>
+        <p class="note">
+          Робот учится в симуляции: тысячи его копий одновременно пробуют, падают и получают награду. Одна и та же
+          физика считается двумя способами — быстро на видеокарте для обучения и точно на процессоре для проверки.
+        </p>
+        <div class="grid cards-260">
+          <article class="card tool">
+            <span class="tag">физика</span>
+            <b>MuJoCo<span class="version" data-version="mujoco"></span></b>
+            <p>Физический движок Google DeepMind. На процессоре, с двойной точностью: на нём идут все проверки этапов, ролики и пробы.</p>
+            <small>Apache 2.0</small>
+          </article>
+          <article class="card tool">
+            <span class="tag">физика на видеокарте</span>
+            <b>MuJoCo Warp<span class="version" data-version="mujoco_warp"></span></b>
+            <p>Та же физика на видеокарте: 4096 роботов шагают одновременно. Построена на NVIDIA Warp.</p>
+            <small>Apache 2.0</small>
+          </article>
+          <article class="card tool">
+            <span class="tag">физика на видеокарте</span>
+            <b>NVIDIA Warp<span class="version" data-version="warp"></span></b>
+            <p>Язык расчётов на видеокарте, на котором написан MuJoCo Warp; первый запуск на новой карте компилирует его ядра.</p>
+            <small>Apache 2.0</small>
+          </article>
+          <article class="card tool">
+            <span class="tag">обучение</span>
+            <b>PyTorch<span class="version" data-version="torch"></span></b>
+            <p>Нейросеть робота и обучение PPO прямо на видеокарте, без копирования данных в процессор. CUDA 13.</p>
+            <small>BSD</small>
+          </article>
+          <article class="card tool">
+            <span class="tag">обучение</span>
+            <b>Gymnasium и Stable-Baselines3<span class="version" data-version="sb3"></span></b>
+            <p>Формат задач и формат сохранения политик: каждый этап обучения читается на любом компьютере.</p>
+            <small>MIT</small>
+          </article>
+          <article class="card tool">
+            <span class="tag">формулы</span>
+            <b>NumPy<span class="version" data-version="numpy"></span></b>
+            <p>Формулы наград и наблюдений написаны один раз и считаются одинаково на процессоре и на видеокарте.</p>
+            <small>BSD</small>
+          </article>
+          <article class="card tool">
+            <span class="tag">модель робота</span>
+            <b>Unitree G1, 29 суставов</b>
+            <p>Модель из unitree_mujoco и настройки моторов из unitree_rl_mjlab. Любая правка файлов модели делает старые этапы несовместимыми — это проверяется при каждой загрузке.</p>
+            <small>BSD 3-Clause · Apache 2.0</small>
+          </article>
+        </div>
+      </section>
+
+      <section class="how-group band section" aria-labelledby="g-unitree">
+        <div class="wrap">
+          <h2 id="g-unitree">Проверка в чужой физике: стек Unitree</h2>
+          <p class="note">
+            Мы не верим только своей симуляции. Каждый кандидат запускается программой управления самой Unitree в их
+            симуляторе — той же программой, что будет работать на настоящем роботе.
+          </p>
+          <div class="grid cards-260">
+            <article class="card tool">
+              <span class="tag">симулятор</span>
+              <b>unitree_mujoco<span class="version" data-version="unitree_mujoco"></span></b>
+              <p>Симулятор Unitree на своём MuJoCo. Мы добавили толчки с точно заданной силой.</p>
+              <small>BSD 3-Clause</small>
+            </article>
+            <article class="card tool">
+              <span class="tag">управление</span>
+              <b>g1_ctrl (unitree_rl_mjlab)</b>
+              <p>Штатная программа, которая запускает нейросеть на роботе. Наши патчи: вставание, высота, руки по целям и найденные исправления.</p>
+              <small>Apache 2.0</small>
+            </article>
+            <article class="card tool">
+              <span class="tag">связь</span>
+              <b>unitree_sdk2</b>
+              <p>Связь программы управления с роботом или симулятором, как на настоящем G1.</p>
+            </article>
+            <article class="card tool">
+              <span class="tag">мерка</span>
+              <b>Штатная политика v0</b>
+              <p>Обученная политика ходьбы от Unitree. Мы её не дообучаем и не берём в свои модели: только сравниваем с ней каждого кандидата.</p>
+            </article>
+            <article class="card tool">
+              <span class="tag">окружение</span>
+              <b>WSL2, Ubuntu</b>
+              <p>Linux внутри Windows: в нём собраны и работают программы Unitree, рядом с лабораторией.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="how-group section wrap" aria-labelledby="g-robot">
+        <h2 id="g-robot">Путь до робота</h2>
+        <p class="note">
+          Обученный этап превращается в файл, который читает программа Unitree, и собирается в пакет с инструкцией и
+          числами всех проверок.
+        </p>
+        <div class="grid cards-260">
+          <article class="card tool">
+            <span class="tag">выгрузка</span>
+            <b>ONNX<span class="version" data-version="onnx"></span></b>
+            <p>Формат нейросети, который читает g1_ctrl. Нормировка входов и все ограничения действий — внутри файла.</p>
+            <small>Apache 2.0</small>
+          </article>
+          <article class="card tool">
+            <span class="tag">сверка</span>
+            <b>ONNX Runtime<span class="version" data-version="onnxruntime"></span></b>
+            <p>Запускает выгруженный файл и сверяет его ответы с обученной политикой на 200 настоящих состояниях, до 0,0001.</p>
+            <small>MIT</small>
+          </article>
+          <article class="card tool">
+            <span class="tag">наше</span>
+            <b>Пакет и паспорт кандидата</b>
+            <p>Политика, патчи, инструкция первого запуска и паспорт: что робот умеет, с какими числами и где слабые места.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="how-group band section" aria-labelledby="g-data">
+        <div class="wrap">
+          <h2 id="g-data">Движения людей</h2>
+          <p class="note">
+            Новые навыки, например вставание, робот учит, повторяя записи движений людей. У каждой записи своя лицензия,
+            и мы её соблюдаем: что можно отдать в робот клиента, а что — только для исследования.
+          </p>
+          <div class="grid cards-260">
+            <article class="card tool">
+              <span class="tag">можно в продукт</span>
+              <b>BONES-SEED</b>
+              <p>Записи Bones Studio, уже перенесённые на G1. Модели на них можно обучать и продавать; сами записи мы не публикуем.</p>
+            </article>
+            <article class="card tool">
+              <span class="tag">можно в продукт</span>
+              <b>CMU Motion Capture</b>
+              <p>Архив Университета Карнеги — Меллона. Можно использовать в продуктах, нельзя перепродавать сами данные.</p>
+            </article>
+            <article class="card tool">
+              <span class="tag">только исследование</span>
+              <b>LAFAN1</b>
+              <p>Записи Ubisoft, лицензия CC BY-NC-ND 4.0. Политики, обученные на них, никогда не попадают в пакет робота.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="how-group section wrap" aria-labelledby="g-team">
+        <h2 id="g-team">ИИ-команда</h2>
+        <p class="note">
+          Код пишут и эксперименты ведут ИИ-агенты, я ставлю цели и правила и проверяю результат. Как они делят работу —
+          в главе 2.
+        </p>
+        <div class="grid cards-260">
+          <article class="card tool">
+            <span class="tag">агенты</span>
+            <b>Claude Code</b>
+            <p>Руководитель и семь агентов: критик, разведчик, инженер, аналитик, ревизор, дежурный, летописец. Перевод сайта — отдельный агент на Claude Haiku.</p>
+          </article>
+          <article class="card tool">
+            <span class="tag">схемы</span>
+            <b>anatomy</b>
+            <p>Набор для объёмных поясняющих схем в журнале; числа в схемах берутся из кода, который они объясняют.</p>
+            <small>MIT</small>
+          </article>
+        </div>
+      </section>
+
+      <section class="how-group band section" aria-labelledby="g-infra">
+        <div class="wrap">
+          <h2 id="g-infra">Железо, сайт и публикация</h2>
+          <p class="note">
+            Всё ставится в папку проекта, ничего не устанавливается в систему: лабораторию можно перенести на другой
+            компьютер или арендованный сервер одной командой.
+          </p>
+          <div class="grid cards-260">
+            <article class="card tool">
+              <span class="tag">видеокарта</span>
+              <b>RTX 4080 SUPER</b>
+              <p>Домашний компьютер: на нём идёт основное обучение, около 30 тысяч шагов симуляции в секунду на вставании.</p>
+            </article>
+            <article class="card tool">
+              <span class="tag">видеокарта в аренду</span>
+              <b>immers.cloud</b>
+              <p>Арендованные карты для параллельных веток. Первый тест: RTX 2080 Ti, 13,7 тысячи шагов в секунду; этап вернулся домой и проверен.</p>
+            </article>
+            <article class="card tool">
+              <span class="tag">окружение</span>
+              <b>Python<span class="version" data-version="python"></span>, uv, Node</b>
+              <p>Переносные версии в папке проекта; зависимости закреплены точными номерами.</p>
+            </article>
+            <article class="card tool">
+              <span class="tag">3D</span>
+              <b>three.js<span class="version" data-version="three"></span></b>
+              <p>Объёмный просмотр и гонка этапов в браузере.</p>
+              <small>MIT</small>
+            </article>
+            <article class="card tool">
+              <span class="tag">сайт</span>
+              <b>g1lab.ru</b>
+              <p>Этот сайт: статическая копия лаборатории на трёх языках, обновляется каждый день.</p>
+            </article>
+            <article class="card tool">
+              <span class="tag">код</span>
+              <b>GitHub mawgly/g1-lab</b>
+              <p>Открытый код лаборатории.</p>
+              <small>Apache 2.0</small>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="how-head wrap" id="team" aria-labelledby="team-title">
+        <p class="eyebrow">Глава 2</p>
+        <h2 id="team-title">ИИ-команда и как устроена работа</h2>
+        <p class="note">
+          Лаборатория — это я и команда ИИ-агентов на Claude. Я ставлю цель и правила, читаю журнал и поправляю курс,
+          решаю, что публиковать и на что тратить деньги. Ведущий агент планирует и решает изо дня в день, остальные —
+          специалисты с узкой задачей и своими правами: критик и ревизор ничего не меняют в проекте, инженер меняет
+          только код одного решения, переводчик — только переводы.
+        </p>
+        <div class="grid lab-figures">
+          <div><span data-count="branches"></span>веток обучения G1 в дереве, по одному изменению в каждой</div>
+          <div><span data-count="iterations"></span>итераций с разбором в «Совете лаборатории»</div>
+          <div><span data-count="entries"></span>записей в журнале</div>
+          <div><span data-count="lessons"></span>уроков того, что мы уже однажды пропустили</div>
+        </div>
+      </section>
+
+      <section class="how-group section wrap" aria-labelledby="g-roles">
+        <h2 id="g-roles">Кто что делает</h2>
+        <div class="grid cards-260">
+          <article class="card tool">
+            <span class="tag">Claude Opus</span>
+            <b>Ведущий агент</b>
+            <p>Планирует итерации, пишет код, запускает и останавливает ветки обучения, решает после разбора. Раз в час проверяет обучение, вечером публикует сайт.</p>
+          </article>
+          <article class="card tool">
+            <span class="tag">Claude Opus · ничего не меняет</span>
+            <b>Критик</b>
+            <p>Перед каждой новой веткой атакует предложение замерами: почему не сработает, что сработает быстрее, какой рычаг сильнее.</p>
+          </article>
+          <article class="card tool">
+            <span class="tag">Claude Sonnet</span>
+            <b>Разведчик</b>
+            <p>Ищет, как похожую задачу решают другие: репозитории Unitree, Isaac Lab, mjlab, свежие статьи. Приносит настройки с источниками, но не чужие обученные модели.</p>
+          </article>
+          <article class="card tool">
+            <span class="tag">Claude Opus</span>
+            <b>Инженер</b>
+            <p>Вносит в код одно согласованное изменение — новое правило, член награды, настройку — с тестами для обучения на процессоре и на видеокарте.</p>
+          </article>
+          <article class="card tool">
+            <span class="tag">Claude Sonnet</span>
+            <b>Аналитик</b>
+            <p>Отвечает на вопрос «почему» замерами: куда уводит робота, какие части награды съедают шаг, как меняется поведение от этапа к этапу.</p>
+          </article>
+          <article class="card tool">
+            <span class="tag">Claude Opus · ничего не меняет</span>
+            <b>Ревизор</b>
+            <p>Вторая подпись под кандидатом на робота: смотрит свежим взглядом, по кадрам и нормам, без рамки ведущего, и ищет то, о чём не спрашивали.</p>
+          </article>
+          <article class="card tool">
+            <span class="tag">Claude Sonnet</span>
+            <b>Дежурный</b>
+            <p>Проверяет, что сервер, очередь и обучение живы, и поднимает тревогу. Решений не принимает.</p>
+          </article>
+          <article class="card tool">
+            <span class="tag">Claude Sonnet</span>
+            <b>Летописец</b>
+            <p>Ведёт журнал простым языком: запись о каждом решении, ролик «было → стало», разбор итерации в «Совете лаборатории».</p>
+          </article>
+          <article class="card tool">
+            <span class="tag">Claude Haiku</span>
+            <b>Переводчик</b>
+            <p>Переводит журнал и сайт на английский и китайский. Проверка не примет перевод, в котором изменилось число, единица или имя ветки.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="how-group band section" aria-labelledby="g-cycle">
+        <div class="wrap">
+          <h2 id="g-cycle">Как идёт одна итерация</h2>
+          <ol class="flow" aria-label="Итерация">
+            <li><b>Предложение</b><span>ведущий: одно изменение, гипотеза, вехи и стоп-кран заранее</span></li>
+            <li><b>Разбор</b><span>критик меряет до обучения, разведчик смотрит, как у других</span></li>
+            <li><b>Изменение</b><span>инженер: код и тесты</span></li>
+            <li><b>Обучение</b><span>новая ветка в дереве, проверка каждый час</span></li>
+            <li><b>Решение</b><span>продолжить, ветвиться или тупик; заметка у ветки</span></li>
+            <li><b>Запись</b><span>летописец, ролик, перевод, публикация</span></li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="how-group section wrap" aria-labelledby="g-rules">
+        <h2 id="g-rules">Правила, которые держат работу честной</h2>
+        <div class="grid cards-260">
+          <article class="card tool">
+            <b>Одно изменение на ветку</b>
+            <p>Иначе не понять, что сработало. Каждая ветка — потомок проверенного этапа, дерево видно на странице «Лаборатория».</p>
+          </article>
+          <article class="card tool">
+            <b>Вехи и стоп-кран до запуска</b>
+            <p>Что должно получиться и когда остановиться, записывается заранее. Так, например, закрылись ветки вставания со спины и с бока по записям v3.</p>
+          </article>
+          <article class="card tool">
+            <b>Тупики тоже записываются</b>
+            <p>Неудачная ветка остаётся в дереве с причиной, чтобы её не повторять.</p>
+          </article>
+          <article class="card tool">
+            <b>Нормы и уроки</b>
+            <p>Общий файл с нормами в абсолютных числах — например, стопы стоя врозь на 0,27 м, как у кандидата 8, — и уроками пропущенных ошибок. Каждый агент читает его первым.</p>
+          </article>
+          <article class="card tool">
+            <b>Две подписи под роботом</b>
+            <p>Кандидата для настоящего робота принимают двое: ведущий и ревизор, который не видел рассуждений ведущего.</p>
+          </article>
+          <article class="card tool">
+            <b>Только измеренные числа</b>
+            <p>Всё, что на сайте и в журнале, — из замеров лаборатории. Чего не измерили, того в таблице нет.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

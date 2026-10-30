@@ -370,6 +370,11 @@ def walking(data, skills, missing):
 
 # --- the getting-up candidate -------------------------------------------------------------------------------------
 
+# The package's getting-up stage on the home page (Pavel 29.10, of stage 1164: «я бы вообще убрал… мне это вообще не
+# нравится»; it gets up with a hop out of a split, not as a human). Off: no card, no number, no clips; the human-like
+# rises are the research blocks (RESEARCH) until a tracker goes into a package.
+SHOW_GETUP = False
+
 
 GETUP_GROUPS = (('Вставание: готовность к роботу', 'Готовность к роботу'),
                 ('Вставание: стойка после подъёма', 'Стойка после подъёма'),
@@ -551,21 +556,44 @@ def clips(root, lab, wanted, workers, redo=False, adopt=False):
 # --- research ------------------------------------------------------------------------------------------------------
 
 # Research experiments the home page shows in a block of their own after the candidates (the user's permission of
-# 26.10: «вставание как человек», a LAFAN1 policy). Not from a robot package and not licence-checked: such a stage
+# 26.10: «вставание как человек», a LAFAN1 policy; 29.10: the BONES-SEED rise from the stomach, first, titled as a
+# skill because its licence lets it onto a client's robot, its text saying where it was checked). Not from a robot package and not licence-checked: such a stage
 # never reaches the candidates' cards, which come from packages alone (licence()). The block is the robot's clip and
 # its text; its numbers are the journal section's (`journal`, the section title's start), checked to be there still,
 # else the block is left out with the reason.
 RESEARCH = (dict(
+    stage='exp-4c17165675654356:841089024', clip='research_getup88', scenario='getup_track', seconds=8.,
+    title='Умеет: встаёт после падения, как человек',
+    alt='Робот встаёт с живота по записи человека: упор руками, колени, присед, стоя',
+    tile='BONES-SEED · exp-4c171656',
+    licence='Движение по записи BONES-SEED © Bones Studio (перенос на G1 — NVIDIA); по лицензии стартапа такую '
+            'политику можно ставить на робота клиента, сами записи не распространяем.',
+    text='Робота толкают, он падает на живот или на спину, переворачивается на живот и встаёт по записи человека: '
+         'упор руками, колени, присед, стоя. В физике Unitree встал в 30 из 32 падений, с живота 10 из 10, потом '
+         'сразу пошёл. Подъём с колен я смягчил: корпус разгоняется до 0,73 м/с, а не до 1,26. В пакет для робота '
+         'пока не входит: впереди проверка сил на кистях и две подписи.',
+    journal='Итерации 85–89', numbers=('30 из 32', '10 из 10', '0,73 м/с', '1,26')), dict(
+    # Rendered by hand (no clip.py scenario for terrain): the scratch terr_clip mosaic of 29.10, adopted.
+    stage='exp-0018af4573f74fe9:7773388800', clip='research_terrain', scenario='terrain_mosaic', seconds=9.,
+    title='Умеет: ходит по неровному полу вслепую',
+    alt='Робот идёт по семи типам неровного пола: шероховатость, блоки, ступени вверх и вниз, склоны',
+    tile='terrain · exp-0018af45',
+    licence='Своя политика ходьбы №8, дообученная на неровном полу в нашей симуляции; без записей движений людей.',
+    text='Робот не видит пол и чувствует его только ногами: шероховатость и блоки до 6 см, ступени до 8 см, склоны '
+         'до 15°. Каждый прогон обучения идёт по новой случайной карте, а проверяю на карте, которой он не видел: '
+         'дошёл 54 из 63, ступени вниз 9 из 9. На ровном полу не разучился: проверка навыков против №8 — 35 из 37. '
+         'Слабое место — крутой спуск. В физике Unitree на неровном полу ещё не проверено.',
+    journal='Итерация 93', numbers=('54 из 63', '9 из 9', '35 из 37')), dict(
     stage='exp-4131bbebbba849a4:150405120', clip='research_getup64', scenario='getup_track', seconds=8.,
-    title='Исследование: вставание как человек', alt='Робот встаёт по записи человека: перекат, колени, выпад с '
-                                                      'колена, стоя',
+    title='Исследование: вставание как человек — со спины',
+    alt='Робот встаёт по записи человека: перекат, колени, выпад с колена, стоя',
     tile='LAFAN1 · exp-4131bbeb',
     licence='Исследовательский эксперимент. Движение по записи LAFAN1 © Ubisoft La Forge, лицензия CC BY-NC-ND 4.0, '
-            'некоммерческое использование. Для робота клиента обучаем на записях CMU.',
+            'некоммерческое использование. Для робота клиента обучаем на записях BONES-SEED (подъём с живота выше).',
     text='Робот следует записи человека, а не придумывает движение сам: перекат, колени, выпад с колена, стоя — за '
          '2,8 с. С первого кадра записи доходит до конца в 9–10 из 10 попыток в четырёх вариантах физики; стопы не '
-         'шире 0,57 м против 1,2 м у кандидата вставания 1164.',
-    journal='Итерации 64–67', numbers=('2,8 с', '95–100%', 'четырёх физиках', '0,57 м', '1,2 м')),)
+         'шире 0,57 м.',
+    journal='Итерации 64–67', numbers=('2,8 с', '95–100%', 'четырёх физиках', '0,57 м')),)
 
 
 def research(root, missing):
@@ -609,7 +637,11 @@ def build(lab, package, walk_skills=None, getup_skills=None, render=True, redo=F
     candidates = [walking(data, walk, missing)]
 
     getup = data['getup']
-    if getup:
+    if getup and not SHOW_GETUP:
+        missing.append(dict(what='Вставание', why=f'этап {int(getup["stage"]) // 1_000_000} пакета на главной не '
+                                                   'показываем (решение 29.10): встаёт не как человек'))
+        getup = None
+    elif getup:
         licence(package, info['getup']['slot'])
         steps = int(getup['stage'])
         getup_file = Path(getup_skills) if getup_skills else journal.folder(root) / 'home' / f'skills_{steps}.json'
@@ -627,7 +659,7 @@ def build(lab, package, walk_skills=None, getup_skills=None, render=True, redo=F
                 sources.append(dict(file=rel(journal.folder(root) / 'journal.json'),
                                     what='карточка «Проверка навыков» «Дневника»', md5=''))
         candidates.append(getting_up(data, rows, missing, against))
-    else:
+    elif SHOW_GETUP:
         missing.append(dict(what='Вставание', why='в пакете нет политики вставания'))
 
     if render:

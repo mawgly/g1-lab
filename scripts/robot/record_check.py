@@ -82,6 +82,10 @@ COMMAND_SHARE = 0.05  # a phase with a command longer than this share is a walki
 GETUP_PATCH = 'g1_ctrl-getup.patch'
 TILT_MARK = '(sim2sim fall-passive patch)'
 GETUP_BUILT = 'Initializing State_GetUp'
+# g1_ctrl-getupchain.patch (iteration 82, the getting-up chain): its info lines (GetUp's hand-over rule, the PD
+# transition's schedule) are printed only when config.yaml turns the chain's states on; g1_ctrl logs CHAIN_BUILT then.
+CHAIN_PATCH = 'g1_ctrl-getupchain.patch'
+CHAIN_BUILT = 'Initializing State_GetUpBlend'
 
 
 def md5(path):
@@ -396,20 +400,30 @@ def getup_only(entry):
     return entry['patch'] == GETUP_PATCH and TILT_MARK not in entry['text']
 
 
+def built_by(entry):
+    """The log line that shows the states printing `entry` built (GETUP_BUILT for the GetUp state's own lines,
+    CHAIN_BUILT for CHAIN_PATCH's), or None for a line printed whatever config.yaml turns on."""
+    if getup_only(entry):
+        return GETUP_BUILT
+    return CHAIN_BUILT if entry['patch'] == CHAIN_PATCH else None
+
+
 def log_check(log, patches, velocity_entries):
     """The patches' info lines in g1_ctrl's output, each required (found at least once) but the GetUp state's own
-    (getup_only), which g1_ctrl prints only when config.yaml turns GetUp on: those are required once the log shows the
-    state built (GETUP_BUILT), as in the getting-up session; with GetUp off (records A-D) they are not."""
+    (getup_only) and the getting-up chain's (CHAIN_PATCH), which g1_ctrl prints only when config.yaml turns those
+    states on: they are required once the log shows the states built (built_by: GETUP_BUILT, CHAIN_BUILT), as in the
+    getting-up session; with them off (records A-D) they are not."""
     if log is None or not log.exists():
         return dict(log=None)
     text = log.read_text(encoding='utf-8', errors='replace')
     getup = GETUP_BUILT in text
     found = [dict(patch=e['patch'], kind=e['kind'], text=e['text'], found=len(re.findall(e['regex'], text)),
-                  required=e['kind'] == 'info' and (getup or not getup_only(e)))
+                  required=e['kind'] == 'info' and (built_by(e) is None or built_by(e) in text))
              for e in patch_log_lines(patches)]
     lines = [x for x in found if x['kind'] == 'info']
     return dict(log=str(log), lines=lines, events=[x for x in found if x['kind'] == 'warn'],
                 ok=bool(lines) and all(x['found'] > 0 for x in lines if x['required']), getup=getup,
+                chain=CHAIN_BUILT in text,
                 policy_dirs=re.findall(r'Policy directory: (\S+)', text), velocity_entries_lowcmd=velocity_entries)
 
 
@@ -425,8 +439,9 @@ def print_report(report):
         print(f"Лог g1_ctrl {log['log']}: строки патчей {ok(log['ok'])}")
         for x in log['lines']:
             print(f"  {x['patch']}: «{x['text']}» — найдено {x['found']}"
-                  + ('' if x['required'] else f' (строка состояния GetUp: нужна, только когда оно включено, а «'
-                                              f'{GETUP_BUILT}» в логе нет)'))
+                  + ('' if x['required'] else
+                     f' ({"строка цепочки вставания" if x["patch"] == CHAIN_PATCH else "строка состояния GetUp"}: '
+                     f'нужна, только когда оно включено, а «{built_by(x)}» в логе нет)'))
         for x in log['events']:
             if x['found']:
                 print(f"  СОБЫТИЕ {x['patch']}: «{x['text']}» — {x['found']} раз")

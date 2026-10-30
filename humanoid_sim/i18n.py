@@ -174,7 +174,8 @@ class Content:
 # --- JSON answers in the asked language -------------------------------------------------------------------------
 
 JOURNAL_FIELDS = {'roadmap': ('title', 'detail'), 'sections': ('title', 'text'), 'path': ('title', 'change', 'result'),
-                  'races': ('title', 'text'), 'entries': ('title', 'text'), 'check': ('title',),
+                  'races': ('title', 'text'), 'entries': ('title', 'text'), 'clips': ('caption',),
+                  'check': ('title',),
                   'items': ('label', 'value', 'target'), 'iterations': ('title', 'question', 'decision'),
                   'messages': ('text',), 'skills': ('title',), 'against': ('title',),
                   'skill_items': ('skill', 'label', 'target', 'value', 'reference', 'note', 'v0')}
@@ -204,7 +205,8 @@ def map_journal(journal, change):
     if skills:
         result['skills'] = {**items([skills], 'skills')[0], 'items': items(skills.get('items'), 'skill_items'),
                             'against': items([skills.get('against') or {}], 'against')[0]}
-    result['entries'] = items(journal.get('entries'), 'entries')
+    result['entries'] = [{**e, 'clips': items(e['clips'], 'clips')} if e.get('clips') else e
+                         for e in items(journal.get('entries'), 'entries')]
     result['iterations'] = [{**it, 'messages': items(it.get('messages'), 'messages')}
                             for it in items(journal.get('iterations'), 'iterations')]
     return result
@@ -272,8 +274,9 @@ SERVER_MODULES = ('webapp.py', 'lab.py', 'lab_api.py', 'lab_worker.py', 'reports
                   '../scripts/lab/skills_check.py:getup_table')
 # The site (Home, Journal, Lab), the live 3D race and the arm's stage player. A listed file that does not exist
 # (yet) is skipped, so the check runs while a page is being written.
-WEB_SCRIPTS = ('site.js', 'journal.js', 'labtree.js', 'home.js', 'race.js', 'app.js', 'viewer3d.js')
-WEB_PAGES = ('site.html', 'journal.html', 'lab.html', 'race.html', 'index.html')
+WEB_SCRIPTS = ('site.js', 'journal.js', 'labtree.js', 'home.js', 'how.js', 'world.js', 'race.js', 'app.js', 'viewer3d.js',
+               'clip.js')
+WEB_PAGES = ('site.html', 'journal.html', 'lab.html', 'how.html', 'world.html', 'race.html', 'index.html')
 
 
 def web_messages():

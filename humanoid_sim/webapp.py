@@ -67,12 +67,16 @@ def shown_geoms(model):
     """Geoms the browser draws, in model order: all but G1 foot_collision's capsules (hidden group 3, contact bit
     FOOT_COLLISION_BIT) and hand_collision's (group 3, named as HAND_CAPSULES). They sit between the other geoms of
     their links, so a race lane with them and one without would otherwise shift every later transform onto the wrong
-    mesh."""
+    mesh. Nor task_config terrain's tile heightfields and box tiles' boxes (g1_terrain.terrain_geoms, terrain_boxes,
+    world geoms the browser does not draw yet; playback and races start on the plane at the origin, 40 m from them)."""
+    from .tasks.g1_terrain import terrain_boxes, terrain_geoms
     from .tasks.g1_velocity import FOOT_COLLISION_BIT, HAND_CAPSULES
     hands = {f'{body.split("_")[0]}_hand_collision' for body in HAND_CAPSULES}
-    return [i for i in range(model.ngeom) if not model.geom_group[i] == 3 or not (
-        model.geom_contype[i] == FOOT_COLLISION_BIT and model.geom_conaffinity[i] == FOOT_COLLISION_BIT
-        or mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) in hands)]
+    terrain = {*terrain_geoms(model), *terrain_boxes(model)}
+    return [i for i in range(model.ngeom) if i not in terrain and (
+        not model.geom_group[i] == 3 or not (
+            model.geom_contype[i] == FOOT_COLLISION_BIT and model.geom_conaffinity[i] == FOOT_COLLISION_BIT
+            or mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) in hands))]
 
 
 def model_geometry(model):
@@ -863,6 +867,9 @@ class Handler(BaseHTTPRequestHandler):
                     from . import home
                     saved = home.load(self.server.lab.root)
                     self.reply(200, {'empty': True} if saved is None else home.localize(saved, lang, content))
+                elif path == '/api/lab/stack':
+                    from . import stack
+                    self.reply(200, {**stack.versions(), **stack.counts(self.server.lab.root)})
                 elif path == '/api/lab/journal/image':
                     from . import journal
                     file = journal.image_file(self.server.lab.root, query.get('name', [''])[0])

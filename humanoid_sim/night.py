@@ -11,8 +11,9 @@ class SleepGuard:
     def __enter__(self):
         if self.enabled:
             if self.set_state is None:
-                if sys.platform != 'win32':
-                    raise RuntimeError('Night sleep protection requires Windows')
+                if sys.platform != 'win32':  # a Linux GPU server does not sleep on its own: nothing to inhibit
+                    self.enabled = False
+                    return self
                 self.set_state = ctypes.windll.kernel32.SetThreadExecutionState
             if not self.set_state(0x80000001):
                 raise RuntimeError('Windows could not inhibit automatic sleep')

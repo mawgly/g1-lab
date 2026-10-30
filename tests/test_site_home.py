@@ -113,6 +113,8 @@ def test_api_and_static_site_serve_the_home_data(tmp_path):
             for lang in i18n.LANGUAGES:
                 (journal.folder(lab.root) / f'site-{lang}-{clip}.webp').write_bytes(b'clip')
                 (journal.folder(lab.root) / f'site-{lang}-{clip}-poster.jpg').write_bytes(b'poster')
+        for name in site_export.PAGE_MEDIA.findall((WEB / page).read_text(encoding='utf-8')):
+            (journal.folder(lab.root) / name).write_bytes(b'media')
     out = tmp_path / 'site'
     summary = site_export.export(out, lab.original)
     for lang in i18n.LANGUAGES:
@@ -124,8 +126,9 @@ def test_api_and_static_site_serve_the_home_data(tmp_path):
 def test_home_page_reads_the_data():
     page = (WEB / 'site.html').read_text(encoding='utf-8')
     script = (WEB / 'home.js').read_text(encoding='utf-8')
-    for marker in ('id="home-updated"', 'id="home-stats"', 'id="home-candidates"'):
+    for marker in ('id="home-updated"', 'id="home-candidates"'):
         assert marker in page
+    assert 'id="home-stats"' not in page and 'if (stats)' in script  # the number cards are off the page (30.10)
     assert 'Обновлено 23 октября' not in page and 'Что умеет кандидат 8' not in page  # no hand-written numbers left
     assert "data('home')" in script and 'wire(candidates.querySelectorAll' in script
     assert 'row.value !== null' in script and '<details' in script  # empty fields hidden, the rest folded away
@@ -144,6 +147,7 @@ def update(monkeypatch):
     module = importlib.import_module('home_update')
     checked = []
     monkeypatch.setattr(module, 'licence', lambda package, slot: checked.append(slot))
+    monkeypatch.setattr(module, 'SHOW_GETUP', True)  # the package's getting-up card, hidden on the real page
     module.checked = checked
     return module, importlib.import_module('package')
 
@@ -273,6 +277,7 @@ def test_a_lafan_stage_never_reaches_the_candidates(monkeypatch, tmp_path):
     monkeypatch.syspath_prepend(str(ROOT / 'scripts' / 'robot'))
     monkeypatch.syspath_prepend(str(ROOT / 'scripts' / 'site'))
     module, package = importlib.import_module('home_update'), importlib.import_module('package')
+    monkeypatch.setattr(module, 'SHOW_GETUP', True)
     folder = make_package(tmp_path / 'g1-n8-test', package, getup=True)
     lab = make_lab(tmp_path / 'lab', check_stage=STEPS)
     walk = lab / BRANCH / f'stage_{STEPS:012d}'
@@ -295,7 +300,7 @@ def test_research_is_a_block_of_its_own(update, tmp_path):
     module, package = update
     folder = make_package(tmp_path / 'g1-n8-test', package)
     lab = make_lab(tmp_path / 'lab')
-    block = module.RESEARCH[0]
+    block = next(b for b in module.RESEARCH if b['clip'] == 'research_getup64')
     assert data_without_research(module, lab, folder)['research'] == []  # no journal section: left out
     section = dict(title=block['journal'] + ': вставание по записи человека',
                    text='Встаёт за 2,8 с; 95–100% во всех четырёх физиках; стопы 0,57 м (у 1164 было 1,2 м).')
@@ -314,6 +319,18 @@ def test_research_is_a_block_of_its_own(update, tmp_path):
     cards = [card.get('clip') for c in data['candidates'] for card in c['skills']]
     assert block['clip'] not in cards and 'exp-4131bbebbba849a4' not in json.dumps(data['candidates'])
     assert block['title'] in home.texts(data)  # translated like the rest
+
+
+def test_the_packaged_getting_up_card_can_be_hidden(update, tmp_path, monkeypatch):
+    """SHOW_GETUP off (Pavel 29.10, stage 1164): no getting-up card, number or clip, the reason among the missing."""
+    module, package = update
+    monkeypatch.setattr(module, 'SHOW_GETUP', False)
+    folder = make_package(tmp_path / 'g1-n8-test', package, getup=True)
+    lab = make_lab(tmp_path / 'lab')
+    data = home.validate(module.build(lab, folder, render=False))
+    assert len(data['candidates']) == 1 and module.checked == [f'n8-{STEPS}']  # the getting-up slot unchecked
+    assert not any('подъёмов после падения' in s['label'] for s in data['stats'])
+    assert any(m['what'] == 'Вставание' and 'не показываем' in m['why'] for m in data['missing'])
 
 
 def data_without_research(module, lab, folder):

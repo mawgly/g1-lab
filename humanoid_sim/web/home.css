@@ -2,11 +2,38 @@
 main [id] {
   scroll-margin-top: 88px; /* the sticky header (~67 px) and some air */
 }
+/* «На этой странице» (Pavel 29.10): the home page's sections, folded, below the intro. */
+.page-nav-box {
+  padding-bottom: 8px;
+}
+.page-nav-box summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid #bfc4bb;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink-2);
+  cursor: pointer;
+  list-style: none;
+}
+.page-nav-box summary::-webkit-details-marker {
+  display: none;
+}
+.page-nav-box summary::after {
+  content: '▾';
+  margin-left: 8px;
+}
+.page-nav-box[open] summary::after {
+  content: '▴';
+}
 .page-nav {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  padding-top: 12px;
+  padding-top: 10px;
   font-size: 14px;
   font-weight: 600;
 }
@@ -377,4 +404,24 @@ main [id] {
 }
 .contact a.button.ghost {
   overflow-wrap: anywhere;
+}
+
+/* The crowd: a full-width video right under the numbers. */
+.crowd {
+  padding-top: 8px;
+}
+.crowd-head {
+  margin-bottom: 18px;
+}
+.crowd-head .note {
+  max-width: 860px;
+}
+.crowd-figure {
+  margin: 0 auto;
+  max-width: 1600px;
+  padding: 0 16px;
+}
+.crowd-figure .media {
+  border-radius: var(--radius);
+  aspect-ratio: 16 / 9;
 }

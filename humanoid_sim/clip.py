@@ -3,7 +3,7 @@
     .venv\\Scripts\\python.exe -m humanoid_sim.clip exp-…[:steps] … [--titles "было,стало"] [--scenario walk]
         [--focus body|torso|arms|hands|feet] [--view side|front|three_quarter|top] [--seconds S]
         [--pose NAME|random] [--draw N] [--amplitude A] [--load KG] [--start N] [--lang ru|en|zh] [--size 640x480]
-        --out c.webp
+        [--terrain-type NAME [--terrain-level N] [--seed N]] --out c.webp
 
 Each lane is the same deterministic CPU episode as `supervise` and `collage` (seed 73000, the scenario's fixed
 commands), filmed by a camera following the pelvis. Lanes are tiles side by side, at most four per row, labelled with
@@ -38,6 +38,15 @@ Scenarios (CLIPS):
             evaluation options), no delay, the motor model as measured and the files' friction (getup_probe's ours),
             8 s; the footer gives the head height and when it got up (the task's success pose within 6 s).
             getup_track: a track_clip stage from its clip's first frame without noise (no bank row).
+Rough ground (--terrain-type, --terrain-level, default 0; stages with task_config terrain, walking scenarios, the
+default then slow, 0.5 m/s straight): every lane starts on the same tile of one map, the first lane's stage's seed and
+generator (--seed: another map, as terrain_probe.py --seed), at its centre as scripts/lab/probes/terrain_probe.py
+(reset options terrain_type / terrain_level with the scenario's command, the robot turned to face -y, TERRAIN_HEADING,
+so the path stays on tiles of the same type). The tiles are drawn (the heightfields, on box tiles the boxes the robot
+touches instead: g1_terrain.ground_geoms), the camera follows the pelvis at the ground's height under it, three
+quarters by default (from the side a stair's edges run along the camera axis), the views turned with the robot; the
+footer gives the tile (type, level and its step, height or slope from the generator) and the metres walked along the
+heading.
 Camera (--focus): body (the default: the pelvis from 2.5 m, as before; getting up the centre of mass, from further
 off), or closer on the centre of the torso, the arms (shoulders, elbows, palms), the hands (palms) or the feet
 (ankle_roll links), following the robot with the focus's offset from it smoothed over FOCUS_SECONDS, so a swinging
@@ -90,6 +99,14 @@ HAND_LOAD_POSITION = (.11, 0., 0.)  # the palm in the wrist_yaw frame: g1_tensor
 TARGET_MARK = (.04, (.2, .9, .35, .45))
 LOAD_MARK = (.025, (.95, .55, .1, 1.))
 LOAD_LIMIT = 5.  # kg per hand
+# Rough ground: the heading the robot is turned to on its tile (terrain_probe.py's HEADING: facing -y, towards the
+# same type one level easier), the body camera's look-at height above the ground under the pelvis (smoothed over
+# FOCUS_SECONDS), distance (m) and elevation (deg), and the group the box tiles' unused heightfields are moved to (off
+# in MjvOption's defaults) while their boxes' BOX_GROUP is drawn.
+TERRAIN_HEADING = -math.pi / 2
+TERRAIN_CAMERA = (.55, 3.2, -14.)
+TERRAIN_SCENARIO = 'slow'  # --terrain-type without --scenario: 0.5 m/s straight
+HIDDEN_GROUP = 5
 
 # Tile texts by language. The measure (the footer's number) is positive in the named direction. Russian is the
 # original, decimal comma; Chinese follows the site's catalogs and docs/i18n-glossary.md (units as symbols, 跌倒).
@@ -104,7 +121,8 @@ TEXTS = {
                height='таз {v[0]:.2f} м · команда {v[1]:.2f} м',
                left_gap='влево {v[0]:+.1f} м · наименьший зазор стоп {v[1]:+.1f} см',
                right_gap='вправо {v[0]:+.1f} м · наименьший зазор стоп {v[1]:+.1f} см',
-               pose='навязанная поза рук: {v}', random='навязанная поза рук ±{v} рад'),
+               pose='навязанная поза рук: {v}', random='навязанная поза рук ±{v} рад',
+               terrain='{v[0]} · пройдено {v[1]:.1f} м'),
     'en': dict(time='{t:4.1f} s', fell='fell at {t:.1f} s', forward='forward {v:+.1f} m', back='back {v:+.1f} m',
                left='left {v:+.1f} m', right='right {v:+.1f} m', turn_left='turned left {v:+.0f}°',
                turn_right='turned right {v:+.0f}°', push='displaced {v:.2f} m', mark='push {d} {v} m/s',
@@ -116,7 +134,8 @@ TEXTS = {
                height='pelvis {v[0]:.2f} m · command {v[1]:.2f} m',
                left_gap='left {v[0]:+.1f} m · smallest foot gap {v[1]:+.1f} cm',
                right_gap='right {v[0]:+.1f} m · smallest foot gap {v[1]:+.1f} cm',
-               pose='forced arm pose: {v}', random='forced arm pose ±{v} rad'),
+               pose='forced arm pose: {v}', random='forced arm pose ±{v} rad',
+               terrain='{v[0]} · walked {v[1]:.1f} m'),
     'zh': dict(time='{t:4.1f} s', fell='在 {t:.1f} s 时跌倒', forward='前进 {v:+.1f} m', back='后退 {v:+.1f} m',
                left='向左 {v:+.1f} m', right='向右 {v:+.1f} m', turn_left='左转 {v:+.0f}°', turn_right='右转 {v:+.0f}°',
                push='位移 {v:.2f} m', mark='{d}推 {v} m/s', million=' M',
@@ -126,7 +145,27 @@ TEXTS = {
                height='骨盆 {v[0]:.2f} m · 指令 {v[1]:.2f} m',
                left_gap='向左 {v[0]:+.1f} m · 双脚最小间隙 {v[1]:+.1f} cm',
                right_gap='向右 {v[0]:+.1f} m · 双脚最小间隙 {v[1]:+.1f} cm',
-               pose='强制手臂姿态：{v}', random='强制手臂姿态 ±{v} rad'),
+               pose='强制手臂姿态：{v}', random='强制手臂姿态 ±{v} rad',
+               terrain='{v[0]} · 行进 {v[1]:.1f} m'),
+}
+# A terrain tile as the footer names it (terrain_label): its type, its level and the generator's number for that
+# level (terrain_parameter: cm or degrees); a flat tile has no number.
+TERRAIN_TEXTS = {
+    'ru': dict(line='{name}, уровень {n} ({detail})', flat='{name}, уровень {n}', names=dict(
+        flat='ровно', rough='неровности', boxes='блоки', stairs_up='лестница вверх', stairs_down='лестница вниз',
+        slope_up='подъём', slope_down='спуск', pits='ямы', curbs='бордюры'),
+        rough='до {v} см', boxes='до {v} см', stairs='ступень {v} см', slope='уклон {v}°', pits='глубина {v} см',
+        curbs='высота {v} см'),
+    'en': dict(line='{name}, level {n} ({detail})', flat='{name}, level {n}', names=dict(
+        flat='flat', rough='rough ground', boxes='blocks', stairs_up='stairs up', stairs_down='stairs down',
+        slope_up='slope up', slope_down='slope down', pits='pits', curbs='curbs'),
+        rough='up to {v} cm', boxes='up to {v} cm', stairs='steps {v} cm', slope='slope {v}°', pits='depth {v} cm',
+        curbs='height {v} cm'),
+    'zh': dict(line='{name}，第 {n} 级（{detail}）', flat='{name}，第 {n} 级', names=dict(
+        flat='平地', rough='粗糙地面', boxes='方块', stairs_up='上楼梯', stairs_down='下楼梯', slope_up='上坡',
+        slope_down='下坡', pits='坑洼', curbs='路缘'),
+        rough='最高 {v} cm', boxes='最高 {v} cm', stairs='台阶 {v} cm', slope='坡度 {v}°', pits='深度 {v} cm',
+        curbs='高度 {v} cm'),
 }
 DIRECTIONS = {'ru': dict(forward='вперёд', back='назад', left='влево', right='вправо'),
               'en': dict(forward='forward', back='back', left='left', right='right'),
@@ -143,7 +182,9 @@ class ClipScenario:
     pose name of export_g1.NAMED_ARM_POSES), ...) the arms move to from the reset on, and load, kg on each hand.
     Getting-up scenarios (task g1_getup): getup, the start bank's class, and start, which of its held-out rows. Held
     poses: held, (seconds from which, a pose name or 'random'), with draw and amplitude (rad) of a random one. Height:
-    heights, ((seconds, c m), ...). focus, view and seconds are the clip's defaults (FOCI, VIEWS, length)."""
+    heights, ((seconds, c m), ...). Rough ground (a walking scenario on a stage with task_config terrain): terrain,
+    (tile type name, level, map seed, generator number; seed and generator None: the stage's own, resolved by
+    terrain_map). focus, view and seconds are the clip's defaults (FOCI, VIEWS, length)."""
     scenario: Scenario
     measure: str = 'forward'
     push: tuple = None
@@ -158,11 +199,12 @@ class ClipScenario:
     draw: int = 0
     amplitude: float = 1.
     heights: tuple = None
+    terrain: tuple = None
 
     @property
     def episode(self):
-        """Whether clip._play films it (arms, getting up, held poses, height), not supervise.rollout."""
-        return bool(self.arms or self.getup or self.held or self.heights)
+        """Whether clip._play films it (arms, getting up, held poses, height, rough ground), not supervise.rollout."""
+        return bool(self.arms or self.getup or self.held or self.heights or self.terrain)
 
 
 def _clip(name, schedule, measure, push=None):
@@ -219,10 +261,14 @@ def get_clip(name):
     return CLIPS[name]
 
 
-def configure(clip, load=None, pose=None, start=None, draw=None, amplitude=None):
+def configure(clip, load=None, pose=None, start=None, draw=None, amplitude=None, terrain_type=None, terrain_level=None,
+              terrain_seed=None):
     """The scenario with the command line's changes (None: the scenario's own): load, kg on each hand, and pose, the
     one named pose of a one-pose arms scenario or a held pose scenario's pose (there also 'random'), with draw and
-    amplitude (rad) of a random held pose; start, which held-out row of a getting-up scenario's class."""
+    amplitude (rad) of a random held pose; start, which held-out row of a getting-up scenario's class; terrain_type,
+    a walking scenario on that tile type (any generator's; film_lane checks the stage's), at terrain_level (0 without
+    it) of the map terrain_seed (None: the stage's), measured by 'terrain'."""
+    clip = _configure_terrain(clip, terrain_type, terrain_level, terrain_seed)
     arms = [name for name, other in CLIPS.items() if other.arms or other.held]
     if load is not None and not clip.arms:
         raise ValueError(f'Груз на кистях — только в сценариях рук: {", ".join(n for n in arms if CLIPS[n].arms)}')
@@ -262,6 +308,80 @@ def configure(clip, load=None, pose=None, start=None, draw=None, amplitude=None)
     return clip
 
 
+def _configure_terrain(clip, kind, level, seed):
+    """configure's rough ground: (kind, level, seed, None) in clip.terrain and the measure 'terrain'."""
+    from .tasks.config import TERRAIN_LEVELS, TERRAIN_SEED_RANGE
+    from .tasks.g1_terrain import GENERATORS
+    if kind is None:
+        if level is not None or seed is not None:
+            raise ValueError('Уровень и карта рельефа — только вместе с типом плитки (--terrain-type)')
+        return clip
+    if clip.episode:
+        raise ValueError(f'Рельеф — только в сценариях ходьбы: {clip.scenario.name}')
+    kinds = list(dict.fromkeys(name for spec in GENERATORS.values() for name in spec.types))
+    if kind not in kinds:
+        raise ValueError(f'Неизвестный тип плитки рельефа: {kind} (есть {", ".join(kinds)})')
+    level = 0 if level is None else level
+    if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level < TERRAIN_LEVELS:
+        raise ValueError(f'Уровень рельефа — целое число от 0 до {TERRAIN_LEVELS - 1}')
+    low, high = TERRAIN_SEED_RANGE
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int) or not low <= seed <= high):
+        raise ValueError(f'Карта рельефа — целое число от {low} до {high}')
+    # From the side a stair's edges run along the camera axis; three quarters show the risers (--view still overrides).
+    return replace(clip, terrain=(kind, level, seed, None), measure='terrain',
+                   view='three_quarter' if clip.view == 'side' else clip.view)
+
+
+def terrain_map(clip, stage):
+    """clip.terrain with its seed and generator filled in from the stage's task_config terrain where None; ValueError
+    for a stage without terrain or a tile type its generator does not have."""
+    from .tasks.config import terrain_generator, terrain_seed, terrain_setting
+    from .tasks.g1_terrain import generator
+    own = terrain_setting(stage_task_config(stage).get('terrain'))
+    if own is None:
+        raise ValueError(f'Ролик на рельефе — для этапов с task_config terrain: {stage}')
+    kind, level, seed, number = clip.terrain
+    seed = terrain_seed(own) if seed is None else seed
+    number = terrain_generator(own) if number is None else number
+    if kind not in generator(number).types:
+        raise ValueError(f'У генератора рельефа {number} нет плиток {kind} (есть {", ".join(generator(number).types)})')
+    return kind, level, seed, number
+
+
+def terrain_config(config, terrain):
+    """A stage's task_config on the map of terrain (kind, level, seed, generator): its terrain setting with that seed
+    and generator (as terrain_probe.py's environment)."""
+    own = {key: value for key, value in (config.get('terrain') or {}).items() if key not in ('seed', 'generator')}
+    return {**config, 'terrain': {**own, 'seed': terrain[2], 'generator': terrain[3]}}
+
+
+def terrain_parameter(kind, level, number):
+    """(TERRAIN_TEXTS key, number) of a tile of generator `number` at `level`: the rough tiles' and blocks' largest
+    height, the stairs' step, the pits' depth and the curbs' height in cm, the slopes' angle in degrees; None for a
+    flat tile."""
+    from .tasks import g1_terrain as terrain
+    spec = terrain.generator(number)
+    bounds = {'rough': terrain.ROUGH, 'boxes': terrain.BOXES, 'stairs': spec.steps, 'pits': terrain.PITS,
+              'curbs': terrain.CURBS}
+    key = kind.split('_')[0]
+    if key == 'flat':
+        return None
+    low, high = terrain.SLOPE if key == 'slope' else bounds[key]
+    value = low + (high - low) * terrain.difficulty(level)
+    return key, value if key == 'slope' else 100 * value
+
+
+def terrain_label(kind, level, number, lang='ru'):
+    """The footer's tile: its type, level and the generator's number for it (terrain_parameter, one decimal at most)."""
+    texts = TERRAIN_TEXTS[lang]
+    name = texts['names'][kind]
+    parameter = terrain_parameter(kind, level, number)
+    if parameter is None:
+        return texts['flat'].format(name=name, n=level)
+    key, value = parameter
+    return texts['line'].format(name=name, n=level, detail=texts[key].format(v=f'{value:.1f}'.rstrip('0').rstrip('.')))
+
+
 def _tile_font(size, lang):
     if lang == 'zh':
         for name in CJK_FONTS:
@@ -292,9 +412,10 @@ def _keep_push(raw):
     raw.set_command = keep
 
 
-def _arrow(force, view):
-    """→ or ← when the push runs across the picture (side view: forward or back), '' along the camera axis."""
-    azimuth = math.radians(VIEWS[view])
+def _arrow(force, view, turn=0.):
+    """→ or ← when the push runs across the picture (side view: forward or back), '' along the camera axis; turn
+    (deg): the camera turned with the robot's start heading (rough ground)."""
+    azimuth = math.radians(VIEWS[view] + turn)
     across = (force[0] * math.sin(azimuth) - force[1] * math.cos(azimuth)) / max(math.hypot(force[0], force[1]), 1e-9)
     return '→' if across > .7 else '←' if across < -.7 else ''
 
@@ -346,6 +467,22 @@ def _arm_measure(raw, shoulders):
         return math.nan, math.nan
     error = raw.data.qpos[raw.qadr] - raw.home - raw.previous_offset
     return float(np.abs(error[list(raw.track_joints)]).mean()), float(error[shoulders].mean())
+
+
+def terrain_option(model):
+    """The MjvOption a rough-ground lane renders with: the ground the robot touches (g1_terrain.ground_geoms). The box
+    tiles' boxes (BOX_GROUP, off by default) are drawn and those tiles' heightfields, which collide with nothing and
+    would flicker against the boxes' tops, are moved to HIDDEN_GROUP in this lane's own model (drawing only: physics
+    and the reward's heights do not read geom_group)."""
+    from .tasks import g1_terrain
+    ground = set(g1_terrain.ground_geoms(model))
+    for geom in g1_terrain.terrain_geoms(model):
+        if geom not in ground:
+            model.geom_group[geom] = HIDDEN_GROUP
+    option = mujoco.MjvOption()
+    option.geomgroup[g1_terrain.BOX_GROUP] = 1
+    option.geomgroup[HIDDEN_GROUP] = 0
+    return option
 
 
 def _add_geom(scene, kind, size, position, rotation, rgba):
@@ -455,13 +592,19 @@ def _play(stage, identity, policy, norm, clip, seed, seconds, on_step):
     class with the task's evaluation options (no assist, the lowest PD bound), no delay, the motor model as measured
     and the files' friction. Held pose: the walking reset, the arms held by a one-step perturbation segment renewed
     before every control step from its time on (set_command, called every step as in supervise.rollout, ends a
-    segment). Height: the walking reset, set_height at each time."""
+    segment). Height: the walking reset, set_height at each time. Rough ground: the stage's task on clip.terrain's map
+    (terrain_config), the reset with the scenario's command on the tile's centre (options terrain_type / terrain_level),
+    the robot then turned to TERRAIN_HEADING with heading hold aimed there and the history filled, as terrain_probe.py
+    does."""
     from .export_g1 import named_arm_poses
     from .tasks import g1_tensor_math as task
     from .tasks.catalog import make_task, resolve_task
     dt = identity['control_dt']
     limit = math.ceil(seconds / dt)
-    env = make_task(identity['task_id'], identity['robot_id'], {**stage_task_config(stage), 'max_episode_steps': limit})
+    config = stage_task_config(stage)
+    if clip.terrain:
+        config = terrain_config(config, clip.terrain)
+    env = make_task(identity['task_id'], identity['robot_id'], {**config, 'max_episode_steps': limit})
     try:
         raw = env.unwrapped
         moves, heights, held = {}, {}, None
@@ -474,6 +617,13 @@ def _play(stage, identity, policy, norm, clip, seed, seconds, on_step):
             options.update(action_delay_steps=0, motor_friction_scale=1.)
             obs, _ = env.reset(seed=seed, options=options)
             raw.model.geom_friction[:, 0] = raw.nominal_friction
+        elif clip.terrain:
+            obs, _ = env.reset(seed=seed, options={'command': clip.scenario.command_at(0.),
+                                                   'terrain_type': clip.terrain[0], 'terrain_level': clip.terrain[1]})
+            raw.data.qpos[3:7] = [math.cos(TERRAIN_HEADING / 2), 0., 0., math.sin(TERRAIN_HEADING / 2)]
+            mujoco.mj_forward(raw.model, raw.data)
+            raw.heading_target = TERRAIN_HEADING
+            obs = raw._observation('fill')
         else:
             obs, _ = env.reset(seed=seed, options={'command': clip.scenario.command_at(0.)})
         if clip.arms:
@@ -519,6 +669,8 @@ def _check_stage(clip, identity, stage):
         raise ValueError(f'Сценарий рук {clip.scenario.name} — для этапов с task_config arm_targets: {stage}')
     if clip.heights and not stage_task_config(stage).get('height_command'):
         raise ValueError(f'Сценарий высоты {clip.scenario.name} — для этапов с task_config height_command: {stage}')
+    if clip.terrain:
+        terrain_map(clip, stage)
 
 
 def film_lane(stage, scenario, seconds=10., fps=FPS, size=TILE, view=None, focus=None):
@@ -529,7 +681,8 @@ def film_lane(stage, scenario, seconds=10., fps=FPS, size=TILE, view=None, focus
     ('pose', name) or ('random', amplitude) while the arms are held, else None. view and focus: None, the scenario's.
     The measure is a number, for arms (error, sag), getting up (head height, seconds to get up or None), held poses
     (displacement or metres forward, heading change in degrees), height (pelvis height, c) and fast side steps
-    (metres sideways, the smallest feet gap so far in cm); fell is a getting-up lane's cut-off."""
+    (metres sideways, the smallest feet gap so far in cm), rough ground (tile type, level, generator, metres walked
+    along the heading); fell is a getting-up lane's cut-off."""
     from .tasks.catalog import resolve_task
     clip = scenario if isinstance(scenario, ClipScenario) else ClipScenario(scenario)
     view, focus = view or clip.view, focus or clip.focus
@@ -537,21 +690,33 @@ def film_lane(stage, scenario, seconds=10., fps=FPS, size=TILE, view=None, focus
         raise ValueError(f'Неизвестный вид или фокус камеры: {view}, {focus}')
     identity = checkpoint_identity(read_json(Path(stage) / 'metadata.json'))
     _check_stage(clip, identity, stage)
+    if clip.terrain:
+        clip = replace(clip, terrain=terrain_map(clip, stage))
     playback = resolve_task(identity['robot_id'], identity['task_id']).playback
     every = max(1, round(1 / (fps * identity['control_dt'])))
     push_step = None if clip.push is None else round(clip.push[0] / identity['control_dt'])
     marked = round(MARK_SECONDS / identity['control_dt'])
     policy, norm = load_stage(stage)
     camera = mujoco.MjvCamera()
-    camera.distance, camera.elevation, camera.azimuth = 2.8 * playback.target[2], -8., VIEWS[view]
-    walking_body = focus == 'body' and not clip.getup  # the camera of the walking clips before foci, bit for bit
-    if not walking_body:
+    turn = math.degrees(TERRAIN_HEADING) if clip.terrain else 0.  # the views turn with the robot's start heading
+    camera.distance, camera.elevation, camera.azimuth = 2.8 * playback.target[2], -8., VIEWS[view] + turn
+    terrain_body = bool(clip.terrain) and focus == 'body'  # the pelvis at the ground's height under it
+    walking_body = focus == 'body' and not clip.getup and not clip.terrain  # the camera of the walking clips before foci
+    if terrain_body:
+        camera.distance, camera.elevation = TERRAIN_CAMERA[1:]
+    elif not walking_body:
         camera.distance, camera.elevation = GETUP_CAMERA[1:] if focus == 'body' else FOCI[focus][1:]
     if view == 'top':
         camera.elevation = TOP_ELEVATION
     state = {'renderer': None, 'step': 0, 'yaw': 0., 'turned': 0., 'mark': None, 'gap': math.inf}
     held_step = None if clip.held is None else round(clip.held[0] / identity['control_dt'])
     capsules = _foot_capsules() if clip.measure in ('left_gap', 'right_gap') else None
+    if clip.terrain:
+        from .tasks import g1_terrain
+        kind, level, _, number = clip.terrain
+        state['start'] = g1_terrain.tile_centres(number)[level, g1_terrain.generator(number).types.index(kind)]
+        state['heading'] = np.array([math.cos(TERRAIN_HEADING), math.sin(TERRAIN_HEADING)])
+        state['ground'] = None
     frames = []
 
     def on_step(now, raw, lean, fell):
@@ -566,14 +731,15 @@ def film_lane(stage, scenario, seconds=10., fps=FPS, size=TILE, view=None, focus
         if state['step'] == push_step:  # pushes from the next control step on
             _keep_push(raw)
             raw.set_force_push(clip.push[1], clip.push[2])
-            state['mark'] = (clip.push[1], _arrow(raw.push_force, view))
+            state['mark'] = (clip.push[1], _arrow(raw.push_force, view, turn))
         if state['step'] % every and not fell:
             return
         if state['renderer'] is None:
             visual = raw.model.vis.global_  # the offscreen buffer is 640x480 unless the model asks for more
             visual.offwidth, visual.offheight = max(visual.offwidth, size[0]), max(visual.offheight, size[1])
             state['renderer'] = mujoco.Renderer(raw.model, height=size[1], width=size[0])
-            if not walking_body:
+            state['options'] = {'scene_option': terrain_option(raw.model)} if clip.terrain else {}
+            if not walking_body and not terrain_body:
                 state['aim'] = _Aim(raw.model, focus, bool(clip.getup), fps)
             if clip.arms:
                 names = [raw.model.joint(joint).name for joint in raw.joints]
@@ -581,8 +747,15 @@ def film_lane(stage, scenario, seconds=10., fps=FPS, size=TILE, view=None, focus
                 state['hands'] = [_body(raw.model, f'{side}_wrist_yaw_link') for side in ('left', 'right')]
                 state['scratch'] = mujoco.MjData(raw.model)
         focus_at = playback.focus(raw.model, raw.data)
-        camera.lookat[:] = (focus_at[0], focus_at[1], .7 * playback.target[2]) if walking_body else state['aim'](raw.data)
-        state['renderer'].update_scene(raw.data, camera=camera)
+        if terrain_body:  # the ground under the pelvis, smoothed as _Aim's offset: a step edge does not jerk it
+            ground = float(raw._ground(np.asarray(focus_at[:2])))
+            blend = 1. - math.exp(-1. / (fps * FOCUS_SECONDS))
+            state['ground'] = ground if state['ground'] is None else state['ground'] + blend * (ground - state['ground'])
+            camera.lookat[:] = (focus_at[0], focus_at[1], state['ground'] + TERRAIN_CAMERA[0])
+        else:
+            camera.lookat[:] = ((focus_at[0], focus_at[1], .7 * playback.target[2]) if walking_body
+                                else state['aim'](raw.data))
+        state['renderer'].update_scene(raw.data, camera=camera, **state['options'])
         turned = math.degrees(state['turned'])
         if clip.arms:
             _arm_marks(state['renderer'].scene, raw, state['scratch'], state['hands'])
@@ -597,6 +770,8 @@ def film_lane(stage, scenario, seconds=10., fps=FPS, size=TILE, view=None, focus
             value = (float(raw.data.qpos[2]), raw.height)
         elif capsules is not None:
             value = (focus_at[1] if clip.measure == 'left_gap' else -focus_at[1], 100 * state['gap'])
+        elif clip.terrain:
+            value = (*clip.terrain[:2], clip.terrain[3], float((raw.data.qpos[:2] - state['start']) @ state['heading']))
         else:
             value = float(_measure(clip.measure, focus_at, state['turned']))
         mark = state['mark'] if push_step is not None and 0 <= state['step'] - push_step < marked else None
@@ -636,6 +811,8 @@ def footer(now, value, fell, measure='forward', lang='ru'):
     if measure == 'getup':
         head, up = value
         detail = texts['getup'].format(v=head) if up is None else texts['getup_up'].format(t=up, v=head)
+    elif measure == 'terrain':  # (tile type, level, generator, metres walked)
+        detail = texts['terrain'].format(v=(terrain_label(*value[:3], lang), value[3]))
     else:
         detail = texts[measure].format(v=value)
     line = f'{status} · {detail}'
@@ -720,12 +897,17 @@ def compose(lanes, titles, size=TILE, lang='ru', measure='forward'):
 
 
 def render(items, scenario_name, out, seconds=None, fps=FPS, size=TILE, view=None, lang='ru', focus=None, load=None,
-           pose=None, start=None, draw=None, amplitude=None):
+           pose=None, start=None, draw=None, amplitude=None, terrain_type=None, terrain_level=None, terrain_seed=None):
     """items: [(title, stage dir)]. Writes <out>.webp and the poster <out stem>-poster.jpg; returns both paths.
-    seconds, view, focus: None, the scenario's; load, pose, start, draw, amplitude: configure's."""
+    seconds, view, focus: None, the scenario's; load, pose, start, draw, amplitude, terrain_type, terrain_level,
+    terrain_seed: configure's. On rough ground every lane runs on the first lane's map (its stage's seed unless
+    terrain_seed, and its generator), so all of them walk the same tile."""
     if lang not in TEXTS:
         raise ValueError(f'Неизвестный язык подписей: {lang}')
-    clip = configure(get_clip(scenario_name), load, pose, start, draw, amplitude)
+    clip = configure(get_clip(scenario_name), load, pose, start, draw, amplitude, terrain_type, terrain_level,
+                     terrain_seed)
+    if clip.terrain and items:
+        clip = replace(clip, terrain=terrain_map(clip, items[0][1]))
     seconds = clip.seconds if seconds is None else seconds
     lanes = [film_lane(stage, clip, seconds, fps, size, view, focus) for _, stage in items]
     frames = compose(lanes, [title for title, _ in items], size, lang, clip.measure)
@@ -748,6 +930,9 @@ def _size(text):
 
 def main():
     from .export_g1 import NAMED_ARM_POSES
+    from .tasks.config import TERRAIN_LEVELS
+    from .tasks.g1_terrain import GENERATORS
+    kinds = list(dict.fromkeys(name for spec in GENERATORS.values() for name in spec.types))
     groups = {'walking': [name for name, clip in CLIPS.items() if not clip.episode],
               'arms (arm_targets stages)': [name for name, clip in CLIPS.items() if clip.arms],
               'held arm pose (any 29-DoF walking stage)': [name for name, clip in CLIPS.items() if clip.held],
@@ -756,8 +941,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('branches', nargs='+', help='experiment id, optionally :steps of a stage')
     parser.add_argument('--titles', help='comma separated tile titles (default: branch and stage)')
-    parser.add_argument('--scenario', default='walk', choices=list(CLIPS), metavar='SCENARIO',
-                        help='; '.join(f'{group}: {", ".join(names)}' for group, names in groups.items()))
+    parser.add_argument('--scenario', choices=list(CLIPS), metavar='SCENARIO',
+                        help=f'default walk ({TERRAIN_SCENARIO} with --terrain-type); '
+                             + '; '.join(f'{group}: {", ".join(names)}' for group, names in groups.items()))
     parser.add_argument('--seconds', type=float,
                         help="clip length (default: the scenario's, 10 s; arms_poses 11 s, getting up 8 s)")
     parser.add_argument('--focus', choices=list(FOCI),
@@ -773,18 +959,27 @@ def main():
                         help=f'held random pose: ±rad per arm joint (default 1, up to {HELD_AMPLITUDE:g})')
     parser.add_argument('--load', type=float, help=f'arms scenarios: kg on each hand (0-{LOAD_LIMIT:g}, default 0)')
     parser.add_argument('--start', type=int, help="getting-up scenarios: which held-out start of the class (0 first)")
+    parser.add_argument('--terrain-type', choices=kinds,
+                        help='walking scenarios on stages with task_config terrain: start on the centre of this tile, '
+                             "facing -y as terrain_probe.py (the stage's generator must have the type)")
+    parser.add_argument('--terrain-level', type=int, help=f'with --terrain-type: the level, 0-{TERRAIN_LEVELS - 1} '
+                                                          '(default 0)')
+    parser.add_argument('--seed', type=int, help="with --terrain-type: the map's seed (default the first lane's "
+                                                 "stage's own; as terrain_probe.py --seed)")
     parser.add_argument('--lang', default='ru', choices=list(TEXTS), help='tile text language')
     parser.add_argument('--size', type=_size, default=TILE, help='tile size WxH (default 320x270)')
     parser.add_argument('--out', type=Path, required=True, help='.webp path')
     args = parser.parse_args()
+    scenario = args.scenario or (TERRAIN_SCENARIO if args.terrain_type else 'walk')
     lab = Laboratory(DEFAULT_RUN)
     stages = [find_stage(lab, item) for item in args.branches]
     titles = args.titles.split(',') if args.titles else [
         f"{item.partition(':')[0][4:12]} · {int(s.name[6:]) / 1e6:.0f}{TEXTS[args.lang]['million']}"
         for item, s in zip(args.branches, stages)]
-    print(*render(list(zip(titles, stages)), args.scenario, args.out, args.seconds, size=args.size, view=args.view,
+    print(*render(list(zip(titles, stages)), scenario, args.out, args.seconds, size=args.size, view=args.view,
                   lang=args.lang, focus=args.focus, load=args.load, pose=args.pose, start=args.start, draw=args.draw,
-                  amplitude=args.amplitude), sep='\n')
+                  amplitude=args.amplitude, terrain_type=args.terrain_type, terrain_level=args.terrain_level,
+                  terrain_seed=args.seed), sep='\n')
 
 
 if __name__ == '__main__':

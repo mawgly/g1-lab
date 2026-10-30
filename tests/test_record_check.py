@@ -47,9 +47,11 @@ def missing(result):
 
 def test_walking_log_without_getup_passes(record_check, tmp_path):
     result = check(record_check, tmp_path, WALKING)
-    assert result['ok'] and not result['getup']
+    assert result['ok'] and not result['getup'] and not result['chain']
     skipped = [x for x in result['lines'] if not x['required']]
-    assert len(skipped) == 3 and all(x['patch'] == 'g1_ctrl-getup.patch' and not x['found'] for x in skipped)
+    getup = [x for x in skipped if x['patch'] == 'g1_ctrl-getup.patch']
+    assert len(getup) == 3 and all(not x['found'] for x in skipped)
+    assert {x['patch'] for x in skipped} == {'g1_ctrl-getup.patch', 'g1_ctrl-getupchain.patch'}
     # the getup patch's tilt check line is Velocity's: still required
     assert any(x['patch'] == 'g1_ctrl-getup.patch' and x['required'] and x['found'] for x in result['lines'])
 
@@ -70,4 +72,22 @@ def test_getup_built_without_its_lines_stops(record_check, tmp_path):
 def test_getup_built_with_its_lines_passes(record_check, tmp_path):
     result = check(record_check, tmp_path, GETUP_BUILT + GETUP_LINES + WALKING)
     assert result['getup'] and result['ok']
-    assert all(x['required'] for x in result['lines'])
+    assert all(x['required'] for x in result['lines'] if x['patch'] != 'g1_ctrl-getupchain.patch')
+    assert not any(x['required'] for x in result['lines'] if x['patch'] == 'g1_ctrl-getupchain.patch')
+
+
+# the getting-up chain on (run.sh --getup-track, g1_ctrl-getupchain.patch): its two states built, its info lines
+CHAIN_BUILT = """[info] Initializing State_GetUpBlend ...
+[info] Initializing State_GetUpTrack ...
+"""
+CHAIN_LINES = """[info] GetUp: hands over to GetUpBlend toward the tracker's frame 18 within 150 policy steps (sim2sim getupchain patch)
+[info] GetUpBlend: PD from the last target to frame 18 over 175 policy steps (arms 0.30, others 0.70 of them, the others 0.00 s later), kp x0.30 -> x1.00, kd x3.00 -> x1.00, then GetUpTrack (sim2sim getupchain patch)
+"""
+
+
+def test_chain_built_without_its_lines_stops_and_with_them_passes(record_check, tmp_path):
+    result = check(record_check, tmp_path, CHAIN_BUILT + GETUP_BUILT + GETUP_LINES + WALKING)
+    assert result['chain'] and not result['ok']
+    assert {x['patch'] for x in result['lines'] if x['required'] and not x['found']} == {'g1_ctrl-getupchain.patch'}
+    result = check(record_check, tmp_path, CHAIN_BUILT + CHAIN_LINES + GETUP_BUILT + GETUP_LINES + WALKING)
+    assert result['chain'] and result['ok'] and all(x['required'] for x in result['lines'])

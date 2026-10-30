@@ -1,8 +1,9 @@
 // The home page (site.html): the site's frame, the paragraphs with inline markup, the clips in the page's language,
 // the changing part from the lab's data (data('home'): the «updated» line, the number cards and what the robot can
 // do, written each morning by scripts/site/home_update.py) and the e-mail button.
-import { lang, t, frame, media, data } from './site.js';
+import { STATIC, lang, t, frame, media, data } from './site.js';
 import { locale } from './i18n.js';
+import { clipElement, wireClip } from './clip.js';
 
 frame('site.html');
 
@@ -22,33 +23,32 @@ if (lang !== 'ru')
   for (const cell of document.querySelectorAll('.num'))
     if (!/[А-Яа-яЁё]/.test(cell.textContent)) cell.textContent = cell.textContent.replace(/(\d),(\d)/g, '$1.$2');
 
-// Clips (site-<lang>-<name>.webp, labels baked in per language): the poster until the clip is on screen, then the
-// looping animation; off screen it goes back to the poster, so only visible clips are decoded. With reduced motion
-// a click plays or stops a clip instead. wire() is called again for the clips the lab's data adds.
-const show = (image, playing) => {
-  const source = playing ? image.dataset.play : image.dataset.poster;
-  if (image.getAttribute('src') !== source) image.src = source;
-};
-const still = matchMedia('(prefers-reduced-motion: reduce)').matches || !('IntersectionObserver' in window);
-const observer = still
-  ? null
-  : new IntersectionObserver((entries) => entries.forEach((entry) => show(entry.target, entry.isIntersecting)), {
-      rootMargin: '120px 0px',
-    });
+// Clips (site-<lang>-<name>, labels baked in per language) in the shared player (clip.js): the poster until the clip
+// is on screen, then it loops; off screen it stops, so only visible clips are fetched and decoded. The static copy
+// has them as .mp4 (humanoid_sim.site_video; a clip the export could not convert stays .webp, which the player falls
+// back to), the live server as .webp. wire() is called again for the clips the lab's data adds.
 function wire(images) {
   for (const image of images) {
-    image.dataset.poster = media(`site-${lang}-${image.dataset.clip}-poster.jpg`);
-    image.dataset.play = media(`site-${lang}-${image.dataset.clip}.webp`);
-    image.src = image.dataset.poster;
-    if (observer) observer.observe(image);
-    else {
-      image.title = t('Нажмите, чтобы смотреть или остановить');
-      image.style.cursor = 'pointer';
-      image.onclick = () => show(image, image.getAttribute('src') !== image.dataset.play);
-    }
+    const name = `site-${lang}-${image.dataset.clip}`;
+    const player = clipElement({
+      src: media(`${name}.${STATIC ? 'mp4' : 'webp'}`),
+      fallback: STATIC ? media(`${name}.webp`) : '',
+      poster: media(`${name}-poster.jpg`),
+      alt: image.alt,
+    });
+    image.replaceWith(player);
+    wireClip(player);
   }
 }
 wire(document.querySelectorAll('img[data-clip]'));
+
+// A finished video the page names itself (data-media .mp4 with its data-poster, the same file in every language:
+// the crowd of 4096 robots), in the same player.
+for (const image of document.querySelectorAll('img[data-media]')) {
+  const player = clipElement({ src: media(image.dataset.media), poster: media(image.dataset.poster), alt: image.alt });
+  image.replaceWith(player);
+  wireClip(player);
+}
 
 // The address is assembled only on a click, from reversed parts, so it is nowhere in the page as one string.
 const button = document.getElementById('show-email');
@@ -153,9 +153,20 @@ function updated(home) {
 
 // A research experiment (home.json «research»): its own block after the candidates, the robot's clip with the licence
 // and what it shows.
-const researchBlock = (block) => `<h2 id="research-title">${escape(block.title)}</h2>
+const researchBlock = (block, index) => `<h2${index ? '' : ' id="research-title"'}>${escape(block.title)}</h2>
 <article class="story-card wide research"><div class="media"><img data-clip="${escape(block.clip)}" alt="${escape(block.alt)}" /></div>
 <div class="body"><span class="text">${escape(block.text)}</span><span class="licence">${escape(block.licence)}</span></div></article>`;
+
+// «Как устроена лаборатория»: the lab's own counts (humanoid_sim.stack, data('stack')); without them the page's
+// numbers stay as written.
+data('stack')
+  .then((counts) => {
+    for (const element of document.querySelectorAll('[data-count]')) {
+      const value = counts[element.dataset.count];
+      if (value !== undefined && value !== null) element.textContent = String(value).replace('.', lang === 'ru' ? ',' : '.');
+    }
+  })
+  .catch(() => {});
 
 const stats = document.getElementById('home-stats'),
   candidates = document.getElementById('home-candidates'),
@@ -164,12 +175,14 @@ try {
   const home = await data('home');
   if (home.empty) throw new Error('no home data');
   document.getElementById('home-updated').textContent = updated(home);
-  stats.innerHTML = home.stats
-    .map(
-      (stat) =>
-        `<div class="card${stat.accent ? ' accent' : ''}"><span class="stat">${escape(stat.value)}</span><span>${escape(stat.label)}</span></div>`,
-    )
-    .join('');
+  // The number cards are off the page since 30.10 (Pavel: not on the home page for now); home.json keeps them.
+  if (stats)
+    stats.innerHTML = home.stats
+      .map(
+        (stat) =>
+          `<div class="card${stat.accent ? ' accent' : ''}"><span class="stat">${escape(stat.value)}</span><span>${escape(stat.label)}</span></div>`,
+      )
+      .join('');
   candidates.innerHTML = home.candidates.map(candidate).join('');
   wire(candidates.querySelectorAll('img[data-clip]'));
   if (home.research?.length) {
@@ -180,6 +193,6 @@ try {
   // The page grew above and around the anchor after the browser had jumped to it: jump again, below the header.
   if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
 } catch (error) {
-  stats.closest('section').hidden = true;
+  if (stats) stats.closest('section').hidden = true;
   candidates.innerHTML = `<p class="note">${escape(t('Данные главной ещё не собраны'))}</p>`;
 }

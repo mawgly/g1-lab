@@ -19,6 +19,7 @@ weights zero, their normalization fixed and wide.
 """
 import argparse
 import pickle
+import re
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +31,8 @@ from .checkpoint_schema import checkpoint_identity, validate_resume
 from .core import load_stage, read_json, save_stage, stage_task_config, write_json
 from .tasks import g1_tensor_math as task
 from .tasks.catalog import make_task
-from .tasks.config import ARM_BLIND_SUFFIX, ARM_TARGETS_SUFFIX, FOOT_COLLISION_SUFFIX, HAND_COLLISION_SUFFIX
+from .tasks.config import (ARM_BLIND_SUFFIX, ARM_TARGETS_SUFFIX, FOOT_COLLISION_SUFFIX, HAND_COLLISION_SUFFIX,
+                           TERRAIN_SEED_SUFFIX, TERRAIN_SUFFIXES, terrain_generator, terrain_setting)
 from .tasks.identity import task_identity
 
 PARAMETERS = ('learning_rate', 'n_steps', 'batch_size', 'n_epochs', 'gamma', 'gae_lambda', 'ent_coef', 'clip_range',
@@ -112,31 +114,60 @@ def widen_history(source, run_dir):
 CARRIED_SCHEMAS = ('observation_schema', 'action_schema')
 # Model revision suffixes carry_over may also cross, added or removed: physics that only adds contacts between the same
 # bodies (task_config foot_collision: the feet collide with each other; hand_collision: the hands collide with the floor
-# and the body), so the joints and the layout stay.
-CARRIED_MODEL_SUFFIXES = (FOOT_COLLISION_SUFFIX, HAND_COLLISION_SUFFIX)
+# and the body) or a static geom (terrain: the rough-ground heightfield beside the plane), so the joints and the layout
+# stay. The terrain's suffix may carry its map's seed (config.terrain_revision: TERRAIN_SUFFIX + TERRAIN_SEED_SUFFIX +
+# seed), another heightfield of the same tiles, so a change of seed is crossed too; and its generator
+# (TERRAIN_SUFFIXES: -terrain2, -terrain3box), other heightfields of the same tile types and more, crossed alone too
+# (carry_over maps the training_state's tile types by name, g1_velocity.carried_terrain_state).
+CARRIED_MODEL_SUFFIXES = (FOOT_COLLISION_SUFFIX, HAND_COLLISION_SUFFIX, *TERRAIN_SUFFIXES.values())
+TERRAIN_SEEDED = re.compile('(' + '|'.join(map(re.escape, TERRAIN_SUFFIXES.values())) + ')'
+                            + re.escape(TERRAIN_SEED_SUFFIX) + r'\d+$')
+TERRAIN_KIND = 'terrain'  # what every terrain suffix is, whatever its generator and seed (_suffix_kind)
 
 
 def model_suffixes(revision):
-    """(the rest, suffixes) of a model revision: the CARRIED_MODEL_SUFFIXES at its end, peeled off one by one in
-    whatever order they were appended, as a list (a repeated one twice)."""
+    """(the rest, suffixes) of a model revision: the CARRIED_MODEL_SUFFIXES at its end (the terrain's with its seed,
+    TERRAIN_SEEDED, as one), peeled off one by one in whatever order they were appended, as a list (a repeated one
+    twice)."""
     suffixes = []
     while True:
-        suffix = next((s for s in CARRIED_MODEL_SUFFIXES if revision.endswith(s)), None)
+        seeded = TERRAIN_SEEDED.search(revision)
+        suffix = seeded.group(0) if seeded else next((s for s in CARRIED_MODEL_SUFFIXES if revision.endswith(s)), None)
         if suffix is None:
             return revision, suffixes
         revision, suffixes = revision[:-len(suffix)], [suffix, *suffixes]
 
 
+def _terrain_parts(suffix):
+    """(generator suffix, seed suffix or '') of a terrain suffix, None for any other suffix."""
+    for base in TERRAIN_SUFFIXES.values():
+        if suffix == base or suffix.startswith(base + TERRAIN_SEED_SUFFIX):
+            return base, suffix[len(base):]
+    return None
+
+
+def _suffix_kind(suffix):
+    """The CARRIED_MODEL_SUFFIXES kind a peeled suffix belongs to (any terrain suffix: TERRAIN_KIND)."""
+    return TERRAIN_KIND if _terrain_parts(suffix) else suffix
+
+
 def carried_fields(saved, wanted):
     """The identity fields carry_over may change between `saved` and `wanted`: the observation and action schemas, and
-    the model revision when the two have the same rest (model_suffixes) and their CARRIED_MODEL_SUFFIXES differ by
-    exactly one, added or removed (foot_collision and hand_collision each on their own)."""
+    the model revision when the two have the same rest (model_suffixes) and differ by exactly one change of their
+    CARRIED_MODEL_SUFFIXES: one added or removed (foot_collision, hand_collision and terrain each on their own), or the
+    terrain's map seed alone, or the terrain's generator alone (-terrain2-seed6 -> -terrain3box-seed6)."""
     old, new = saved.get('model_revision'), wanted.get('model_revision')
     crossed = False
     if isinstance(old, str) and isinstance(new, str):
         (old_rest, old_suffixes), (new_rest, new_suffixes) = model_suffixes(old), model_suffixes(new)
-        if old_rest == new_rest and all(len(set(s)) == len(s) for s in (old_suffixes, new_suffixes)):
-            crossed = len(set(old_suffixes) ^ set(new_suffixes)) == 1
+        old_kinds, new_kinds = ([_suffix_kind(s) for s in suffixes] for suffixes in (old_suffixes, new_suffixes))
+        if old_rest == new_rest and all(len(set(k)) == len(k) for k in (old_kinds, new_kinds)):
+            changed = 0  # the terrain's generator and seed, each a change of its own
+            if TERRAIN_KIND in old_kinds and TERRAIN_KIND in new_kinds:
+                before = _terrain_parts(old_suffixes[old_kinds.index(TERRAIN_KIND)])
+                after = _terrain_parts(new_suffixes[new_kinds.index(TERRAIN_KIND)])
+                changed = sum(a != b for a, b in zip(before, after))
+            crossed = len(set(old_kinds) ^ set(new_kinds)) + changed == 1
     return CARRIED_SCHEMAS + (('model_revision',) if crossed else ())
 
 
@@ -167,12 +198,28 @@ def check_carry_over(saved, wanted):
     validate_resume(saved, {**wanted, **{field: saved.get(field) for field in fields}})
 
 
+def carried_state(saved, task_config):
+    """The training_state a carried stage keeps (stage metadata `saved`, the new run's task_config): the source's as it
+    is, but with task_config terrain on both sides and another tile generator, its worlds' tile types mapped by name
+    onto the new generator's (g1_velocity.carried_terrain_state)."""
+    from .tasks import g1_terrain
+    from .tasks.g1_velocity import carried_terrain_state
+    state = saved.get('training_state')
+    old = terrain_setting((saved.get('task_config') or {}).get('terrain'))
+    new = terrain_setting((task_config or {}).get('terrain'))
+    if not state or old is None or new is None:
+        return state
+    names = [g1_terrain.generator(terrain_generator(setting)).types for setting in (old, new)]
+    return carried_terrain_state(state, *names)
+
+
 def carry_over(source, run_dir):
     """The source stage as the first stage of run_dir when the new contract keeps the same input and output layout
     and changes only what some inputs or outputs mean (task_config phase_stop: the gait phase reads 0 while standing;
     lock_wrists: four action entries no longer reach the motors; knee_floor: knee actions below the floor no longer
     move the knee target; g1_getup's pd_bound: actions are bounded around the observed angles) or adds contacts to the
-    physics (foot_collision: the feet collide with each other; hand_collision: the hands with the floor and the body).
+    physics (foot_collision: the feet collide with each other; hand_collision: the hands with the floor and the body;
+    terrain: the rough-ground heightfield, or another map of it, its seed).
     Only the observation and action schemas and a model revision suffix of CARRIED_MODEL_SUFFIXES may differ; robot,
     the rest of the model revision, normalization and control step must match, the observation must keep its size and
     the action space (size and box) must be the same. Weights, normalization and optimizer state are kept as they
@@ -195,7 +242,7 @@ def carry_over(source, run_dir):
         norm.observation_space = base.observation_space
         norm.set_venv(base)
         model = PPO.load(source / 'policy.zip', env=norm, device='cpu')
-        stage = save_stage(run_dir, model, norm, saved.get('training_state'))
+        stage = save_stage(run_dir, model, norm, carried_state(saved, task_config))
         write_json(stage / 'warm_start.json', {'source': str(source.resolve()), 'steps': model.num_timesteps,
                                                'method': 'same layout, new contract: weights carried over unchanged',
                                                'from_schema': saved.get('observation_schema'),
@@ -211,8 +258,9 @@ def carry_over(source, run_dir):
 
 def observation_keys(raw):
     """Per entry of a G1 real-robot environment's observation: (term, frame, entry), term a deploy term's number
-    (0-6, deploy_observation's order) or an extra term's name (task.extra_terms), frame 0 the oldest; the critic
-    extras ('critic', 0, k)."""
+    (0-6, deploy_observation's order) or an extra term's name (task.extra_terms), frame 0 the oldest; task_config
+    height_scan's actor scan (task.HEIGHT_SCAN_TERM, 0, point) after them; the critic extras ('critic', 0, k); the
+    critic's scan (task.CRITIC_SCAN_TERM, 0, point) last."""
     nu, history, sizes = raw.model.nu, raw.history, raw.extra_sizes
     names = [*range(7), *(name for name, _ in raw.extra_terms)]
     keys = [None] * raw.observation_space.shape[0]
@@ -220,8 +268,11 @@ def observation_keys(raw):
         for (start, end), name in zip(task.deploy_terms(nu, sizes), names):
             for i in range(start, end):
                 keys[positions[i]] = (name, frame, i - start)
-    for k in range(len(keys) - raw.frame_size * history):
-        keys[raw.frame_size * history + k] = ('critic', 0, k)
+    scan, critic_scan = (len(getattr(raw, name, ())) for name in ('scan_grid', 'critic_grid'))
+    tail = ([(task.HEIGHT_SCAN_TERM, 0, k) for k in range(scan)]
+            + [('critic', 0, k) for k in range(len(keys) - raw.frame_size * history - scan - critic_scan)]
+            + [(task.CRITIC_SCAN_TERM, 0, k) for k in range(critic_scan)])
+    keys[raw.frame_size * history:] = tail
     return keys
 
 
@@ -271,8 +322,13 @@ def insert_terms(source, run_dir):
     old columns' statistics as they are (count kept), the new columns' from the environment's fixed_normalization
     (TensorNormalize keeps them frozen; the ~7e9 counted observations would never estimate them). Adam: the new
     columns start with no momentum and the mean second moment of their row's old columns, so their first updates are
-    of the usual size. Steps and updates are kept. Only the observation schema may differ (check_insert_terms);
-    robot, model, actions, normalization and control step must match."""
+    of the usual size. Steps and updates are kept, and so is the source's training_state (g1_getup's assist forces,
+    track_sampling's bins). Only the observation schema may differ (check_insert_terms); robot, model, actions,
+    normalization and control step must match. g1_getup's track_clip → track_clips (iteration 78) goes the same way:
+    the critic's extras grow at their end (the reference ahead), the actor's 490 inputs stay, and the new critic
+    columns are the task's fixed_normalization ones, so the critic values as the source's on the old columns. So does
+    G1 task_config height_scan: the actor's scan after the history, the critic's after the critic extras, both new
+    columns at zero weights (the actor's and the critic's first layers), so stage 0 acts and values as the source."""
     source, run_dir = Path(source), Path(run_dir)
     config = read_json(run_dir / 'run_config.json')
     robot_id, task_id, task_config = config['robot_id'], config['task_id'], config['task_config']
@@ -321,18 +377,60 @@ def insert_terms(source, run_dir):
                                                        moments['exp_avg_sq'].mean(dim=1, keepdim=True))
         model.policy.optimizer.load_state_dict(optimizer)
         model.num_timesteps, model._n_updates = old.num_timesteps, old._n_updates
-        stage = save_stage(run_dir, model, norm)
+        stage = save_stage(run_dir, model, norm, saved.get('training_state'))
         write_json(stage / 'warm_start.json', {
             'source': str(source.resolve()), 'steps': old.num_timesteps,
             'method': 'terms inserted: old columns kept, critic extras last, new columns zero weights; new columns '
                       'normalized as fixed_normalization; Adam m 0, v the row mean',
             'from_schema': saved.get('observation_schema'), 'to_schema': wanted['observation_schema'],
-            'inserted': [name for name, _ in raw.extra_terms if name not in dict(old_raw.extra_terms)],
+            'inserted': [name for name, _ in raw.extra_terms if name not in dict(old_raw.extra_terms)]
+                        + [name for name, grid in ((task.HEIGHT_SCAN_TERM, 'scan_grid'), (task.CRITIC_SCAN_TERM,
+                                                                                         'critic_grid'))
+                           if len(getattr(raw, grid, ())) and not len(getattr(old_raw, grid, ()))],
             'observation_size': [old_env.observation_space.shape[0], base.observation_space.shape[0]]})
         return stage
     finally:
         old_env.close()
         base.close()
+
+
+INSERT_SEEDS = (0, 1, 2, 3)  # inserted_difference's training resets
+INSERT_STEPS = 150
+
+
+def inserted_difference(source, stage, seeds=INSERT_SEEDS, steps=INSERT_STEPS):
+    """Largest |action difference| between the source stage's and insert_terms' stage's deterministic policies, each
+    normalizing with its own statistics, on the new task's own observations (the source reads its old columns, term_map)
+    of training resets (no command: the new terms live, e.g. height_scan's scans on the terrain tiles, noise included)
+    `seeds`, `steps` control steps each, the source's actions driving (a fall ends the run). 0 up to float rounding:
+    the new columns' weights are zero."""
+    source, stage = Path(source), Path(stage)
+    identity = checkpoint_identity(read_json(stage / 'metadata.json'))
+    (first, first_norm), (second, second_norm) = load_stage(source), load_stage(stage)
+    env = make_task(identity['task_id'], identity['robot_id'], stage_task_config(stage))
+    old_env = make_task(identity['task_id'], identity['robot_id'], stage_task_config(source))
+    worst = 0.
+    try:
+        mapping = term_map(old_env.unwrapped, env.unwrapped)
+        known = (mapping >= 0).nonzero().flatten()
+        old_columns = torch.empty(old_env.observation_space.shape[0], dtype=torch.long)
+        old_columns[mapping[known]] = known
+        old_columns = old_columns.numpy()
+        for seed in seeds:
+            obs, _ = env.reset(seed=seed)
+            for _ in range(steps):
+                action = first.predict(first_norm.normalize_obs(obs[old_columns]), deterministic=True)[0]
+                other = second.predict(second_norm.normalize_obs(obs), deterministic=True)[0]
+                worst = max(worst, float(np.abs(action - other).max()))
+                obs, _, terminated, truncated, _ = env.step(action)
+                if terminated or truncated:
+                    break
+    finally:
+        env.close()
+        old_env.close()
+        first_norm.close()
+        second_norm.close()
+    return worst
 
 
 # blind_arms' reference runs (the critic's mixref, lab-critic/it30 blind_const.py): (command, first and last control

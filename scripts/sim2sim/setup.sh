@@ -7,7 +7,8 @@
 # Each step logs to $ROOT/logs/setup-<step>.log. Docs: docs/sim2sim.md.
 # Unitree's code is changed only by the patches in patches/ (simulate: pelvis pushes, g1ctrl: the target held
 # until the first policy step, targets published clipped, Passive after a fall, the height command's observation
-# terms, the getting-up state GetUp, the arm command's observation term), applied once by their steps before the build.
+# terms, the getting-up state GetUp, the arm command's observation term, the getting-up chain's hand-over, PD
+# transition and tracker states), applied once by their steps before the build.
 # SIM2SIM_HEIGHT=off builds g1_ctrl without the height patch (reversed if the tree has it), as robot package 8 was
 # built: wsl.exe -d Ubuntu -u root -e env SIM2SIM_HEIGHT=off bash /mnt/c/.../setup.sh g1ctrl
 # SIM2SIM_JOBS=4 builds with 4 compiler processes instead of 16 (while training or tests use the CPU).
@@ -31,7 +32,7 @@ JOYSTICK_FIFO=/tmp/sim2sim_js0
 
 # g1_ctrl's patches in the order step_g1ctrl puts them on (height only without SIM2SIM_HEIGHT=off).
 G1CTRL_PATCHES=(g1_ctrl-policy-start.patch g1_ctrl-clip-race.patch g1_ctrl-fall-passive.patch g1_ctrl-height.patch
-  g1_ctrl-getup.patch g1_ctrl-arms.patch)
+  g1_ctrl-getup.patch g1_ctrl-arms.patch g1_ctrl-getupchain.patch)
 
 step_apt() {
   export DEBIAN_FRONTEND=noninteractive
@@ -152,6 +153,12 @@ step_g1ctrl() {
   # named poses from deploy.yaml chosen by LB + a button, a quintic to them (flag 1), LB + B home and then zeros (flag
   # 0); other exports never name it. Its own lines in observations.h, so it goes on with or without the height patch.
   apply_patch unitree_rl_mjlab g1_ctrl-arms.patch || return 1
+  # The getting-up chain (iteration 82, getup_chain.py): GetUp hands over by itself (config.yaml handover, the pelvis
+  # rule toward the tracker's frame) to GetUpBlend (the PD transition: quintic targets and gains to the tracker's
+  # hand-over frame), then GetUpTrack (the tracker, an RLBase state with its own policy_dir); both off in config.yaml's
+  # enabled list until a tracker is in config/policy/getup_track (run.sh --getup-track turns them on for a run). It
+  # edits the getup patch's GetUp lines, so it goes on last; robot packages leave it out (package.py CHAIN_PATCH).
+  apply_patch unitree_rl_mjlab g1_ctrl-getupchain.patch || return 1
   cd "$ROOT/unitree_rl_mjlab/deploy/robots/g1" && mkdir -p build && cd build &&
   cmake .. && make -j$JOBS && ls -la g1_ctrl
 }

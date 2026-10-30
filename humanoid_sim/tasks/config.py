@@ -251,6 +251,197 @@ def load_curve_setting(value):
     if any(type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1 for v in (low, high)) or low > high:
         raise ValueError('G1 load_curve raise_falls and lower_falls must be shares in [0,1], raise_falls <= lower_falls')
     return {'block': int(block), 'raise_falls': float(low), 'lower_falls': float(high)}
+
+
+# terrain (stage 5, rough ground blind; docs/lab-knowledge.md «Неровный пол вслепую»): a grid of 8 m tiles beside
+# the plane, TERRAIN_LEVELS rows of difficulty times the tile types of tasks/g1_terrain (flat, rough, boxes, stairs,
+# slopes), one heightfield per tile built at load time for the CPU task and Warp alike (terrain2, 29.10: one
+# heightfield for the grid gave MJWarp contacts metres deep, g1_terrain). Training resets put each world at the
+# centre of a tile of its type and level; the full-GPU task moves a world's level after each episode by how far it
+# walked along its commands (up from `up` of the commanded path, down below `down` or after a fall,
+# tasks/g1_tensor_math terrain_level_update), and from `slow_level` on caps the commanded speed at `slow_speed`; fresh
+# worlds start at a level up to `start_level`. A reset with a command (evaluation, scenarios) starts on the plane at
+# the origin, as before. The reward's heights (pelvis, feet, soles), the fall and the feet's tilt are measured from the
+# ground under the body. Observations and actions are unchanged, the physics is not: its own model revision
+# (TERRAIN_SUFFIX; the generator's revision is part of it), a stage moves there with warm_start.carry_over. None
+# (missing) is the plane alone, bit for bit.
+# `seed` (30.10, Pavel: always different, realistic floors) is the map's random seed (tasks/g1_terrain.terrain_grid):
+# the same tile types, levels, platforms and borders, other random heights, blocks and treads. Missing, or
+# TERRAIN_SEED, is the first map bit for bit (the normalized setting then has no seed key); another seed is other
+# heightfield data, so its own model revision (TERRAIN_SUFFIX + TERRAIN_SEED_SUFFIX + seed, terrain_revision), which
+# warm_start.carry_over crosses (scripts/lab/terrain_next.py: each run on a new map).
+# `pelvis_support` (bool, 29.10, critic it94; missing or false: the old task bit for bit, the normalized setting then
+# has no such key) measures the pelvis height that the fall, the height and height_ceiling terms and the critic see
+# above the mean ground under the two feet (their ankle_roll origins, g1_tensor_math.pelvis_ground), not above the
+# ground under the pelvis, which on stairs up passes over the next step before the feet do (20 cm steps: 9 of 9 runs
+# cut by the fall rule with the pelvis 0.68-0.74 m above the feet). Reward and fall only: not part of the identity.
+# `generator` (30.10, the lead after critic it94: a height-map teacher on 15-20 cm stairs, pits and curbs; missing or
+# TERRAIN_GENERATOR 2 is the old map bit for bit, the normalized setting then has no generator key) picks the tile
+# generator (tasks/g1_terrain.GENERATORS): 3 has a 2.5 cm cell, stairs of 2 -> 20 cm on 0.23-0.31 m treads, and two
+# more tile types, pits and curbs. Other heightfields, so its own model revision (TERRAIN_SUFFIXES[generator], the seed
+# suffix as before), which warm_start.carry_over crosses (the training_state's tile types mapped by name).
+# Generator 3's stairs, pits, curbs and steep boxes tiles collide through static boxes, their heightfields only give
+# the reward its heights (30.10, the lead: MJWarp measured 15-20 cm risers vertically, contacts 19 cm deep;
+# g1_terrain.box_tiles): other physics than 369be7f's -terrain3, so -terrain3box (its pits' ramp tilted boxes and no
+# two boxes of one height over one cell since the same day, changed in place before any stage had it).
+TERRAIN_SUFFIX = '-terrain2'
+TERRAIN_GENERATOR = 2
+TERRAIN_SUFFIXES = {2: TERRAIN_SUFFIX, 3: '-terrain3box'}
+TERRAIN_SEED_SUFFIX = '-seed'
+TERRAIN_SEED = 5
+TERRAIN_SEED_RANGE = (0, 2 ** 31 - 1)
+TERRAIN_LEVELS = 10
+TERRAIN_DEFAULTS = dict(up=.8, down=.5, start_level=0, slow_level=5, slow_speed=.5)
+TERRAIN_SLOW_SPEED_RANGE = (.1, 2.)
+
+
+def terrain_seed(setting):
+    """The map seed of a normalized terrain setting (TERRAIN_SEED without the key)."""
+    return TERRAIN_SEED if setting is None else setting.get('seed', TERRAIN_SEED)
+
+
+def terrain_pelvis_support(setting):
+    """Whether a normalized terrain setting measures the pelvis height above the feet's ground (pelvis_support)."""
+    return setting is not None and setting.get('pelvis_support', False)
+
+
+def terrain_generator(setting):
+    """The tile generator of a normalized terrain setting (TERRAIN_GENERATOR without the key)."""
+    return TERRAIN_GENERATOR if setting is None else setting.get('generator', TERRAIN_GENERATOR)
+
+
+def terrain_revision(setting):
+    """The model revision suffix of a normalized terrain setting (not None): its generator's TERRAIN_SUFFIXES entry,
+    plus TERRAIN_SEED_SUFFIX and the seed for a map other than TERRAIN_SEED's."""
+    seed = terrain_seed(setting)
+    return TERRAIN_SUFFIXES[terrain_generator(setting)] + ('' if seed == TERRAIN_SEED else
+                                                            f'{TERRAIN_SEED_SUFFIX}{seed}')
+
+
+def terrain_setting(value):
+    """task_config terrain normalized: None, or every key of TERRAIN_DEFAULTS (missing keys take those): `up` in (0, 2]
+    and `down` in [0, up) shares of the commanded path, `start_level` and `slow_level` whole levels (slow_level =
+    TERRAIN_LEVELS: never slower), `slow_speed` m/s; optionally `seed`, a whole number in TERRAIN_SEED_RANGE, kept only
+    when it is not TERRAIN_SEED, `pelvis_support`, a bool, kept only when true, and `generator`, one of
+    TERRAIN_SUFFIXES, kept only when it is not TERRAIN_GENERATOR; anything else raises ValueError."""
+    if value is None:
+        return None
+    optional = ('seed', 'pelvis_support', 'generator')
+    if not isinstance(value, dict) or set(value) - {*TERRAIN_DEFAULTS, *optional}:
+        raise ValueError('G1 terrain must be null or a dict of ' + ', '.join([*TERRAIN_DEFAULTS, *optional]))
+    seed = value.get('seed', TERRAIN_SEED)
+    low, high = TERRAIN_SEED_RANGE
+    if type(seed) is not int or not low <= seed <= high:
+        raise ValueError(f'G1 terrain seed must be a whole number in [{low},{high}]')
+    support = value.get('pelvis_support', False)
+    if type(support) is not bool:
+        raise ValueError('G1 terrain pelvis_support must be true or false')
+    generator = value.get('generator', TERRAIN_GENERATOR)
+    if type(generator) is not int or generator not in TERRAIN_SUFFIXES:
+        raise ValueError('G1 terrain generator must be one of ' + ', '.join(map(str, TERRAIN_SUFFIXES)))
+    value = {key: item for key, item in value.items() if key not in optional}
+    result = {**TERRAIN_DEFAULTS, **value}
+    numbers = [result[key] for key in ('up', 'down', 'slow_speed')]
+    if any(type(v) not in (int, float) or not math.isfinite(v) for v in numbers):
+        raise ValueError('G1 terrain up, down and slow_speed must be finite numbers')
+    if not 0 < result['up'] <= 2 or not 0 <= result['down'] < result['up']:
+        raise ValueError('G1 terrain needs 0 < up <= 2 and 0 <= down < up (shares of the commanded path)')
+    low, high = TERRAIN_SLOW_SPEED_RANGE
+    if not low <= result['slow_speed'] <= high:
+        raise ValueError(f'G1 terrain slow_speed must be in [{low:g},{high:g}] m/s')
+    for key, top in (('start_level', TERRAIN_LEVELS - 1), ('slow_level', TERRAIN_LEVELS)):
+        level = result[key]
+        if type(level) not in (int, float) or level != int(level) or not 0 <= level <= top:
+            raise ValueError(f'G1 terrain {key} must be a whole number in [0,{top}]')
+    return {'up': float(result['up']), 'down': float(result['down']), 'start_level': int(result['start_level']),
+            'slow_level': int(result['slow_level']), 'slow_speed': float(result['slow_speed']),
+            **({} if seed == TERRAIN_SEED else {'seed': seed}), **({'pelvis_support': True} if support else {}),
+            **({} if generator == TERRAIN_GENERATOR else {'generator': generator})}
+
+
+# height_scan (30.10, stage 5's height-map teacher; the lead after critic it94 and the scouting in docs/lab-knowledge.md
+# «Учитель с картой высот — разведка»; needs terrain, real_robot and critic_extras): the ground's heights in the
+# observation, for the actor and the critic in one insertion. The actor's grid lies in the pelvis frame turned by its
+# yaw, x from x[0] to x[1] ahead, y within ±y (symmetric, so the left-right mirror maps it onto itself), spacing step
+# (default 15 × 11 = 165 points, -0.2…1.2 × ±0.5 m every 0.1 m, where the head's D435i depth camera will see it for a
+# student, stage C): each point the ground height (g1_tensor_math.terrain_height, the reward's) minus the grid's mean,
+# clipped to ±HEIGHT_SCAN_CLIP, plus training noise U(±noise) (the CUDA task per world from its generator, the CPU task
+# with np_random after a training reset; a reset with a command or set_command: none), the newest frame only, one term
+# after the actor's other terms. The critic's grid, CRITIC_SCAN_POINTS² points every CRITIC_SCAN_STEP within
+# ±CRITIC_SCAN_HALF around the pelvis in the same frame, exact, is the ground height minus the mean ground under the two
+# feet (as pelvis_support), after the critic extras (g1_tensor_math.height_scan, critic_scan). Its own observation
+# contract (…-hscan<points>, HEIGHT_SCAN_SUFFIX; the grid spelled out when not the default); a stage moves there with
+# warm_start.insert_terms (new columns with zero weights, fixed normalization). None (missing) is the old layout, bit
+# for bit. The export refuses it: on the robot the map is a depth-camera student's (stage C).
+HEIGHT_SCAN_SUFFIX = '-hscan'
+HEIGHT_SCAN_DEFAULTS = dict(x=[-.2, 1.2], y=.5, step=.1, noise=.1)
+HEIGHT_SCAN_STEP_RANGE = (.025, .5)  # m
+HEIGHT_SCAN_X_RANGE = (-2., 3.)  # m, both ends of the actor's grid along the pelvis heading
+HEIGHT_SCAN_Y_RANGE = (0., 2.)  # m, its half-width (0: one row on the midline)
+HEIGHT_SCAN_NOISE_RANGE = (0., .5)  # m
+HEIGHT_SCAN_MAX_POINTS = 1024
+CRITIC_SCAN_HALF = .7  # m
+CRITIC_SCAN_STEP = .1  # m
+CRITIC_SCAN_POINTS = 15  # per side: 15 × 15 = 225
+
+
+def height_scan_counts(setting):
+    """(points along x, points along y) of a normalized height_scan setting's actor grid."""
+    (low, high), half, step = setting['x'], setting['y'], setting['step']
+    return round((high - low) / step) + 1, 2 * round(half / step) + 1
+
+
+def height_scan_setting(value):
+    """task_config height_scan normalized: None, or {'x': [low, high], 'y': half-width, 'step', 'noise'} (missing keys
+    take HEIGHT_SCAN_DEFAULTS): low < high within HEIGHT_SCAN_X_RANGE, y within HEIGHT_SCAN_Y_RANGE, both whole
+    multiples of step (HEIGHT_SCAN_STEP_RANGE) from 0 and from low, at most HEIGHT_SCAN_MAX_POINTS points, noise in
+    HEIGHT_SCAN_NOISE_RANGE m; anything else raises ValueError."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) - set(HEIGHT_SCAN_DEFAULTS):
+        raise ValueError('G1 height_scan must be null or a dict of ' + ', '.join(HEIGHT_SCAN_DEFAULTS))
+    result = {**HEIGHT_SCAN_DEFAULTS, **value}
+    x = result['x']
+    if not isinstance(x, (list, tuple)) or len(x) != 2:
+        raise ValueError('G1 height_scan x must be [low, high] m')
+    numbers = [*x, result['y'], result['step'], result['noise']]
+    if any(type(v) not in (int, float) or not math.isfinite(v) for v in numbers):
+        raise ValueError('G1 height_scan x, y, step and noise must be finite numbers')
+    low, high = (float(v) for v in x)
+    half, step, noise = float(result['y']), float(result['step']), float(result['noise'])
+    if not HEIGHT_SCAN_STEP_RANGE[0] <= step <= HEIGHT_SCAN_STEP_RANGE[1]:
+        raise ValueError(f'G1 height_scan step must be in [{HEIGHT_SCAN_STEP_RANGE[0]:g},'
+                         f'{HEIGHT_SCAN_STEP_RANGE[1]:g}] m')
+    if not HEIGHT_SCAN_X_RANGE[0] <= low < high <= HEIGHT_SCAN_X_RANGE[1]:
+        raise ValueError(f'G1 height_scan x needs {HEIGHT_SCAN_X_RANGE[0]:g} <= low < high <= '
+                         f'{HEIGHT_SCAN_X_RANGE[1]:g} m')
+    if not HEIGHT_SCAN_Y_RANGE[0] <= half <= HEIGHT_SCAN_Y_RANGE[1]:
+        raise ValueError(f'G1 height_scan y (half-width) must be in [{HEIGHT_SCAN_Y_RANGE[0]:g},'
+                         f'{HEIGHT_SCAN_Y_RANGE[1]:g}] m')
+    if any(abs(length / step - round(length / step)) > 1e-6 for length in (high - low, half)):
+        raise ValueError('G1 height_scan x span and y half-width must be whole multiples of step')
+    if not HEIGHT_SCAN_NOISE_RANGE[0] <= noise <= HEIGHT_SCAN_NOISE_RANGE[1]:
+        raise ValueError(f'G1 height_scan noise must be in [{HEIGHT_SCAN_NOISE_RANGE[0]:g},'
+                         f'{HEIGHT_SCAN_NOISE_RANGE[1]:g}] m')
+    setting = {'x': [low, high], 'y': half, 'step': step, 'noise': noise}
+    columns, rows = height_scan_counts(setting)
+    if columns * rows > HEIGHT_SCAN_MAX_POINTS:
+        raise ValueError(f'G1 height_scan has more than {HEIGHT_SCAN_MAX_POINTS} points')
+    return setting
+
+
+def height_scan_revision(setting):
+    """The observation schema suffix of a normalized height_scan setting (not None): HEIGHT_SCAN_SUFFIX and the actor's
+    point count, then the grid (x span, half-width, step) when it is not the default one. The noise is training only,
+    not part of it."""
+    columns, rows = height_scan_counts(setting)
+    suffix = f'{HEIGHT_SCAN_SUFFIX}{columns * rows}'
+    defaults = height_scan_setting({})
+    if any(setting[key] != defaults[key] for key in ('x', 'y', 'step')):
+        suffix += f"-x{setting['x'][0]:g}_{setting['x'][1]:g}-y{setting['y']:g}-s{setting['step']:g}"
+    return suffix
+
+
 G1_PARAMETERS = (
     dict(group=None, key='real_robot', label='Реальный робот: моторы, датчики и разброс Unitree', default=False,
          type='bool'),
@@ -341,6 +532,15 @@ G1_PARAMETERS = (
     dict(group=None, key='load_curve', default=None,
          label=('Кривая груза на кистях: решение раз в block раскаток, вверх при доле падений ниже raise_falls, вниз '
                 'выше lower_falls (пусто — решение каждую раскатку, 1% / 3%)')),
+    # Missing or null in a saved config means the plane alone; a different model revision (…-terrain2).
+    dict(group=None, key='terrain', default=None,
+         label=('Неровный пол: плитки 8 м по 10 уровням (шероховатость, пороги, ступени, склоны), уровень мира растёт '
+                'и падает по пройденному пути (пусто — ровный пол)')),
+    # Needs terrain, real_robot and critic_extras; missing or null in a saved config means off. Its own observation
+    # contract (…-hscan165); a stage moves there with warm_start.insert_terms (scripts/lab/insert_root.py).
+    dict(group=None, key='height_scan', default=None,
+         label=('Карта высот во входе: сетка перед роботом для политики (с шумом), вокруг таза для критика '
+                '(пусто — без карты)')),
     dict(group=None, key='action_limit', label='Предел команды моторов (1 — прежний, 4 — почти весь ход суставов)',
          default=1., min=ACTION_LIMIT_RANGE[0], max=ACTION_LIMIT_RANGE[1]),
     *(dict(group='commands', key=key, label=G1_COMMAND_LABELS[key], default=G1_COMMANDS[key],
@@ -436,13 +636,15 @@ def g1_config(values):
     ARM_PERTURB_RADIANS (the original arm poses), arm_perturb_contact_mask missing means off (arm contacts charged in a
     perturbation segment too). arm_blind missing means off (the policy saw its arms). hand_collision missing means off
     (the hands touched nothing). arm_targets missing means off (the upper-body slot stayed zeros). load_curve missing
-    means None (the load curve decided every rollout window, 1 % / 3 %).
+    means None (the load curve decided every rollout window, 1 % / 3 %). terrain missing or null means None (the plane
+    alone). height_scan missing or null means None (no height map in the observation).
     """
     keys = {'reward_weights', 'heading_hold', 'commands', 'gait', 'action_limit', 'real_robot', 'critic_extras',
             'training_realism', 'history', 'stand_heading_hold', 'phase_stop', 'sole_contact', 'random_phase',
             'action_delay', 'arm_perturb', 'arm_perturb_radians', 'arm_perturb_contact_mask', 'lock_wrists',
             'knee_floor', 'force_push', 'feet_flat_stance', 'foot_collision', 'side_heading_hold', 'motor_friction',
-            'height_command', 'upper_body_slot', 'arm_blind', 'hand_collision', 'arm_targets', 'load_curve'}
+            'height_command', 'upper_body_slot', 'arm_blind', 'hand_collision', 'arm_targets', 'load_curve', 'terrain',
+            'height_scan'}
     if not isinstance(values, dict) or set(values)-keys:
         raise ValueError('Unknown G1 task setting')
     for key in ('heading_hold', 'real_robot', 'critic_extras', 'stand_heading_hold', 'phase_stop', 'sole_contact',
@@ -510,6 +712,10 @@ def g1_config(values):
     load_curve = load_curve_setting(values.get('load_curve'))
     if load_curve is not None and not values.get('arm_targets'):
         raise ValueError('load_curve requires arm_targets')
+    terrain = terrain_setting(values.get('terrain'))
+    height_scan = height_scan_setting(values.get('height_scan'))
+    if height_scan is not None and (terrain is None or not real or not values.get('critic_extras')):
+        raise ValueError('height_scan requires terrain, real_robot and critic_extras')
     commands = g1_commands(values.get('commands'))
     if any(commands['crouch_share']) and not values.get('height_command'):
         raise ValueError('G1 command crouch_share requires height_command')
@@ -545,7 +751,9 @@ def g1_config(values):
             'arm_blind': values.get('arm_blind', False),
             'hand_collision': values.get('hand_collision', False),
             'arm_targets': values.get('arm_targets', False),
-            'load_curve': load_curve}
+            'load_curve': load_curve,
+            'terrain': terrain,
+            'height_scan': height_scan}
 
 
 # Bumped when the real-robot physics or observation layout changes.
@@ -570,6 +778,7 @@ def g1_config_identity(identity, config):
                   + ('-ubslot' if config.get('upper_body_slot') else '')
                   + (ARM_BLIND_SUFFIX if config.get('arm_blind') else '')
                   + (ARM_TARGETS_SUFFIX if config.get('arm_targets') else '')
+                  + ('' if config.get('height_scan') is None else height_scan_revision(config['height_scan']))
                   + (f'-critic{CRITIC_EXTRAS}' if config.get('critic_extras') else ''))
         identity = {**identity, 'observation_schema': f"{identity['task_id']}:{schema}",
                     'model_revision': hashlib.sha256(f"{identity['model_revision']}:{REAL_ROBOT_REVISION}".encode()).hexdigest()}
@@ -577,6 +786,8 @@ def g1_config_identity(identity, config):
         identity = {**identity, 'model_revision': f"{identity['model_revision']}{FOOT_COLLISION_SUFFIX}"}
     if config.get('hand_collision'):  # likewise
         identity = {**identity, 'model_revision': f"{identity['model_revision']}{HAND_COLLISION_SUFFIX}"}
+    if config.get('terrain') is not None:  # a heightfield beside the plane, the same bodies, joints and layout
+        identity = {**identity, 'model_revision': f"{identity['model_revision']}{terrain_revision(config['terrain'])}"}
     return identity
 
 
@@ -650,6 +861,79 @@ TRACK_CRITIC_EXTRAS = 11  # sin/cos of the clip phase, the anchor's position (3)
 # share of substeps with a robot-robot contact above 10 N).
 G1_GETUP_TRACK_WEIGHTS = dict(anchor_pos=.5, anchor_ori=.5, body_pos=1., body_ori=1., body_lin_vel=1., body_ang_vel=1.,
                               action_rate=.1, joint_limit=10., self_contact=10.)
+# track_clip's training starts (iteration 68; Pavel: the body lies differently before getting up, on the back, the
+# chest, the side, the arms and legs anywhere), all need track_clip and none is part of the contract:
+# track_starts {first, rsi, bank}: the shares of the training resets from the clip's first frame, a uniform frame
+#   (reference state init) and a bank row (None, missing: g1_tensor_math.TRACK_START_SHARES 0.6 / 0.3 / 0.1, bit for
+#   bit); the shares sum to 1.
+# track_noise: the clip starts' noise as a multiple of g1_tensor_math.TRACK_START_NOISE (1, missing: mjlab's; at 3 the
+#   joints ±0.3 rad, roll and pitch ±0.3, yaw ±0.6, xy ±0.15 m, z ±0.03 m, root velocities ±0.3).
+# track_bank_classes: the bank classes a bank start draws its training rows from (None, missing: the back's alone,
+#   g1_tensor_math.TRACK_BANK_CLASS); GETUP_START_CLASSES are g1_getup_bank.CLASSES.
+# track_bank_nearest (bool): a bank start's clip clock starts at the clip frame nearest to the row (the pelvis gravity
+#   and the free joints, g1_tensor_math.track_nearest_frame, among the frames whose anchor height lies within
+#   TRACK_NEAREST_ANCHOR of the row's), the reference aligned to that frame's pelvis; false (missing): frame 0.
+# track_sampling (iteration 77; SuperMimic, arXiv 2610.28480, appendix D.1; critic it76: the window 1.0-1.5 s of the
+#   side clip got ~4 % of the episodes) {bin, uniform, hard, history, temperature}: the clip's frames cut into bins of
+#   `bin` seconds, each with a running estimate G_b of the normalized discounted return of the episodes started there;
+#   an RSI start (track_starts' rsi share) draws its bin from the mixture `uniform` (uniform over the bins), `hard`
+#   (softmax(−temperature·G_b/G_max)) and `history` (the running mean of the past softmax weights), its frame uniform
+#   within the bin (g1_tensor_math.TrackBinSampler). The full-GPU task only, the learner's own episodes; the CPU task
+#   accepts it and keeps its uniform RSI. None (missing): off, bit for bit. Needs track_clip and a non-zero rsi share.
+TRACK_SAMPLING_KEYS = ('bin', 'uniform', 'hard', 'history', 'temperature')
+TRACK_SAMPLING_BIN_RANGE = (.02, 10.)  # s: one control step to 10 s
+TRACK_SAMPLING_TEMPERATURE_RANGE = (0., 1000.)
+# track_clips (iteration 78; Pavel 27.10, SuperMimic: one tracker of many human rises): [{file, md5}, …], 2 to
+# TRACK_CLIPS_RANGE[1] different clips of tasks/g1_getup_track (as track_clip's), instead of track_clip: each world
+# follows one of them per episode (g1_tensor_math.track_clips_index), the starts of track_starts drawn over all of them
+# (first: the first frame of a clip drawn uniformly; rsi: a frame drawn uniformly over every clip's frames, or with
+# track_sampling from one bin table over every clip; bank: the clip and frame nearest to the row's pose among the clips
+# whose start class is the row's, g1_tensor_math.track_nearest_clip). One clip's phase tells the critic little among
+# many, so it also sees the seconds left and the reference ahead (TRACK_FUTURE_SECONDS: the anchor in the robot anchor's
+# frame and the free joints there; g1_tensor_math.track_clips_critic_extras): its own observation contract
+# (…-critic6-track<TRACK_CLIPS_CRITIC_EXTRAS>), the actor's 490 inputs as before; a track_clip stage moves there with
+# warm_start.insert_terms (the new columns zero weights, their normalization fixed). Not with track_clip, settle_clip,
+# pd_bound, human_starts, style_judge or the style / amp weights. None (missing): off, the task bit for bit.
+TRACK_CLIPS_RANGE = (2, 64)
+TRACK_FUTURE_SECONDS = (.1, .5, 1.)
+TRACK_FUTURE_JOINTS = 25  # the free joints: all but the four locked wrists
+# The critic's track_clips inputs after the six: track_clip's 11, the seconds left, then per TRACK_FUTURE_SECONDS the
+# reference anchor's position (3) and rotation (6) in the robot anchor's frame and the free joints (relative to home).
+TRACK_CLIPS_CRITIC_EXTRAS = TRACK_CRITIC_EXTRAS + 1 + len(TRACK_FUTURE_SECONDS) * (3 + 6 + TRACK_FUTURE_JOINTS)
+# track_end_reach (iteration 78, the critic's it78: branch 76 sat on straight legs from 1.5 s while the clip tucked the
+#   right foot under the pelvis, and only the anchor's height ended it at 3.04 s): m, an episode also ends when an ankle
+#   lies farther than this from its place in the clip re-anchored under the robot (g1_tensor_math.track_reach_distance,
+#   3D; the bank starts' grace as the ends' heights). None (missing): off, bit for bit; working 0.4 (the successful
+#   runs' largest 0.08-0.28 m). Needs track_clip or track_clips; not part of the contract.
+TRACK_END_REACH_RANGE = (.1, 2.)
+# track_weights (iteration 80; SuperMimic, arXiv 2610.28480, table A.2: on the same BONES-SEED clips no self-contact
+#   penalty and joint limits at 2): a partial dict of G1_GETUP_TRACK_WEIGHTS' keys, each in [0, 100], over the constant
+#   in both tasks. Why (critic it79): the BONES fits put robot parts into each other (A473 v2 85 frames deeper than 1 cm,
+#   up to 9.2 cm; A493 v3 59), so following such a clip cost −5.4 a step and lying +2.5. A self_contact of 0 reads no
+#   contact forces for it (as a zero weight everywhere). None (missing): the constant, bit for bit. Needs track_clip or
+#   track_clips; not part of the contract.
+TRACK_WEIGHTS_RANGE = (0., 100.)
+# track_handover_starts (iteration 83, the lead's decision on getup_chain.py: the chain «1164 → PD 1 s → tracker 73»
+#   stands up from the back 10/9/10/10 of 10, but the PD lands the robot on its hands at 1-2.4 kN, and handed over
+#   directly (0 of 80) tracker 73 does not take a robot in motion, 9-14 rad/s and 0.9 rad from any frame): {share, file,
+#   md5}, a training reset starts with probability share from a random row of the hand-over bank
+#   runs/humanoid_lab/getup_bank/<file>.npz (g1_getup_handover, made by scripts/lab/getup_handover_bank.py: the states
+#   in which the getting-up policy hands over to the tracker, by getup_chain's rule on the robot's own sensors), as
+#   recorded: no tracking noise, the actions in flight under the delay the first policy's, the clip clock at the bank's
+#   frame, the reference aligned under the robot as a bank start's, the ends' rules waiting
+#   g1_tensor_math.TRACK_HANDOVER_GRACE_SECONDS; the other starts as track_starts' within the rest. The bank's clip must be
+#   track_clip's (its md5). Needs track_clip; not part of the contract. None (missing): off, bit for bit.
+TRACK_HANDOVER_NAME = r'[A-Za-z0-9_-]{1,96}'  # a file name under getup_bank, never a path
+# Its optional key grace (s, after branch 83): a hand-over start's first `grace` seconds no tracking rule ends it,
+#   the anchor's height and gravity too (missing: the ends' and reach rules wait TRACK_HANDOVER_GRACE_SECONDS, the
+#   anchor's hold from the first step, bit for bit). Why: branch 83 (exp-768453b72dd44bc5 @ 781 M) ended 80 of 80
+#   hand-over episodes by the anchor's rules, median 1.52 s, p90 1.88 s: 1164 hands over with its torso raised (R22
+#   0.62) while every frame 0-60 of A493 v3 lies flat or head down (≤ −0.03), a gravity gap of 0.71 against 0.8 from
+#   the first step, so the robot lay still until the clip left it.
+TRACK_HANDOVER_GRACE_RANGE = (0., 5.)
+TRACK_NOISE_RANGE = (0., 5.)
+GETUP_START_CLASSES = ('back', 'front', 'side', 'fall', 'sit', 'stand')
+TRACK_START_KEYS = ('first', 'rsi', 'bank')
 # settle_clip (iteration 66; the user: get up from any fall pose, as a human does): [{file, md5}, …], one to
 # SETTLE_CLIPS_MAX human clips getting up (tasks/g1_getup_track's files, as track_clip's) whose first frames are the
 # settling targets: from any bank start (g1_tensor_math.SETTLE_CLASSES) the policy rolls and lays its limbs into the
@@ -666,6 +950,23 @@ SETTLE_CLIPS_MAX = 4
 # (all joints, rad), self_contact on our scale (the share of substeps with a robot-robot contact above 10 N).
 G1_GETUP_SETTLE_WEIGHTS = dict(settle_ori=1., settle_pose=1., settle_still=1., action_rate=.01, joint_limit=1.,
                                self_contact=1.)
+# settle_success (iteration 85, the critic's lab-critic/it85): {pelvis_degrees, arm_joint, mean, still}, the settling
+#   success (and the stillness term's "near") by joints: the pelvis gravity within pelvis_degrees of the target's, every
+#   free arm joint (shoulders, elbows, wrist roll) within arm_joint rad of it, the mean |q − q0| over the 25 free joints
+#   within mean rad, every free joint slower than SETTLE_DONE_SPEED for `still` s (g1_tensor_math.settle_near). Why:
+#   the old rule (25°, mean 0.3) let a pose with one arm far off count, and the tracker's basin is a mean of ~0.2 rad.
+#   Working {"pelvis_degrees": 10, "arm_joint": 0.35, "mean": 0.15, "still": 0.3}. None (missing): the old rule (25°,
+#   mean 0.3, 0.3 s), bit for bit. Needs settle_clip; not part of the contract.
+SETTLE_SUCCESS_RANGES = dict(pelvis_degrees=(1., 90.), arm_joint=(.02, 3.), mean=(.02, 1.), still=(.02, 3.))
+# settle_starts (iteration 85, a reverse curriculum from the target): {target, noise, classes}, a share `target` of the
+#   training resets starts from a settle clip's first frame (drawn uniformly) with the tracking starts' noise
+#   (g1_tensor_math.track_start_pose / track_start_speed) times `noise` (optional, 1: TRACK_START_NOISE), raised out of
+#   the floor; the others from the bank's training rows of `classes` (optional, SETTLE_CLASSES' all). The target draws
+#   have a stream of their own, so the bank row and every other draw stay the old ones. Training resets only
+#   (evaluation, probes: a bank row, of `classes`). None (missing): the old starts, bit for bit. Needs settle_clip; not
+#   part of the contract.
+SETTLE_STARTS_KEYS = ('target', 'noise', 'classes')
+SETTLE_START_CLASSES = tuple(kind for kind in GETUP_START_CLASSES if kind != 'stand')  # g1_tensor_math.SETTLE_CLASSES
 GETUP_POSE_STD = .1
 GETUP_POSE_STD_RANGE = (.02, 2.)
 GETUP_STYLE_LIBRARY = 'lafan1'
@@ -673,7 +974,10 @@ GETUP_STYLE_NAME = r'[A-Za-z0-9_-]{1,64}'  # a file name under getup_style, neve
 G1_GETUP_DEFAULTS = dict(assist_force=200., action_delay=.02, motor_friction=1.25, body_friction=[.3, 1.],
                          pd_bound=None, stand_pose_std=GETUP_POSE_STD, action_change_unbounded=False,
                          style_library=GETUP_STYLE_LIBRARY, style_judge=False, human_starts=None,
-                         stance_pelvis=GETUP_STANCE_PELVIS, hip_roll_out=None, track_clip=None, settle_clip=None)
+                         stance_pelvis=GETUP_STANCE_PELVIS, hip_roll_out=None, track_clip=None, settle_clip=None,
+                         track_starts=None, track_noise=1., track_bank_classes=None, track_bank_nearest=False,
+                         track_sampling=None, track_clips=None, track_end_reach=None, track_weights=None,
+                         track_handover_starts=None, settle_success=None, settle_starts=None)
 GETUP_ASSIST_RANGE = (0., 500.)
 GETUP_BODY_FRICTION_RANGE = (.05, 2.)
 PD_BOUND_RANGE = (.1, 1.)
@@ -753,6 +1057,55 @@ G1_GETUP_PARAMETERS = (
     dict(group=None, key='settle_clip', default=G1_GETUP_DEFAULTS['settle_clip'], type='json',
          label=('Укладка в начальную позу клипа вставания: [{"file": имя клипа runs/humanoid_lab/getup_track/<имя>.npz, '
                 '"md5": md5 файла}, …], цель — ближайший из первых кадров (пусто — обычная задача вставания)')),
+    # The track_clip starts: missing means the original starts (0.6 / 0.3 / 0.1, mjlab's noise, the back's rows, frame 0).
+    dict(group=None, key='track_starts', default=G1_GETUP_DEFAULTS['track_starts'], type='json',
+         label=('Старты следования записи: {"first": доля с первого кадра, "rsi": доля со случайного кадра, "bank": '
+                'доля из банка поз}, в сумме 1 (пусто — 0,6 / 0,3 / 0,1)')),
+    dict(group=None, key='track_noise', default=G1_GETUP_DEFAULTS['track_noise'], min=TRACK_NOISE_RANGE[0],
+         max=TRACK_NOISE_RANGE[1],
+         label=('Шум старта с кадра записи: множитель (1 — как в mjlab: суставы ±0,1 рад, крен и тангаж ±0,1 рад, '
+                'рыскание ±0,2 рад, сдвиг ±5 см)')),
+    dict(group=None, key='track_bank_classes', default=G1_GETUP_DEFAULTS['track_bank_classes'], type='json',
+         label=('Классы поз банка для стартов следования записи: список из back, front, side, fall, sit, stand '
+                '(пусто — только на спине)')),
+    dict(group=None, key='track_bank_nearest', default=G1_GETUP_DEFAULTS['track_bank_nearest'], type='bool',
+         label=('Старт из банка — с ближайшего по позе кадра записи (наклон таза и суставы, при той же высоте '
+                'корпуса), а не с первого')),
+    # Missing or null means off (the RSI frames uniform over the clip); full GPU only, not part of the contract.
+    dict(group=None, key='track_sampling', default=G1_GETUP_DEFAULTS['track_sampling'], type='json',
+         label=('Чаще стартовать с трудных кусков записи (SuperMimic): {"bin": длина куска, с, "uniform": доля '
+                'равномерно по кускам, "hard": доля по трудности, "history": доля по прошлой трудности, '
+                '"temperature": острота выбора трудных}, доли в сумме 1 (пусто — случайный кадр равномерно; только '
+                'полный GPU)')),
+    # Missing or null means off (one clip, track_clip, or the getting-up task); a different critic contract.
+    dict(group=None, key='track_clips', default=G1_GETUP_DEFAULTS['track_clips'], type='json',
+         label=('Следование многим записям человека одной политикой: [{"file": имя клипа '
+                'runs/humanoid_lab/getup_track/<имя>.npz, "md5": md5 файла}, …], от 2 до 64 разных клипов вместо '
+                'track_clip (пусто — один клип или обычная задача вставания)')),
+    # Missing or null means off (the ends' heights alone); not part of the contract.
+    dict(group=None, key='track_end_reach', default=G1_GETUP_DEFAULTS['track_end_reach'],
+         min=TRACK_END_REACH_RANGE[0], max=TRACK_END_REACH_RANGE[1],
+         label=('Обрыв эпизода, если лодыжка дальше этого расстояния от своего места в записи, м (пусто — только '
+                'по высотам)')),
+    # Missing or null means the constant weights (G1_GETUP_TRACK_WEIGHTS); not part of the contract.
+    dict(group=None, key='track_weights', default=G1_GETUP_DEFAULTS['track_weights'], type='json',
+         label=('Веса следования записи вместо обычных: {"имя члена": вес от 0 до 100, …}, например {"self_contact": 0, '
+                '"joint_limit": 2} (пусто — обычные веса)')),
+    # Missing or null means off (the track_starts starts alone); not part of the contract.
+    dict(group=None, key='track_handover_starts', default=G1_GETUP_DEFAULTS['track_handover_starts'], type='json',
+         label=('Старты из передачи от политики вставания: {"share": доля обучающих сбросов, "file": имя банка '
+                'runs/humanoid_lab/getup_bank/<имя>.npz, "md5": md5 файла, "grace": с без обрывов, необязательно} '
+                '(пусто — без них)')),
+    # Missing or null means the old success rule (25°, mean 0.3 rad, 0.3 s); not part of the contract.
+    dict(group=None, key='settle_success', default=G1_GETUP_DEFAULTS['settle_success'], type='json',
+         label=('Успех укладки по суставам: {"pelvis_degrees": таз от цели не дальше, °, "arm_joint": каждый сустав '
+                'руки не дальше, рад, "mean": среднее по свободным суставам не дальше, рад, "still": с без движения} '
+                '(пусто — 25°, среднее 0,3 рад, 0,3 с)')),
+    # Missing or null means the old starts (the bank rows of every settling class); not part of the contract.
+    dict(group=None, key='settle_starts', default=G1_GETUP_DEFAULTS['settle_starts'], type='json',
+         label=('Старты укладки: {"target": доля обучающих сбросов из позы цели с шумом, "noise": множитель шума '
+                '(необязательно, 1), "classes": классы поз банка для остальных (необязательно, все)} (пусто — все '
+                'старты из банка)')),
     *(dict(group='reward_weights', key=key, label=G1_GETUP_LABELS[key], default=G1_GETUP_REWARD_WEIGHTS[key], min=0,
            max=100) for key in G1_GETUP_REWARD_WEIGHTS),
 )
@@ -816,6 +1169,21 @@ def g1_getup_config(values):
             raise ValueError('G1 getup track_clip does not go with pd_bound, human_starts, style_judge or the style '
                              'and amp weights')
         clip = {'file': clip['file'], 'md5': clip['md5']}
+    clips, (fewest, most) = result['track_clips'], TRACK_CLIPS_RANGE
+    if clips is not None:
+        if not isinstance(clips, (list, tuple)) or not fewest <= len(clips) <= most or any(
+                not isinstance(entry, dict) or set(entry) != {'file', 'md5'} or not isinstance(entry['file'], str)
+                or not re.fullmatch(GETUP_TRACK_NAME, entry['file']) or not isinstance(entry['md5'], str)
+                or not re.fullmatch(r'[0-9a-f]{32}', entry['md5']) for entry in clips) \
+                or len({entry['md5'] for entry in clips}) != len(clips):
+            raise ValueError(f'G1 getup track_clips must be null or a list of {fewest} to {most} different '
+                             '{"file": a clip name (letters, digits, _ and -), "md5": the file\'s md5}')
+        if clip is not None or bound is not None or human is not None or result['style_judge'] or any(
+                weights.get(key) for key in ('style', 'amp')):
+            raise ValueError('G1 getup track_clips does not go with track_clip, pd_bound, human_starts, style_judge '
+                             'or the style and amp weights')
+        clips = [{'file': entry['file'], 'md5': entry['md5']} for entry in clips]
+    tracking = clip is not None or clips is not None
     settle = result['settle_clip']
     if settle is not None:
         if not isinstance(settle, (list, tuple)) or not 1 <= len(settle) <= SETTLE_CLIPS_MAX or any(
@@ -825,11 +1193,114 @@ def g1_getup_config(values):
                 or len({entry['md5'] for entry in settle}) != len(settle):
             raise ValueError(f'G1 getup settle_clip must be null or a list of 1 to {SETTLE_CLIPS_MAX} different '
                              '{"file": a clip name (letters, digits, _ and -), "md5": the file\'s md5}')
-        if clip is not None or bound is not None or human is not None or result['style_judge'] or any(
+        if tracking or bound is not None or human is not None or result['style_judge'] or any(
                 weights.get(key) for key in ('style', 'amp')):
-            raise ValueError('G1 getup settle_clip does not go with track_clip, pd_bound, human_starts, style_judge '
-                             'or the style and amp weights')
+            raise ValueError('G1 getup settle_clip does not go with track_clip, track_clips, pd_bound, human_starts, '
+                             'style_judge or the style and amp weights')
         settle = [{'file': entry['file'], 'md5': entry['md5']} for entry in settle]
+    success = result['settle_success']
+    if success is not None:
+        if not isinstance(success, dict) or set(success) != set(SETTLE_SUCCESS_RANGES) or any(
+                type(success[key]) not in (int, float) or not math.isfinite(success[key])
+                or not low <= success[key] <= high for key, (low, high) in SETTLE_SUCCESS_RANGES.items()):
+            raise ValueError('G1 getup settle_success must be null or {' + ', '.join(
+                f'"{key}": [{low:g},{high:g}]' for key, (low, high) in SETTLE_SUCCESS_RANGES.items()) + '}')
+        if settle is None:
+            raise ValueError('G1 getup settle_success needs settle_clip')
+        success = {key: float(success[key]) for key in SETTLE_SUCCESS_RANGES}
+    settle_starts = result['settle_starts']
+    if settle_starts is not None:
+        target = settle_starts.get('target') if isinstance(settle_starts, dict) else None
+        noise = settle_starts.get('noise', 1.) if isinstance(settle_starts, dict) else None
+        kinds = settle_starts.get('classes', list(SETTLE_START_CLASSES)) if isinstance(settle_starts, dict) else None
+        low, high = TRACK_NOISE_RANGE
+        if not isinstance(settle_starts, dict) or 'target' not in settle_starts \
+                or set(settle_starts) - set(SETTLE_STARTS_KEYS) \
+                or type(target) not in (int, float) or not math.isfinite(target) or not 0 <= target <= 1 \
+                or type(noise) not in (int, float) or not math.isfinite(noise) or not low <= noise <= high \
+                or not isinstance(kinds, (list, tuple)) or not kinds \
+                or any(kind not in SETTLE_START_CLASSES for kind in kinds) or len(set(kinds)) != len(kinds):
+            raise ValueError(f'G1 getup settle_starts must be null or {{"target": a share in [0, 1], "noise": '
+                             f'[{low:g},{high:g}] (optional), "classes": different bank classes of '
+                             f'{", ".join(SETTLE_START_CLASSES)} (optional)}}')
+        if settle is None:
+            raise ValueError('G1 getup settle_starts needs settle_clip')
+        settle_starts = {'target': float(target), 'noise': float(noise), 'classes': list(kinds)}
+    starts = result['track_starts']
+    if starts is not None:
+        if not isinstance(starts, dict) or set(starts) != set(TRACK_START_KEYS) or any(
+                type(starts[key]) not in (int, float) or not math.isfinite(starts[key]) or not 0 <= starts[key] <= 1
+                for key in TRACK_START_KEYS) or abs(sum(starts.values()) - 1) > 1e-6:
+            raise ValueError('G1 getup track_starts must be null or {"first", "rsi", "bank"}: shares in [0, 1] summing '
+                             'to 1')
+        starts = {key: float(starts[key]) for key in TRACK_START_KEYS}
+    noise, (low, high) = result['track_noise'], TRACK_NOISE_RANGE
+    if type(noise) not in (int, float) or not math.isfinite(noise) or not low <= noise <= high:
+        raise ValueError(f'G1 getup track_noise must be in [{low:g},{high:g}]')
+    classes = result['track_bank_classes']
+    if classes is not None:
+        if not isinstance(classes, (list, tuple)) or not classes or any(
+                name not in GETUP_START_CLASSES for name in classes) or len(set(classes)) != len(classes):
+            raise ValueError('G1 getup track_bank_classes must be null or a list of different bank classes '
+                             f'({", ".join(GETUP_START_CLASSES)})')
+        classes = list(classes)
+    if type(result['track_bank_nearest']) is not bool:
+        raise ValueError('G1 getup track_bank_nearest must be true or false')
+    if not tracking and (starts is not None or noise != 1 or classes is not None or result['track_bank_nearest']):
+        raise ValueError('G1 getup track_starts, track_noise, track_bank_classes and track_bank_nearest need track_clip '
+                         'or track_clips')
+    sampling = result['track_sampling']
+    if sampling is not None:
+        shares = ('uniform', 'hard', 'history')
+        (low, high), (cold, hot) = TRACK_SAMPLING_BIN_RANGE, TRACK_SAMPLING_TEMPERATURE_RANGE
+        if not isinstance(sampling, dict) or set(sampling) != set(TRACK_SAMPLING_KEYS) or any(
+                type(sampling[key]) not in (int, float) or not math.isfinite(sampling[key])
+                for key in TRACK_SAMPLING_KEYS) or not low <= sampling['bin'] <= high \
+                or any(not 0 <= sampling[key] <= 1 for key in shares) \
+                or abs(sum(sampling[key] for key in shares) - 1) > 1e-6 \
+                or not cold <= sampling['temperature'] <= hot:
+            raise ValueError(f'G1 getup track_sampling must be null or {{"bin": [{low:g},{high:g}] s, "uniform", '
+                             f'"hard", "history": shares in [0, 1] summing to 1, "temperature": [{cold:g},{hot:g}]}}')
+        if not tracking:
+            raise ValueError('G1 getup track_sampling needs track_clip or track_clips')
+        if starts is not None and starts['rsi'] <= 0:  # missing: g1_tensor_math.TRACK_START_SHARES' 0.3
+            raise ValueError('G1 getup track_sampling needs RSI starts (a non-zero rsi share of track_starts)')
+        sampling = {key: float(sampling[key]) for key in TRACK_SAMPLING_KEYS}
+    reach, (low, high) = result['track_end_reach'], TRACK_END_REACH_RANGE
+    if reach is not None:
+        if type(reach) not in (int, float) or not math.isfinite(reach) or not low <= reach <= high:
+            raise ValueError(f'G1 getup track_end_reach must be null or in [{low:g},{high:g}] m')
+        if not tracking:
+            raise ValueError('G1 getup track_end_reach needs track_clip or track_clips')
+        reach = float(reach)
+    overrides, (low, high) = result['track_weights'], TRACK_WEIGHTS_RANGE
+    if overrides is not None:
+        if not isinstance(overrides, dict) or set(overrides) - set(G1_GETUP_TRACK_WEIGHTS) or any(
+                type(v) not in (int, float) or not math.isfinite(v) or not low <= v <= high
+                for v in overrides.values()):
+            raise ValueError(f'G1 getup track_weights must be null or {{tracking term: weight in [{low:g},{high:g}]}} '
+                             f'of {", ".join(G1_GETUP_TRACK_WEIGHTS)}')
+        if not tracking:
+            raise ValueError('G1 getup track_weights needs track_clip or track_clips')
+        overrides = {key: float(overrides[key]) for key in G1_GETUP_TRACK_WEIGHTS if key in overrides}
+    handover = result['track_handover_starts']
+    if handover is not None:
+        share = handover.get('share') if isinstance(handover, dict) else None
+        grace, (low, high) = handover.get('grace', 0.) if isinstance(handover, dict) else None, \
+            TRACK_HANDOVER_GRACE_RANGE
+        if not isinstance(handover, dict) or not {'share', 'file', 'md5'} <= set(handover) <= {
+                'share', 'file', 'md5', 'grace'} \
+                or type(share) not in (int, float) or not math.isfinite(share) or not 0 < share <= 1 \
+                or not isinstance(handover['file'], str) or not re.fullmatch(TRACK_HANDOVER_NAME, handover['file']) \
+                or not isinstance(handover['md5'], str) or not re.fullmatch(r'[0-9a-f]{32}', handover['md5']) \
+                or type(grace) not in (int, float) or not math.isfinite(grace) or not low <= grace <= high:
+            raise ValueError('G1 getup track_handover_starts must be null or {"share": (0, 1], "file": a hand-over '
+                             'bank name (letters, digits, _ and -), "md5": the file\'s md5[, "grace": '
+                             f'[{low:g},{high:g}] s]}}')
+        if clip is None:
+            raise ValueError('G1 getup track_handover_starts needs track_clip (one clip, the bank\'s)')
+        handover = {'share': float(share), 'file': handover['file'], 'md5': handover['md5'],
+                    **({'grace': float(handover['grace'])} if 'grace' in handover else {})}
     return {'reward_weights': {**G1_GETUP_REWARD_WEIGHTS, **{k: float(v) for k, v in weights.items()}},
             'assist_force': float(result['assist_force']), 'action_delay': float(result['action_delay']),
             'motor_friction': float(result['motor_friction']), 'body_friction': [float(v) for v in friction],
@@ -838,21 +1309,27 @@ def g1_getup_config(values):
             'action_change_unbounded': result['action_change_unbounded'], 'style_library': result['style_library'],
             'style_judge': result['style_judge'], 'human_starts': human,
             'stance_pelvis': float(result['stance_pelvis']), 'hip_roll_out': None if roll is None else float(roll),
-            'track_clip': clip, 'settle_clip': settle}
+            'track_clip': clip, 'settle_clip': settle, 'track_starts': starts, 'track_noise': float(noise),
+            'track_bank_classes': classes, 'track_bank_nearest': result['track_bank_nearest'],
+            'track_sampling': sampling, 'track_clips': clips, 'track_end_reach': reach, 'track_weights': overrides,
+            'track_handover_starts': handover, 'settle_success': success, 'settle_starts': settle_starts}
 
 
 def g1_getup_config_identity(identity, config):
     """g1_getup's contract refined by its normalized task_config (TaskSpec.config_identity): pd_bound bounds what the
     actions do, its own action contract (…-pdbound<lowest>: g1_getup:action-v2-limit10-wristlock-knee0.061-pdbound0.6
     for [1, 0.6]), and so does hip_roll_out (…-hiproll<v>, after it); track_clip adds TRACK_CRITIC_EXTRAS critic inputs,
-    its own observation contract (…-critic6-track11; the actor's inputs as before); without them the identity of
-    g1_getup_identity, bit for bit."""
+    its own observation contract (…-critic6-track11; the actor's inputs as before), track_clips
+    TRACK_CLIPS_CRITIC_EXTRAS (…-critic6-track114); without them the identity of g1_getup_identity, bit for bit."""
     if config.get('pd_bound') is not None:
         identity = {**identity, 'action_schema': f"{identity['action_schema']}-pdbound{config['pd_bound'][1]:g}"}
     if config.get('hip_roll_out') is not None:  # hip roll actions beyond the limit no longer move the target
         identity = {**identity, 'action_schema': f"{identity['action_schema']}-hiproll{config['hip_roll_out']:g}"}
     if config.get('track_clip') is not None:  # the critic's inputs grow; the actor's stay
         identity = {**identity, 'observation_schema': f"{identity['observation_schema']}-track{TRACK_CRITIC_EXTRAS}"}
+    if config.get('track_clips') is not None:  # many clips: the reference ahead too
+        identity = {**identity,
+                    'observation_schema': f"{identity['observation_schema']}-track{TRACK_CLIPS_CRITIC_EXTRAS}"}
     return identity
 
 

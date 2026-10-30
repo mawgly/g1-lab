@@ -29,6 +29,8 @@ def lab_with_journal(tmp_path):
             for lang in i18n.LANGUAGES:
                 (journal.folder(lab.root) / f'site-{lang}-{clip}.webp').write_bytes(b'clip')
                 (journal.folder(lab.root) / f'site-{lang}-{clip}-poster.jpg').write_bytes(b'poster')
+        for name in site_export.PAGE_MEDIA.findall((WEB / page).read_text(encoding='utf-8')):
+            (journal.folder(lab.root) / name).write_bytes(b'media')  # world.html's clips and posters
     return lab
 
 
@@ -84,7 +86,12 @@ def test_export_writes_the_static_site(tmp_path):
     assert {'site-ru-walk.webp', 'site-en-walk-poster.jpg', 'site-zh-story-path.webp'} <= media
     assert 'unused.png' not in media
     assert [name for name in summary['missing'] if name.startswith('media/')] == []
-    assert summary['site_media_bytes'] > 0 and summary['journal_media_bytes'] == len(b'RIFF clip' b'poster' b'png')
+    shown = {name for page in site_export.site_pages()
+             for name in site_export.PAGE_MEDIA.findall((WEB / page).read_text(encoding='utf-8'))}
+    assert shown <= media  # world.html's clips and posters (not animated here, so copied as they are)
+    assert summary['site_media_bytes'] > 0
+    assert summary['journal_media_bytes'] == len(b'RIFF clip' b'poster' b'png') + len(b'media') * len(shown)
+    assert summary['video']['mp4'] == 0 and summary['video']['failed'] == {}
 
     with zipfile.ZipFile(tmp_path / 'site.zip') as archive:
         names = set(archive.namelist())
@@ -151,3 +158,17 @@ def test_root_serves_the_home_page(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_scripts_and_styles_carry_the_build(tmp_path):
+    """The host keeps .js / .css a week in the browser: the export names them with ?v=<build> in the pages and in
+    every module's imports, one build for the whole export."""
+    from humanoid_sim import site_export
+    html = '<link href="site.css" /><script type="module" src="home.js"></script><a href="journal.html">'
+    assert site_export.versioned(html, '.html', 'abc') == (
+        '<link href="site.css?v=abc" /><script type="module" src="home.js?v=abc"></script><a href="journal.html">')
+    js = "import { t } from './i18n.js';\nconst x = import('./race.js');\nfetch('data/home.json');"
+    assert site_export.versioned(js, '.js', 'abc') == (
+        "import { t } from './i18n.js?v=abc';\nconst x = import('./race.js?v=abc');\nfetch('data/home.json');")
+    assert site_export.versioned('body { color: red }', '.css', 'abc') == 'body { color: red }'
+    assert site_export.build_id(['site.html', 'site.js']) == site_export.build_id(['site.js', 'site.html'])

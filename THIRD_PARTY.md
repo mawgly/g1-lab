@@ -40,3 +40,10 @@ and keep their own licenses, which are stored next to them.
   `runs/` (untracked). The database's terms allow its use in commercially sold products but not reselling the data,
   even in converted form, so neither the recordings nor the clip are published. The data used in this project was
   obtained from mocap.cs.cmu.edu. The database was created with funding from NSF EIA-0196217.
+- BONES-SEED ([bones.studio/datasets/seed](https://bones.studio/datasets/seed)), Bones Studio's motion capture in
+  NVIDIA's Unitree G1 retarget: getting-up takes read from `.tools/datasets/bones_seed` (untracked) by
+  `scripts/lab/getup_track_clip.py --source bones` into getting-up tracking clips under `runs/` (untracked). Its
+  license (the BONES-SEED Dataset License Agreement) lets a qualifying startup train and commercialize models on it,
+  but not redistribute or publish the data, derived clips or a competing dataset, so neither is published. Training
+  data includes Motion Data by Bones Studio (https://bones.studio/). Use of the underlying dataset is subject to the
+  BONES Motion Capture Dataset License Agreement.

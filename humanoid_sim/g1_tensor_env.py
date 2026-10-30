@@ -34,7 +34,7 @@ class TensorG1Env:
                  lock_wrists=False, knee_floor=None, force_push=0., feet_flat_stance=False, foot_collision=False,
                  side_heading_hold=True, motor_friction=0., height_command=False, upper_body_slot=False,
                  arm_perturb_radians=task.ARM_PERTURB_RADIANS, arm_perturb_contact_mask=False, arm_blind=False,
-                 hand_collision=False, arm_targets=False, load_curve=None):
+                 hand_collision=False, arm_targets=False, load_curve=None, terrain=None, height_scan=None):
         if type(n_envs) is not int or n_envs < 1 or type(max_episode_steps) is not int or max_episode_steps < 1:
             raise ValueError('n_envs and max_episode_steps must be positive integers')
         if not torch.cuda.is_available():
@@ -55,7 +55,7 @@ class TensorG1Env:
             foot_collision=foot_collision, side_heading_hold=side_heading_hold, motor_friction=motor_friction,
             height_command=height_command, upper_body_slot=upper_body_slot, arm_perturb_radians=arm_perturb_radians,
             arm_perturb_contact_mask=arm_perturb_contact_mask, arm_blind=arm_blind, hand_collision=hand_collision,
-            arm_targets=arm_targets, load_curve=load_curve)
+            arm_targets=arm_targets, load_curve=load_curve, terrain=terrain, height_scan=height_scan)
         # Warp gets the reference's model (put_model below), so foot_collision's capsules, their contact filter and
         # the sole spheres are the CPU task's; a foot-foot contact is a robot-robot one for self_contact. So are
         # hand_collision's capsules (a hand on the body is a robot-robot contact too).
@@ -97,6 +97,8 @@ class TensorG1Env:
         ref.reset(seed=seed)
         self.initial_qpos = constant(ref.data.qpos)
         self.initial_qpos[self.qadr] = self.home
+        if getattr(ref, 'terrain', None) is not None:  # ref's reset stood on its tile; a reset adds the world's own
+            self.initial_qpos[2] -= float(ref.tile_spawn[ref.tile_level, ref.terrain_type])
         self.command = torch.zeros((n_envs,3),device=self.device)
         self.observed_command = torch.zeros_like(self.command)
         # Reset pose has identity orientation, so the heading to hold is world +x for every world.
@@ -218,6 +220,31 @@ class TensorG1Env:
             self._free_steps = torch.zeros((), device=self.device)
             self._free_falls = torch.zeros((), device=self.device)
             self.load_block = None if ref.load_curve is None else task.LoadCurveBlock(**ref.load_curve)
+        # terrain: the reference's heightfield (its model goes to Warp) as heights for task.terrain_height, each tile's
+        # centre and spawn height; per world its tile type (fixed by world index, the generator's shares), its level
+        # (fresh: up to the setting's start_level; a stage's training_state; moved after every episode by
+        # task.terrain_level_update) and the path commanded and walked along the commands this episode
+        # (task.terrain_progress), drawn with a generator of its own, so self.generator's stream is the old one. Level
+        # rises and drops since the last rollout_metrics.
+        self.terrain = ref.terrain
+        if self.terrain is not None:
+            self.terrain_names = ref.terrain_names
+            self.terrain_generator = torch.Generator(device=self.device).manual_seed(seed + task.TERRAIN_STREAM)
+            self.terrain_heights = constant(ref.terrain_heights)
+            self.tile_centres, self.tile_spawn = constant(ref.tile_centres), constant(ref.tile_spawn)
+            self.terrain_type = task.terrain_types(n_envs, ref.terrain_shares).to(self.device)
+            self.terrain_level = torch.randint(0, self.terrain['start_level']+1, (n_envs,), device=self.device,
+                                               generator=self.terrain_generator)
+            self.terrain_path = torch.zeros((n_envs,2),device=self.device)
+            self._terrain_ended = torch.zeros((),device=self.device)
+            self._terrain_rises = torch.zeros((),device=self.device)
+            self._terrain_drops = torch.zeros((),device=self.device)
+        # height_scan: the reference's grids (the actor's after the history, the critic's after the critic extras) and
+        # the actor's training noise, U(±noise) per world and point from self.generator in every observation while
+        # observation_noise is on (training; tests switch it off to compare with the CPU task's command resets).
+        self.height_scan = ref.height_scan
+        if self.height_scan is not None:
+            self.scan_grid, self.critic_grid = constant(ref.scan_grid), constant(ref.critic_grid)
         self._worlds = torch.arange(n_envs,device=self.device)
         self.returns = torch.zeros(n_envs,device=self.device)
         self.last_episode_lengths, self.last_episode_returns = self.lengths.clone(), self.returns.clone()
@@ -243,6 +270,10 @@ class TensorG1Env:
                 self.body_mass = wp.to_torch(self.model.body_mass)
                 self.body_ipos = wp.to_torch(self.model.body_ipos)
                 self.body_subtreemass = wp.to_torch(self.model.body_subtreemass)
+            # task_config terrain keeps the plane's buffers: candidate 8 with action noise sigma 4 on level-9 tiles (55 k
+            # falls in 300 steps over 4096 worlds) needs at most 56 contacts / 224 rows per world. The overflows of
+            # 29.10 (141 / 592) came from terrain1's metres-deep heightfield contacts (g1_terrain), and the 256 / 1024
+            # buffers they got did not fit 4096 worlds into 16 GB.
             self.data = mjw.make_data(ref.model,nworld=n_envs,nconmax=nconmax,njmax=njmax)
             mjw.forward(self.model,self.data)
             mjw.step(self.model,self.data)
@@ -320,6 +351,50 @@ class TensorG1Env:
     def _phase(self):
         return task.gait_phase(self.lengths+self.phase_offset, self.dt, self.reference.gait['period'])
 
+    def _ground(self, xy):
+        """task_config terrain: ground height (m) under world points xy (..., 2) (task.terrain_height)."""
+        ref = self.reference
+        return task.terrain_height(xy,self.terrain_heights,ref.terrain_corner,ref.terrain_cell,ref.terrain_lift)
+
+    def pelvis_height(self):
+        """(n_envs,) the pelvis height the reward, the fall and the critic see: with task_config terrain above the
+        ground under it, or with its pelvis_support above the mean ground under the feet (task.pelvis_ground), else its
+        world height."""
+        if self.terrain is None:
+            return self.qpos[:,2]
+        ref = self.reference
+        return self.qpos[:,2]-task.pelvis_ground(self.qpos[:,:2],self.xpos[:,self.feet,:2],self.terrain_heights,
+                                                 ref.terrain_corner,ref.terrain_cell,ref.terrain_lift,
+                                                 self.terrain.get('pelvis_support',False))
+
+    def _ground_terms(self):
+        """task_config terrain: reward_components' height (n,), foot_height (n, 2), the sole spheres' heights (n, 2, k)
+        above the ground under them and floor_normal (n, 2, 3), as the CPU task's _ground_terms."""
+        ref = self.reference
+        feet, spheres = self.xpos[:,self.feet], self.geom_xpos[:,self.soles]
+        return dict(height=self.pelvis_height(), foot_height=feet[...,2]-self._ground(feet[...,:2]),
+                    spheres=spheres[...,2]-self._ground(spheres[...,:2]),
+                    floor_normal=task.terrain_normal(feet[...,:2],self.terrain_heights,ref.terrain_corner,
+                                                     ref.terrain_cell))
+
+    def _cap_commands(self, commands):
+        """terrain: commands (n_envs, 3) of worlds on slow_level's tiles and above at most slow_speed."""
+        if self.terrain is None:
+            return commands
+        return task.terrain_command_cap(commands,self.terrain_level,self.terrain['slow_level'],
+                                        self.terrain['slow_speed'])
+
+    def set_terrain_level(self, level):
+        """Every world's terrain level ((n_envs,) or one whole number in [0, TERRAIN_LEVELS)) from its next reset on
+        (tests, probes); the curriculum goes on moving it after each episode."""
+        from .tasks.config import TERRAIN_LEVELS
+        if self.terrain is None:
+            raise ValueError('a terrain level needs task_config terrain')
+        level = torch.as_tensor(level,device=self.device).expand(self.n_envs)
+        if level.dtype.is_floating_point or bool((level < 0).any()) or bool((level >= TERRAIN_LEVELS).any()):
+            raise ValueError(f'expected whole terrain levels in [0, {TERRAIN_LEVELS})')
+        self.terrain_level.copy_(level)
+
     def _largest_contacts(self, selected):
         """(n_envs,) per world the largest contact force norm (N) at the last physics step over the contact slots
         where `selected` (naconmax,) holds, 0 without one."""
@@ -388,8 +463,20 @@ class TensorG1Env:
             else:
                 self.frames[:,-1] = observed
             observed = task.history_observation(self.frames,self.previous_action.shape[1],self.reference.extra_sizes)
+        if self.height_scan is not None:  # the newest frame only, under the exact pelvis pose
+            ref = self.reference
+            pose = (self.qpos[:,:3],self.xmat[:,self.pelvis].reshape(-1,3,3))
+            ground = (self.terrain_heights,ref.terrain_corner,ref.terrain_cell,ref.terrain_lift)
+            scan = task.height_scan(*pose,self.scan_grid,*ground)
+            if self.observation_noise and self.height_scan['noise']:
+                scan = scan+task.scan_noise(lambda shape: torch.rand(shape,device=self.device,generator=self.generator),
+                                            scan.shape,self.height_scan['noise'])
+            observed = torch.cat((observed,scan),dim=1)
         if self.reference.critic_extras:  # exact, never noised: only the critic reads them
-            observed = torch.cat((observed, task.critic_extras(velocity, self.qpos[:,2])), dim=1)
+            observed = torch.cat((observed, task.critic_extras(velocity, self.pelvis_height())), dim=1)
+        if self.height_scan is not None:  # exact, around the pelvis, above the feet's ground
+            observed = torch.cat((observed,task.critic_scan(*pose,self.xpos[:,self.feet,:2],self.critic_grid,*ground)),
+                                 dim=1)
         return observed
 
     def _uniform(self, n):
@@ -401,6 +488,11 @@ class TensorG1Env:
         positions = self.initial_qpos.expand(self.n_envs,-1).clone()
         positions[:,self.qadr] += .02*torch.rand(self.previous_action.shape,device=self.device,generator=self.generator)-.01
         commands = task.sample_commands(self.n_envs, self._uniform, **self.reference.commands)
+        if self.terrain is not None:  # each world at its tile's centre, as high above the platform as above the plane
+            positions[:,:2] = self.tile_centres[self.terrain_level,self.terrain_type]
+            positions[:,2] += self.tile_spawn[self.terrain_level,self.terrain_type]
+            commands = self._cap_commands(commands)
+            self.terrain_path.masked_fill_(mask[:,None],0)
         self.qpos.copy_(torch.where(mask[:,None],positions,self.qpos))
         self.qvel.masked_fill_(mask[:,None],0)
         self.previous_action.masked_fill_(mask[:,None],0)
@@ -540,17 +632,25 @@ class TensorG1Env:
         self._set_loads(load.clone())
 
     def training_state(self):
-        """What a stage keeps of this training beyond the weights (save_stage): with arm_targets the hand load ceiling;
-        None without (nothing kept, as before)."""
-        return {'load_max': [self.load_max]} if self.arm_targets else None
+        """What a stage keeps of this training beyond the weights (save_stage): with arm_targets the hand load ceiling,
+        with terrain every world's level and tile type; None without either (nothing kept, as before)."""
+        state = {'load_max': [self.load_max]} if self.arm_targets else {}
+        if self.terrain is not None:
+            state.update(terrain_level=self.terrain_level.tolist(),terrain_type=self.terrain_type.tolist())
+        return state or None
 
     def restore_training_state(self, state):
         """The hand load ceiling from a stage's training_state (arm_targets; g1_velocity.saved_load), the worlds' loads
-        scaled to it; nothing without the setting or a saved ceiling."""
+        scaled to it; the worlds' terrain levels (terrain; g1_velocity.restored_terrain_levels, type by type); nothing
+        without the settings or saved values."""
         if self.arm_targets and 'load_max' in state:
             from .tasks.g1_velocity import saved_load
             self.load_max = saved_load(state)
             self._rescale_loads()
+        if self.terrain is not None and 'terrain_level' in state:
+            from .tasks.g1_velocity import restored_terrain_levels
+            levels = restored_terrain_levels(state,self.terrain_type.cpu().numpy())
+            self.terrain_level.copy_(torch.as_tensor(levels,device=self.device))
 
     @torch.no_grad()
     def reset(self):
@@ -622,6 +722,10 @@ class TensorG1Env:
             raise ValueError(f'expected heights in [{low:g}, {high:g}] m')
         self.height_command.copy_(height)
 
+    def _before_physics(self, pushes):
+        """A hook right before the step's physics, after its kicks and draws (world model collector, scripts/lab/wm):
+        pushes (n_envs, frame_skip, 3) the pelvis force of each substep, None without force pushes. Does nothing."""
+
     @torch.no_grad()
     def step(self, actions):
         if actions.device != self.device or actions.shape != self.previous_action.shape:
@@ -675,7 +779,9 @@ class TensorG1Env:
                     self.push_force.copy_(force)
                 pushes,left = task.force_push_substeps(self.push_force,self.push_left,self.reference.frame_skip)
                 self.push_left.copy_(left)
+            self._before_physics(pushes if self.force_pushes else None)
             feet_before = self.xpos[:,self.feet,:2].clone()
+            pelvis_before = self.qpos[:,:2].clone() if self.terrain is not None else None
             # arm_targets: home moved by each world's arm targets of this step (flag 1; 0 elsewhere), and the delay
             # queue's targets each with the offsets of its own step; without the setting home itself.
             home = self.home
@@ -764,22 +870,30 @@ class TensorG1Env:
                 arms = dict(arm_flag=flag,arm_track=tracked,arm_posture_joints=self.arm_posture_joints)
                 if self.reference.reward_weights['arm_error']:
                     arms.update(arm_error=error,arm_hold=hold)
+            # terrain: the heights above the ground under the body and the feet's ground normals (as the CPU task's).
+            ground = self._ground_terms() if self.terrain is not None else {}
             # Rewarded for the command observed when the action was chosen (set by the previous _obs()).
             components,terminated = reward_components(velocity,self.xmat[:,self.pelvis].reshape(-1,3,3),
-                self.qpos[:,2],self.observed_command.clone(),self.ctrl,action,self.previous_action,
-                self.xpos[:,self.feet,2],self._phase(),self.qpos[:,self.qadr],self.home,
+                ground['height'] if ground else self.qpos[:,2],self.observed_command.clone(),self.ctrl,action,
+                self.previous_action,ground['foot_height'] if ground else self.xpos[:,self.feet,2],self._phase(),
+                self.qpos[:,self.qadr],self.home,
                 self.xmat[:,self.torso].reshape(-1,3,3),weights=self.reference.reward_weights,
                 posture_joints=self.posture_joints,heading_target=self.heading_target,
                 stance_fraction=self.reference.gait['stance_fraction'],hip_joints=self.hip_joints,
                 foot_speed=(self.xpos[:,self.feet,:2]-feet_before).norm(dim=-1)/self.dt,
                 foot_rotation=self.xmat[:,self.feet].reshape(self.n_envs,len(self.feet),3,3),
-                sole_height=(task.sole_height(self.geom_xpos[:,self.soles,2],self.sole_radius)
+                sole_height=(task.sole_height(ground['spheres'] if ground else self.geom_xpos[:,self.soles,2],
+                                              self.sole_radius)
                              if self.reference.sole_contact or self.reference.reward_weights['clearance']
                              else None),sole_contact=self.reference.sole_contact,
                 yaw_drift_error=yaw_drift,requested_command=self.command.clone(),self_contact=self_contact,
                 arm_press=arm_press,feet_flat_stance=self.reference.feet_flat_stance,height_command=height_command,
-                stand_home=stand_home,**arms)
+                stand_home=stand_home,**arms,**({'floor_normal': ground['floor_normal']} if ground else {}))
             reward = sum(components.values())
+            if self.terrain is not None:  # the path commanded and walked along this step's requested commands
+                commanded,walked = task.terrain_progress(self.qpos[:,:2]-pelvis_before,
+                                                         self.xmat[:,self.pelvis].reshape(-1,3,3),self.command,self.dt)
+                self.terrain_path.add_(torch.stack((commanded,walked),dim=1))
             self.previous_action.copy_(action)
             if self.arm_targets:  # the offsets this step followed: the observed last action, the delay queue
                 self.previous_flag.copy_(self.arm_flag)
@@ -792,8 +906,8 @@ class TensorG1Env:
                 # Same per-step resampling probability as the CPU task; applies from the next action.
                 # side_stop reads the command each world is replacing (a reset draws without one).
                 resample = self._uniform(self.n_envs) < self.dt / task.COMMAND_RESAMPLE_SECONDS
-                fresh = task.sample_commands(self.n_envs, self._uniform, previous=self.command,
-                                             **self.reference.commands)
+                fresh = self._cap_commands(task.sample_commands(self.n_envs, self._uniform, previous=self.command,
+                                                                **self.reference.commands))
                 self.command.copy_(torch.where(resample[:,None],fresh,self.command))
                 self.yaw_drift_error.masked_fill_(resample,0)  # a new command starts a new mean
                 if self.reference.commands.get('straight_probability'):  # walk straight on from here
@@ -822,6 +936,15 @@ class TensorG1Env:
             if self.arm_targets:  # falls of flag-1 episodes, for the load curve, and of flag-0 ones, logged
                 self._arm_falls.add_((terminated & self.arm_flag).sum())
                 self._free_falls.add_((terminated & ~self.arm_flag).sum())
+            if self.terrain is not None:  # each ended episode moves its world's level, before it resets onto the tile
+                from .tasks.config import TERRAIN_LEVELS
+                top = torch.randint(0,TERRAIN_LEVELS,(self.n_envs,),device=self.device,generator=self.terrain_generator)
+                level = task.terrain_level_update(self.terrain_level,self.terrain_path[:,0],self.terrain_path[:,1],
+                                                  terminated,top,self.terrain['up'],self.terrain['down'],TERRAIN_LEVELS)
+                self._terrain_ended.add_(done.sum())
+                self._terrain_rises.add_((done & (level > self.terrain_level)).sum())
+                self._terrain_drops.add_((done & (level < self.terrain_level)).sum())
+                self.terrain_level.copy_(torch.where(done,level,self.terrain_level))
             self._masked_reset(done)
             # Worlds that reset start a fresh history filled with their first frame; the others keep theirs.
             return torch.where(done[:,None],self._obs('fill',done),terminal_obs),reward,terminated,truncated,terminal_obs
@@ -847,6 +970,19 @@ class TensorG1Env:
         once its block of windows is full (task.LoadCurveBlock), and that window logs rollout/arm_falls_block, the
         block's flag-1 falls per episode."""
         metrics = {}
+        if self.terrain is not None:  # the worlds' levels now, per tile type, and the moves of the episodes since
+            level = self.terrain_level.float()
+            metrics['rollout/terrain_level'] = level.mean().item()
+            for index,name in enumerate(self.terrain_names):
+                worlds = self.terrain_type == index
+                metrics[f'rollout/terrain_share_{name}'] = worlds.float().mean().item()
+                metrics[f'rollout/terrain_level_{name}'] = (level[worlds].mean().item() if bool(worlds.any())
+                                                            else float('nan'))
+            ended = self._terrain_ended.item()
+            metrics['rollout/terrain_rise'] = self._terrain_rises.item() / ended if ended else float('nan')
+            metrics['rollout/terrain_drop'] = self._terrain_drops.item() / ended if ended else float('nan')
+            for value in (self._terrain_ended, self._terrain_rises, self._terrain_drops):
+                value.zero_()
         if self.arm_targets:
             steps, falls, track_sum = self._arm_steps.item(), self._arm_falls.item(), self._arm_track_sum.item()
             track = track_sum / steps if steps else float('nan')
@@ -910,8 +1046,11 @@ class TensorG1Env:
     def check_health(self):
         overflow = self.mjw.OverflowType
         # Solver iteration limits and the EPA horizon (convex-mesh contact precision; first seen when G1 learned
-        # from scratch and fell a lot) do not lose state; buffer capacity overflows do.
-        capacity_mask = int(overflow.ALL) & ~int(overflow.ITERATIONS | overflow.LS_ITERATIONS | overflow.EPA_HORIZON)
+        # from scratch and fell a lot) do not lose state; buffer capacity overflows do. So does not HFIELD (task_config
+        # terrain): more than mjMAXCONPAIR heightfield prisms under one geom (a body lying on the ground), whose extra
+        # prisms are skipped, as MuJoCo's mjc_ConvexHField does.
+        capacity_mask = int(overflow.ALL) & ~int(overflow.ITERATIONS | overflow.LS_ITERATIONS | overflow.EPA_HORIZON
+                                                 | overflow.HFIELD)
         if bool((self._overflow_seen & capacity_mask).any().item()):
             raise RuntimeError('G1 Warp contact/constraint allocation overflow')
         if bool(self._bad_state_seen.item()):

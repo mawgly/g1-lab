@@ -12,11 +12,16 @@ i18n.localize_journal, as /api/lab/journal) and the branch tree (Laboratory.entr
 i18n.localize_snapshot, as /api/lab, plus `robots`: /api/lab/robots' names and race flags) without what runs the
 lab: queue, worker, jobs, hardware, process ids, the settings forms; and the home page's data (humanoid_sim.home,
 written by scripts/site/home_update.py; {"empty": true} before its first run), as /api/lab/home.
-media/ holds the journal pictures, clips and figures that data names and the home page's site-<lang>-<name> clips
-(data-clip in a page, and the clips the home data names), nothing else from the journal folder. No live race: the
-pages show pre-rendered clips.
+media/ holds the journal pictures, clips and figures that data names, those a page names (data-media, data-poster)
+and the home page's site-<lang>-<name> clips (data-clip in a page, and the clips the home data names), nothing else
+from the journal folder. No live race: the pages show pre-rendered clips.
+Every animated WebP clip goes out as an H.264 MP4 instead (humanoid_sim.site_video; iPhone Safari does not play our
+animated WebP, 29.10), and the names in data/*.json and the pages' data-media follow it; web/clip.js plays an .mp4 as
+a muted inline <video> and a .webp as before. A clip whose conversion fails goes out as its WebP and is reported.
+The live server keeps serving the WebP.
 """
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -24,13 +29,28 @@ import time
 import zipfile
 from pathlib import Path
 
-from . import home, i18n, journal
+from . import home, i18n, journal, site_video, stack
 from .core import DEFAULT_RUN, ROOT, read_json
 from .lab import Laboratory
 
 WEB = i18n.WEB
 # Source page -> exported name. A page is part of the site once it has the site-mode meta (the old lab.html has not).
-PAGES = {'site.html': 'index.html', 'journal.html': 'journal.html', 'lab.html': 'lab.html'}
+# The host (LiteSpeed at IHC) served the 1.2 MB journal data uncompressed (28.10: slow to open on a phone): text is
+# compressed, pictures and clips kept a day in the browser.
+HTACCESS = '''<IfModule mod_deflate.c>
+AddOutputFilterByType DEFLATE text/html text/css text/plain application/javascript text/javascript application/json image/svg+xml
+</IfModule>
+<IfModule mod_expires.c>
+ExpiresActive On
+ExpiresByType image/webp "access plus 1 day"
+ExpiresByType image/jpeg "access plus 1 day"
+ExpiresByType image/png "access plus 1 day"
+ExpiresByType video/mp4 "access plus 1 day"
+</IfModule>
+AddType video/mp4 .mp4
+'''
+PAGES = {'site.html': 'index.html', 'journal.html': 'journal.html', 'lab.html': 'lab.html', 'how.html': 'how.html',
+         'world.html': 'world.html'}
 SITE_MODE = re.compile(r'(<meta\s+name="site-mode"\s+content=")live(")')
 # Local files a page, script or style loads; page links (.html) are not followed, the pages are PAGES.
 REFERENCES = {
@@ -39,10 +59,33 @@ REFERENCES = {
     '.css': re.compile(r'''@import\s+['"]([^'"]+)['"]|url\(\s*['"]?([^'")#?]+)'''),
 }
 CLIP = re.compile(r'\bdata-clip="([A-Za-z0-9_-]+)"')
+# Journal media a page shows by name (world.html: the clip and its poster).
+PAGE_MEDIA = re.compile(r'\bdata-(?:media|poster)="([A-Za-z0-9_.-]+)"')
+# The host keeps styles and scripts a week in the browser (Cache-Control max-age 604800, 29.10: a phone mixed the new
+# site.js with last week's site.css), so every local .js / .css reference in the pages and in the modules' imports gets
+# ?v=<build>, one hash of all the exported code: each module keeps one URL, and a publish with other code renames all.
+VERSIONED = {
+    '.html': re.compile(r'''(\b(?:src|href)\s*=\s*["'])([^"':#?]+\.(?:js|css))(["'])'''),
+    '.js': re.compile(r'''((?:\bfrom\s*|\bimport\s*\(?\s*)['"])([^'":#?]+\.js)(['"])'''),
+}
+
+
+def build_id(sources):
+    """A short hash of the exported pages, scripts and styles (WEB-relative names)."""
+    digest = hashlib.sha256()
+    for name in sorted(sources):
+        digest.update(name.encode() + b'\0' + (WEB / name).read_bytes())
+    return digest.hexdigest()[:10]
+
+
+def versioned(text, suffix, build):
+    """text with ?v=build after every local .js / .css it loads (VERSIONED)."""
+    pattern = VERSIONED.get(suffix)
+    return text if pattern is None else pattern.sub(lambda m: f'{m[1]}{m[2]}?v={build}{m[3]}', text)
 # Parts of the /api/lab answer, and of a task in /api/lab/robots, that run the lab rather than describe it.
 CONTROL = ('queue', 'worker_active', 'active_trainers', 'job', 'hardware')
 TASK_CONTROL = ('parameters', 'jobs', 'backends', 'training_backends')
-STORED = ('.webp', '.jpg', '.png')  # already compressed: zipped as they are
+STORED = ('.webp', '.jpg', '.png', '.mp4')  # already compressed: zipped as they are
 MARKER = 'site-export.json'
 
 
@@ -127,6 +170,36 @@ def media_names(value):
     return set()
 
 
+def renamed(value, names):
+    """value with every string that is a key of `names` (a media file name) replaced by its value."""
+    if isinstance(value, dict):
+        return {key: renamed(item, names) for key, item in value.items()}
+    if isinstance(value, list):
+        return [renamed(item, names) for item in value]
+    return names.get(value, value) if isinstance(value, str) else value
+
+
+def page_media(text, names):
+    """A page with its data-media="<clip>.webp" pointing at the MP4 the export wrote instead."""
+    return re.sub(r'(\bdata-media=")([A-Za-z0-9_.-]+)(")', lambda m: m[1] + names.get(m[2], m[2]) + m[3], text)
+
+
+def videos(files, cache=None):
+    """({webp name: mp4 name} of the animated WebP clips among {name: file} that became MP4s, {name: error} of those
+    that did not, the MP4 files by name)."""
+    clips = {name: file for name, file in files.items() if name.endswith('.webp') and site_video.animated(file)}
+    results = site_video.convert_all(clips.values(), cache)
+    converted, failed, made = {}, {}, {}
+    for name, file in clips.items():
+        result = results[Path(file)]
+        if isinstance(result, Path):
+            converted[name] = name[:-len('.webp')] + '.mp4'
+            made[converted[name]] = result
+        else:
+            failed[name] = result
+    return converted, failed, made
+
+
 def _write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, allow_nan=False), encoding='utf-8')
@@ -148,53 +221,76 @@ def _prepare(out):
     return out
 
 
-def export(out, run_dir=DEFAULT_RUN, zip_file=None):
-    """Writes the static site into `out`; returns a summary (files, bytes, media bytes, what was missing)."""
+def export(out, run_dir=DEFAULT_RUN, zip_file=None, video_cache=None):
+    """Writes the static site into `out`; returns a summary (files, bytes, media bytes, what was missing, the clips
+    written as MP4). video_cache: the MP4 cache folder (default site_video.CACHE)."""
     pages = site_pages()
     out = _prepare(out)
     files, missing = dependencies(pages)
-    for source, name in pages.items():
-        (out / name).write_text(static_page((WEB / source).read_text(encoding='utf-8')), encoding='utf-8',
-                                newline='')
+    build = build_id(list(pages) + files)
     for name in files + [f'i18n/{lang}.json' for lang in i18n.LANGUAGES[1:]]:
         (out / name).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(WEB / name, out / name)
+        if Path(name).suffix == '.js':
+            (out / name).write_text(versioned((WEB / name).read_text(encoding='utf-8'), '.js', build),
+                                    encoding='utf-8', newline='')
+        else:
+            shutil.copyfile(WEB / name, out / name)
 
     from .tasks.catalog import catalog
     lab = Laboratory(run_dir)
     content = i18n.Content(lab.root)
     saved, snapshot, robots = journal.load(lab.root), lab_snapshot(lab), catalog()
     front = home.load(lab.root)
-    names = set()
+    sources = {source: (WEB / source).read_text(encoding='utf-8') for source in pages}
+    names = {name for text in sources.values() for name in PAGE_MEDIA.findall(text) if journal.IMAGE_NAME.match(name)}
+    data = {}
     for lang in i18n.LANGUAGES:
         localized = _scrub(i18n.localize_journal(saved, lang, content))
         names |= media_names(localized)
-        _write_json(out / 'data' / f'journal.{lang}.json', localized)
-        _write_json(out / 'data' / f'home.{lang}.json',
-                    {'empty': True} if front is None else _scrub(home.localize(front, lang, content)))
         tree = i18n.localize_snapshot(snapshot, lang, content)
         tree = {key: value for key, value in tree.items() if key not in CONTROL}
-        _write_json(out / 'data' / f'lab.{lang}.json',
-                    _scrub({**tree, 'robots': robot_names(robots, lang), 'exported_at': time.time()}))
+        data |= {f'journal.{lang}': localized,
+                 f'home.{lang}': {'empty': True} if front is None else _scrub(home.localize(front, lang, content)),
+                 f'stack.{lang}': {**stack.versions(), **stack.counts(lab.root)},
+                 f'lab.{lang}': _scrub({**tree, 'robots': robot_names(robots, lang), 'exported_at': time.time()})}
 
-    clips = sorted({name for source in pages for name in CLIP.findall((WEB / source).read_text(encoding='utf-8'))}
-                   | set(home.clips(front)))
+    clips = sorted({name for text in sources.values() for name in CLIP.findall(text)} | set(home.clips(front)))
     site_media = {f'site-{lang}-{clip}{suffix}' for clip in clips for lang in i18n.LANGUAGES
                   for suffix in ('.webp', '-poster.jpg')}
-    sizes = {'journal': 0, 'site': 0}
-    (out / 'media').mkdir()
+    found = {}
     for name in sorted(names | site_media):
         file = journal.image_file(lab.root, name) or journal.figure_file(lab.root, name)
         if file is None:
             missing.append(f'media/{name}')
-            continue
-        shutil.copyfile(file, out / 'media' / name)
-        sizes['site' if name in site_media else 'journal'] += file.stat().st_size
+        else:
+            found[name] = file
+    started = time.time()
+    converted, failed, made = videos(found, video_cache)
+    seconds = time.time() - started
+    missing += [f'mp4/{name}' for name in failed]
 
+    sizes = {'journal': 0, 'site': 0}
+    (out / 'media').mkdir()
+    for name, file in found.items():
+        target = converted.get(name, name)
+        file = made.get(target, file)
+        shutil.copyfile(file, out / 'media' / target)
+        sizes['site' if name in site_media else 'journal'] += file.stat().st_size
+    for name, value in data.items():
+        _write_json(out / 'data' / f'{name}.json', renamed(value, converted))
+    for source, name in pages.items():
+        page = page_media(static_page(sources[source]), converted)
+        (out / name).write_text(versioned(page, '.html', build), encoding='utf-8', newline='')
+
+    (out / '.htaccess').write_text(HTACCESS, encoding='utf-8', newline='\n')
     written = [path for path in out.rglob('*') if path.is_file() and path.name != MARKER]
-    summary = {'complete': True, 'exported_at': time.time(), 'pages': sorted(pages.values()), 'files': len(written),
+    summary = {'complete': True, 'exported_at': time.time(), 'build': build, 'pages': sorted(pages.values()),
+               'files': len(written),
                'bytes': sum(path.stat().st_size for path in written), 'journal_media_bytes': sizes['journal'],
-               'site_media_bytes': sizes['site'], 'missing': sorted(missing)}
+               'site_media_bytes': sizes['site'], 'missing': sorted(missing),
+               'video': {'mp4': len(converted), 'failed': failed, 'seconds': round(seconds, 1),
+                         'webp_bytes': sum(found[name].stat().st_size for name in converted),
+                         'mp4_bytes': sum(made[name].stat().st_size for name in converted.values())}}
     (out / MARKER).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
     if zip_file is not None:
         zip_file = Path(zip_file).resolve()
@@ -220,6 +316,11 @@ def main():
     print(f'Сайт: {Path(args.out).resolve()} — страницы {", ".join(summary["pages"])}; {summary["files"]} файлов, '
           f'{megabytes(summary["bytes"])} (медиа дневника {megabytes(summary["journal_media_bytes"])}, '
           f'ролики главной {megabytes(summary["site_media_bytes"])})')
+    video = summary['video']
+    print(f'Ролики MP4: {video["mp4"]} ({megabytes(video["webp_bytes"])} WebP → {megabytes(video["mp4_bytes"])}), '
+          f'{video["seconds"]:.0f} с')
+    for name, error in video['failed'].items():
+        print(f'Не перекодирован, выгружен как WebP: {name} — {error}')
     if 'zip_bytes' in summary:
         print(f'Архив: {Path(args.zip).resolve()} — {megabytes(summary["zip_bytes"])}')
     if summary['missing']:

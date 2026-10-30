@@ -5,6 +5,7 @@
 // Only the page's own labels go through t().
 import { STATIC, t, data, media, frame } from './site.js';
 import { tn, locale, withLang } from './i18n.js';
+import { clipMarkup as clipPlayer, wireClips, releaseClips } from './clip.js';
 
 frame('journal.html');
 const $ = (id) => document.getElementById(id);
@@ -86,14 +87,14 @@ function route() {
 const fold = (key, summary, body, open = false, cls = '') =>
   `<details class="j-fold ${cls}" data-fold="${esc(key)}"${(folds.get(key) ?? open) ? ' open' : ''}><summary>${summary}</summary><div class="j-body">${body}</div></details>`;
 
-// A pre-rendered clip (humanoid_sim.clip): its poster until pressed, then the looping animation; pressing again
-// stops on the poster. The clip file is fetched only when played. A still picture in the clip slot (.png/.jpg)
-// is shown as it is.
+// A pre-rendered clip (humanoid_sim.clip) in the shared player (clip.js): the static copy's .mp4 plays by itself
+// while on screen, the live server's .webp from its poster when pressed; the file is fetched only when played. A
+// still picture in the clip slot (.png/.jpg) is shown as it is.
 function clipMarkup(item, title) {
   if (!item.clip) return '';
   if (/\.(png|jpe?g)$/i.test(item.clip) || !item.poster)
     return `<a class="j-still" href="${media(item.clip)}" target="_blank" rel="noopener" title="${t('Открыть картинку целиком')}"><img src="${media(item.poster || item.clip)}" alt="${esc(title)}" loading="lazy" /></a>`;
-  return `<figure class="j-clip"><button type="button" class="j-play" aria-pressed="false" title="${t('Нажмите, чтобы смотреть или остановить')}" data-clip="${media(item.clip)}" data-poster="${media(item.poster)}"><img src="${media(item.poster)}" alt="${esc(title)}" loading="lazy" /><span class="j-play-label">${t('▶ Смотреть')}</span></button></figure>`;
+  return `<figure class="j-clip">${clipPlayer({ src: media(item.clip), poster: media(item.poster), alt: title, auto: false })}</figure>`;
 }
 const imageMarkup = (item) =>
   item.image
@@ -217,7 +218,7 @@ function asideMarkup() {
   return check + skills + council + plan;
 }
 const entryMarkup = (x, focus) =>
-  `<article class="card j-entry${x.id === focus ? ' j-focus' : ''}" id="entry-${esc(x.id)}"><p class="j-meta"><a href="#entries/${esc(x.id)}">${time(x.at)}</a></p><h2 class="j-title">${esc(x.title)}</h2><div class="j-text">${paragraphs(x.text)}</div>${clipMarkup(x, x.title)}${imageMarkup(x)}${figureMarkup(x, x.title)}${raceLink(x.race, t('Открыть в 3D'))}</article>`;
+  `<article class="card j-entry${x.id === focus ? ' j-focus' : ''}" id="entry-${esc(x.id)}"><p class="j-meta"><a href="#entries/${esc(x.id)}">${time(x.at)}</a></p><h2 class="j-title">${esc(x.title)}</h2><div class="j-text">${paragraphs(x.text)}</div>${clipMarkup(x, x.title)}${(x.clips || []).map((c) => `${clipMarkup(c, c.caption || x.title)}${c.caption ? `<p class="j-caption">${esc(c.caption)}</p>` : ''}`).join('')}${imageMarkup(x)}${figureMarkup(x, x.title)}${raceLink(x.race, t('Открыть в 3D'))}</article>`;
 function renderEntries([focus]) {
   const entries = [...journal.entries].sort((a, b) => b.at - a.at);
   if (focus && entries.findIndex((x) => x.id === focus) >= RECENT_ENTRIES) allEntries = true;
@@ -437,12 +438,16 @@ function show(navigated) {
   }
   for (const name of VIEWS) {
     $('view-' + name).hidden = name !== view;
-    if (name !== view) $('view-' + name).replaceChildren(); // stops its clips; drawn again when shown
+    if (name === view) continue;
+    releaseClips($('view-' + name));
+    $('view-' + name).replaceChildren(); // stops its clips; drawn again when shown
   }
   if (!journal) return;
   const panel = $('view-' + view);
   races = [];
+  releaseClips(panel);
   panel.innerHTML = RENDER[view](rest);
+  wireClips(panel);
   renderNow();
   measureFigures(panel);
   if (!navigated) return;
@@ -489,12 +494,6 @@ function openStep(number) {
 main.addEventListener('click', (event) => {
   const summary = event.target.closest('details[data-fold] > summary');
   if (summary) folds.set(summary.parentElement.dataset.fold, !summary.parentElement.open);
-  const play = event.target.closest('.j-play');
-  if (play) {
-    const playing = play.getAttribute('aria-pressed') !== 'true';
-    play.setAttribute('aria-pressed', String(playing));
-    play.querySelector('img').src = playing ? play.dataset.clip : play.dataset.poster;
-  }
   const step = event.target.closest('[data-step]');
   if (step) openStep(Number(step.dataset.step));
   const jump = event.target.closest('[data-jump]');

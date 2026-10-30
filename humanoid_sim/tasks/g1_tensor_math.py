@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from .config import (ARM_PERTURB_RADIANS, G1_COMMANDS, G1_GETUP_REWARD_WEIGHTS, G1_GETUP_SETTLE_WEIGHTS,
                      G1_GETUP_TRACK_WEIGHTS, G1_REWARD_WEIGHTS, GETUP_CRITIC_EXTRAS, GETUP_POSE_STD, GETUP_STANCE_PELVIS, TRACK_CRITIC_EXTRAS, backward_share)
+from .config import TRACK_CLIPS_CRITIC_EXTRAS, TRACK_FUTURE_JOINTS, TRACK_FUTURE_SECONDS
 
 # Gait clock: each leg is in stance for the first 55% of its 0.8 s cycle, legs half a cycle apart.
 # Defaults of the task's `gait` setting; a stance share below 0.5 adds flight phases (running).
@@ -928,6 +929,178 @@ def fall_height(height):
     return FALL_HEIGHT + (height - BASE_HEIGHT)
 
 
+# task_config terrain (stage 5; tasks/g1_terrain): the ground is a heightfield beside the plane. The reward's heights
+# (pelvis, ankle_roll origins, sole spheres), the fall height and the feet's tilt are measured from the ground under
+# the body (terrain_height, terrain_normal; the pelvis's by pelvis_ground: under it, or with pelvis_support above
+# the feet's mean ground), the same function on both backends. The full-GPU task moves each world's
+# level after an episode (terrain_level_update) by the path walked along its commands (terrain_progress) against the
+# path commanded; from the setting's slow_level on the commanded speed is capped (terrain_command_cap).
+TERRAIN_MIN_PATH = 2.  # m: an episode commanded a shorter path (standing, a short episode) keeps its level
+TERRAIN_STREAM = 50_000_000  # the terrain draws' own stream: seed + this (CUDA), (seed, this) (CPU)
+
+
+def _terrain_cell(xy, heights, corner, cell):
+    """The heightfield triangle under points xy (..., 2): (inside the grid, its corner heights h00 h01 h10 h11 (row,
+    column offsets), the fractions u along x and v along y, whether it is the upper triangle (v ≥ u))."""
+    rows, columns = heights.shape
+    u = (xy[..., 0] - corner[0]) / cell
+    v = (xy[..., 1] - corner[1]) / cell
+    inside = (u >= 0) & (u <= columns - 1) & (v >= 0) & (v <= rows - 1)
+    column = u.floor().clamp(0, columns - 2)
+    row = v.floor().clamp(0, rows - 2)
+    u, v = (u - column).clamp(0., 1.), (v - row).clamp(0., 1.)
+    c, r = column.long(), row.long()
+    return inside, heights[r, c], heights[r, c + 1], heights[r + 1, c], heights[r + 1, c + 1], u, v, v >= u
+
+
+def terrain_height(xy, heights, corner, cell, lift):
+    """Ground height (m) under points xy (..., 2), (...): inside the grid the heightfield's surface (heights (rows,
+    columns) m above its zero, corner the (x, y) of row 0, column 0, spacing cell, the zero at lift), outside the plane
+    at 0. MuJoCo's triangles: each cell is cut along the diagonal from (row, column) to (row + 1, column + 1), as
+    mjc_ConvexHField and MJWarp's prisms are."""
+    inside, h00, h01, h10, h11, u, v, upper = _terrain_cell(xy, heights, corner, cell)
+    height = torch.where(upper, h00 + v*(h10 - h00) + u*(h11 - h10), h00 + u*(h01 - h00) + v*(h11 - h01))
+    return torch.where(inside, height + lift, torch.zeros_like(height))
+
+
+def pelvis_ground(pelvis_xy, feet_xy, heights, corner, cell, lift, support=False):
+    """Ground height (m) the pelvis height (the fall, the height and height_ceiling terms, the critic) is measured from,
+    (...): terrain_height under the pelvis xy (..., 2), or with support (task_config terrain pelvis_support) the mean of
+    terrain_height under the two feet's ankle_roll origins feet_xy (..., 2, 2). Why support (critic, it94): on stairs
+    up the pelvis passes over the next step before the feet do, so above the ground under it a robot standing normally
+    reads a fall (20 cm steps: 9 of 9 runs cut with the pelvis 0.68-0.74 m above the feet; 8 cm steps leave 0.10 m)."""
+    if support:
+        return terrain_height(feet_xy, heights, corner, cell, lift).mean(dim=-1)
+    return terrain_height(pelvis_xy, heights, corner, cell, lift)
+
+
+def terrain_normal(xy, heights, corner, cell):
+    """Unit normal (..., 3) of the ground under points xy (..., 2): the heightfield triangle's, (0, 0, 1) outside."""
+    inside, h00, h01, h10, h11, u, v, upper = _terrain_cell(xy, heights, corner, cell)
+    slope_x = torch.where(upper, h11 - h10, h01 - h00) / cell
+    slope_y = torch.where(upper, h10 - h00, h11 - h01) / cell
+    slope_x, slope_y = torch.where(inside, slope_x, 0.), torch.where(inside, slope_y, 0.)
+    normal = torch.stack((-slope_x, -slope_y, torch.ones_like(slope_x)), dim=-1)
+    return normal / normal.norm(dim=-1, keepdim=True)
+
+
+def terrain_progress(displacement, rotation, command, dt):
+    """(commanded, walked) path (m) of one control step, (n,) each: ‖v_xy‖·dt of the requested commands command (n, 3)
+    (pelvis frame), and the pelvis displacement (n, 2) along the command's direction in the world (turned by the pelvis
+    heading of rotation (n, 3, 3)), 0 when it went backwards or the command is a stand."""
+    speed = command[:, :2].norm(dim=1)
+    yaw = heading(rotation).to(command.dtype)
+    cos, sin = torch.cos(yaw), torch.sin(yaw)
+    world = torch.stack((cos*command[:, 0] - sin*command[:, 1], sin*command[:, 0] + cos*command[:, 1]), dim=1)
+    along = (displacement.to(command.dtype)*world).sum(dim=1) / speed.clamp(min=1e-9)
+    return speed*dt, torch.where(speed > 0, along.clamp(min=0.), torch.zeros_like(along))
+
+
+def terrain_level_update(level, commanded, walked, fell, top_draw, up, down, levels, min_path=TERRAIN_MIN_PATH):
+    """Levels (n,) after episodes that commanded `commanded` and walked `walked` m (terrain_progress summed): down one
+    after a fall (fell (n,)) or when it walked less than `down` of a path of at least min_path, up one from `up` of it
+    without a fall, otherwise kept; past the top a world takes top_draw (n,), a random level (mjlab's rule: no world
+    stays on the hardest tiles forever), never below 0."""
+    judged = commanded >= min_path
+    ratio = walked / commanded.clamp(min=1e-9)
+    rise = ~fell & judged & (ratio >= up)
+    drop = fell | (judged & (ratio < down))
+    moved = level + rise.long() - drop.long()
+    return torch.where(moved >= levels, top_draw.to(moved.dtype), moved).clamp(min=0)
+
+
+def terrain_command_cap(command, level, slow_level, slow_speed):
+    """Commands (n, 3) with ‖v_xy‖ at most slow_speed where level (n,) ≥ slow_level (direction and turn kept)."""
+    speed = command[:, :2].norm(dim=1, keepdim=True)
+    capped = (level >= slow_level)[:, None] & (speed > slow_speed)
+    scale = torch.where(capped, slow_speed / speed.clamp(min=1e-9), torch.ones_like(speed))
+    return torch.cat((command[:, :2]*scale, command[:, 2:]), dim=1)
+
+
+def terrain_type_draw(uniform, n, shares):
+    """(n,) tile types drawn by their shares (one uniform(n) draw)."""
+    draw = uniform(n).to(torch.float64)
+    edges = torch.as_tensor(np.cumsum(shares), dtype=torch.float64, device=draw.device)
+    return torch.searchsorted(edges, draw, right=True).clamp(max=len(shares) - 1)
+
+
+def terrain_types(n, shares):
+    """(n,) tile types of n worlds by their shares, by world index (the full-GPU task's fixed assignment)."""
+    edges = torch.as_tensor(np.cumsum(shares), dtype=torch.float64)
+    return torch.searchsorted(edges, (torch.arange(n, dtype=torch.float64) + .5) / n, right=True).clamp(
+        max=len(shares) - 1)
+
+
+# task_config height_scan (30.10, stage 5's height-map teacher; config.height_scan_setting): the ground's heights under
+# grids of points fixed in the pelvis frame turned by its yaw (scan_points). The actor's (height_scan) is each point's
+# terrain_height minus the grid's mean, the critic's (critic_scan) minus the mean ground under the two feet (as
+# pelvis_ground with support), both clipped to ±HEIGHT_SCAN_CLIP; 0 on a flat floor, the plane included. Grids are laid
+# out x-major (every y of the first x, then the next x), y ascending, symmetric about y = 0, so the left-right mirror is
+# a permutation (scan_mirror). Normalization fixed at mean 0 and HEIGHT_SCAN_VARIANCE (G1VelocityEnv.
+# fixed_normalization): σ 0.1 m puts the clip at 10σ, the normalizers' own clip, so no height inside it is cut (σ 0.05
+# would cut 0.5 m, which 20 cm stairs reach within the actor's 1.4 m).
+HEIGHT_SCAN_TERM = 'height_scan'
+CRITIC_SCAN_TERM = 'critic_scan'
+HEIGHT_SCAN_CLIP = 1.  # m
+HEIGHT_SCAN_VARIANCE = .1 ** 2
+CRITIC_SCAN_VARIANCE = .1 ** 2
+
+
+def scan_grid(x, y, step):
+    """(k, 2) float64 offsets (m) of a grid in the pelvis yaw frame: x from x[0] to x[1], y from −y to y, every step,
+    x-major, y ascending."""
+    columns, rows = round((x[1] - x[0]) / step) + 1, 2 * round(y / step) + 1
+    along = x[0] + step * torch.arange(columns, dtype=torch.float64)
+    across = step * (torch.arange(rows, dtype=torch.float64) - (rows - 1) // 2)
+    return torch.stack(torch.meshgrid(along, across, indexing='ij'), dim=-1).reshape(-1, 2)
+
+
+def critic_scan_grid():
+    """The critic's grid: config.CRITIC_SCAN_POINTS² points every CRITIC_SCAN_STEP within ±CRITIC_SCAN_HALF."""
+    from .config import CRITIC_SCAN_HALF, CRITIC_SCAN_STEP
+    return scan_grid((-CRITIC_SCAN_HALF, CRITIC_SCAN_HALF), CRITIC_SCAN_HALF, CRITIC_SCAN_STEP)
+
+
+def scan_mirror(grid):
+    """(k,) the index of each grid point's mirror image (x, −y): the left-right mirror of a scan (symmetry.Mirror)."""
+    points = np.round(np.asarray(grid, dtype=np.float64) * 1e6).astype(np.int64)
+    where = {tuple(point): k for k, point in enumerate(points.tolist())}
+    index = [where.get((x, -y)) for x, y in points.tolist()]
+    if None in index:
+        raise ValueError('The height scan grid is not symmetric about y = 0')
+    return np.array(index)
+
+
+def scan_points(position, rotation, grid):
+    """World xy (n, k, 2) of grid (k, 2) offsets around pelvis positions position (n, ≥2), turned by the pelvis yaw of
+    rotation (n, 3, 3)."""
+    yaw = heading(rotation)
+    cos, sin = torch.cos(yaw)[:, None], torch.sin(yaw)[:, None]
+    grid = grid.to(position.dtype)
+    x, y = grid[:, 0][None], grid[:, 1][None]
+    return torch.stack((position[:, None, 0] + cos*x - sin*y, position[:, None, 1] + sin*x + cos*y), dim=-1)
+
+
+def height_scan(position, rotation, grid, heights, corner, cell, lift):
+    """The actor's height scan (n, k): terrain_height under scan_points minus their mean, clipped to
+    ±HEIGHT_SCAN_CLIP (without training noise, which the environments add)."""
+    ground = terrain_height(scan_points(position, rotation, grid), heights, corner, cell, lift)
+    return (ground - ground.mean(dim=1, keepdim=True)).clamp(-HEIGHT_SCAN_CLIP, HEIGHT_SCAN_CLIP)
+
+
+def critic_scan(position, rotation, feet_xy, grid, heights, corner, cell, lift):
+    """The critic's height scan (n, k): terrain_height under scan_points minus the mean ground under the two feet's
+    ankle_roll origins feet_xy (n, 2, 2) (pelvis_ground's support), clipped to ±HEIGHT_SCAN_CLIP."""
+    ground = terrain_height(scan_points(position, rotation, grid), heights, corner, cell, lift)
+    support = terrain_height(feet_xy.to(ground.dtype), heights, corner, cell, lift).mean(dim=-1)
+    return (ground - support[:, None]).clamp(-HEIGHT_SCAN_CLIP, HEIGHT_SCAN_CLIP)
+
+
+def scan_noise(uniform, shape, noise):
+    """Training noise of the actor's scan, U(±noise) per point: uniform(shape) draws in [0, 1)."""
+    return (2*uniform(shape) - 1) * noise
+
+
 def height_ceiling(height, command):
     """(n,) the height_ceiling term before its weight, in [0, 1): g(c)·(1 − exp(−CEILING_SHARPNESS·max(0, h − c))),
     g(c) = clamp((BASE_HEIGHT − c)/CEILING_RAMP, 0, 1); pelvis heights height, commands command (n,). 0 at c = 0.78."""
@@ -962,7 +1135,7 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
                       foot_rotation=None, sole_height=None, sole_contact=None, yaw_drift_error=None,
                       requested_command=None, self_contact=None, arm_press=None, feet_flat_stance=False,
                       height_command=None, stand_home=None, arm_flag=None, arm_track=None, arm_posture_joints=None,
-                      arm_error=None, arm_hold=None):
+                      arm_error=None, arm_hold=None, floor_normal=None):
     """foot_speed: (n, 2) horizontal speed of each foot over the control step (m/s), for the slip and clearance
     terms. foot_rotation: (n, 2, 3, 3) world <- body rotations of the FEET bodies, for the feet_flat term.
     sole_height: (n, 2) lowest sole point of each foot (m, see sole_height()), for the clearance term and for
@@ -987,7 +1160,10 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
     posture sums over arm_posture_joints (the posture joints without the arms). Flag 0 and None: those terms as before,
     arm_track 0.
     arm_error: (n,) the arms' mean |q − target| (arm_error()) and arm_hold (n,) bool, the worlds whose targets hold
-    (arm_holding), both with arm_flag, for the arm_error term, charged with flag 1 on a hold; None: the term is zero."""
+    (arm_holding), both with arm_flag, for the arm_error term, charged with flag 1 on a hold; None: the term is zero.
+    floor_normal (task_config terrain): (n, 2, 3) unit normal of the ground under each foot (terrain_normal), the
+    feet_flat tilt then measured against it, not the vertical; height, foot_height and sole_height are then given above
+    the ground under the body (terrain_height). None: the vertical, the old expression."""
     weights = G1_REWARD_WEIGHTS if weights is None else weights
     if arm_flag is not None and (arm_track is None or arm_posture_joints is None):
         raise ValueError('arm targets need the tracking term and the posture joints without the arms')
@@ -1017,7 +1193,12 @@ def reward_components(velocity, rotation, height, command, torque, action, previ
     # sin^2 of each sole's tilt, (n, 2, 2), for feet_flat. feet_flat_stance keeps the feet in contact: Unitree v0 at a
     # command of 2 m/s rolls its swing foot heel to toe (34° on average), feet_flat cost it 0.79 per step, 0.23 of it
     # on the stance foot (by the sole).
-    tilt = None if foot_rotation is None else foot_rotation[..., 2, :2].to(dtype).square()
+    if foot_rotation is None:
+        tilt = None
+    elif floor_normal is None:
+        tilt = foot_rotation[..., 2, :2].to(dtype).square()
+    else:  # the ground's normal in each foot's frame: its x and y components (0 on a flat sole)
+        tilt = (foot_rotation[..., :2].to(dtype)*floor_normal.to(dtype)[..., None]).sum(dim=-2).square()
     if tilt is not None and feet_flat_stance:
         tilt = tilt*contact[..., None].to(dtype)
     components = {
@@ -1578,20 +1759,41 @@ TRACK_END_BODIES = ('left_ankle_roll_link', 'right_ankle_roll_link', 'left_wrist
 TRACK_HOLD_SECONDS = 3.
 TRACK_SIGMA = dict(anchor_pos=.3, anchor_ori=.4, body_pos=.3, body_ori=.4, body_lin_vel=1., body_ang_vel=3.14)
 TRACK_ANCHOR_Z, TRACK_GRAVITY_Z, TRACK_END_Z = .25, .8, .25
+# task_config track_end_reach (iteration 78, the critic's it78): one more end, an ankle (TRACK_REACH_BODIES, the
+# ankle_roll links of TRACK_END_BODIES; not the hands, which the clips lift off on their own) farther than the setting
+# from its place in the clip re-anchored under the robot (track_relative, body_pos' frame), a 3D distance; a bank
+# start's first TRACK_GRACE_SECONDS do not count it, as the ends' heights. The heights alone missed a robot sitting on
+# straight legs while the clip tucked a foot under the pelvis (branch 76: the foot 0.55-0.63 m from its place, the
+# episode ended 1.6-2.3 s later by the anchor).
+TRACK_REACH_BODIES = ('left_ankle_roll_link', 'right_ankle_roll_link')
 # Training starts: the clip's first frame with mjlab's pose noise, a uniformly drawn frame of the clip with the same
 # noise and the clip's velocities (reference state init), a training row of the start bank lying on the back (the
-# junction with the getting-up task's starts).
+# junction with the getting-up task's starts). task_config track_starts, track_noise, track_bank_classes and
+# track_bank_nearest change the shares, scale the noise, widen the bank's classes and start a bank row at its nearest
+# frame (config.py); missing, these constants, bit for bit.
 TRACK_START_SHARES = (.6, .3, .1)
-TRACK_START_KINDS = ('clip', 'frame', 'bank')
+# The fourth kind, 'handover' (task_config track_handover_starts, iteration 83), is never one of TRACK_START_SHARES'
+# draws: a share of the training resets starts from a state another policy handed over (g1_getup_handover).
+TRACK_START_KINDS = ('clip', 'frame', 'bank', 'handover')
 TRACK_BANK_CLASS = 'back'
 # A bank start's limbs lie where the bank put them, not where the clip's first frame has them (the clip's right hand
 # 0.24-0.27 m above the held-out back rows'): its first TRACK_GRACE_SECONDS the ankles' and hands' heights end nothing,
 # the anchor's rules hold from the first step.
 TRACK_GRACE_SECONDS = .5
+# A hand-over start is a robot in motion (the getting-up policy 1164 rolling face down: joints at 9-14 rad/s, 0.9 rad
+# from any clip frame, getup_chain.py), farther from its reference than a bank row lying still: its ankles', hands'
+# (and track_end_reach's) rules wait twice as long, the anchor's hold from the first step as a bank start's.
+TRACK_HANDOVER_GRACE_SECONDS = 1.
 # Uniform noise half-widths of a clip start: root xy, z (m), roll and pitch, yaw (rad, a world rotation before the
 # pose, Isaac's quat_from_euler_xyz), joints (rad, then the joint ranges); small root velocities (m/s, rad/s).
 TRACK_START_NOISE = dict(xy=.05, z=.01, tilt=.1, yaw=.2, joints=.1, linear=.1, angular=.1)
 TRACK_POSE_NOISE, TRACK_SPEED_NOISE = 35, 6  # uniform numbers a noisy start draws: pose (xyz, rpy, joints), speeds
+# task_config track_bank_nearest: a bank start's clip frame is the nearest one by the pelvis gravity and the free joints
+# (settle_errors' angle and pose, settle_nearest's unweighted kernels) among the frames whose anchor height lies within
+# TRACK_NEAREST_ANCHOR of the start's, half the anchor's termination gap, so the start is not one wobble from ending; no
+# such frame: frame 0. (Without the height rule a row on the front picks a frame standing up: the LAFAN clip never lies
+# on its front, so its nearest frame by orientation is the end, its anchor 0.75 m above the row's.)
+TRACK_NEAREST_ANCHOR = TRACK_ANCHOR_Z / 2
 TRACK_HAND_PART = 'wrist'  # rollout/hand_force: the floor's force on the bodies named so (wrist roll, pitch, yaw links)
 
 
@@ -1635,12 +1837,31 @@ def track_heading(rotation):
 
 
 def track_align(position, rotation, clip_position, clip_rotation):
-    """(yaw (n,), offset (n, 2)) that put the clip's first pelvis pose (clip_position (3,), clip_rotation (3, 3)) on a
-    start's pelvis (position (n, 3), rotation (n, 3, 3)): the heading between them (track_heading) and the xy offset of
-    the turned clip pelvis to the start's."""
+    """(yaw (n,), offset (n, 2)) that put the clip's first pelvis pose (clip_position (3,), clip_rotation (3, 3)), or
+    each world's own clip pelvis pose ((n, 3), (n, 3, 3): track_bank_nearest's frames), on a start's pelvis (position
+    (n, 3), rotation (n, 3, 3)): the heading between them (track_heading) and the xy offset of the turned clip pelvis to
+    the start's."""
+    if clip_rotation.ndim == 3:
+        yaw = track_heading(rotation) - track_heading(clip_rotation)
+        turned = (yaw_rotation(yaw) @ clip_position[:, :, None])[:, :, 0]
+        return yaw, position[:, :2] - turned[:, :2]
     yaw = track_heading(rotation) - track_heading(clip_rotation[None])
     turned = (yaw_rotation(yaw) @ clip_position[:, None])[:, :, 0]
     return yaw, position[:, :2] - turned[:, :2]
+
+
+def track_nearest_frame(gravity, position, anchor_height, frame_gravity, frame_position, frame_anchor_height, joints):
+    """(n,) track_bank_nearest's clip frame of each start: gravity (n, 3) its pelvis projected gravity, position (n, 29)
+    its joints, anchor_height (n,) its anchor's height; frame_gravity (K, 3), frame_position (K, 29),
+    frame_anchor_height (K,) the clip frames'; joints the free ones. The largest exp(−angle²/SETTLE_ORI_STD²) +
+    exp(−mean((q − q_f)²)/SETTLE_POSE_STD²) (settle_nearest's score) among the frames whose anchor height is within
+    TRACK_NEAREST_ANCHOR of the start's; frame 0 when there is none."""
+    xp = _module(position)
+    angle, pose, _ = settle_errors(gravity, position, frame_gravity, frame_position, joints)
+    score = xp.exp(-angle ** 2 / SETTLE_ORI_STD ** 2) + xp.exp(-pose / SETTLE_POSE_STD ** 2)
+    near = xp.abs(frame_anchor_height[None] - anchor_height[:, None]) <= TRACK_NEAREST_ANCHOR
+    best = xp.where(near, score, -1.).argmax(-1)  # scores are positive: -1 never wins over a near frame
+    return xp.where(near.any(-1), best, 0 * best)
 
 
 def clip_reference(frames, clock, yaw, offset):
@@ -1664,18 +1885,41 @@ def body_point_velocity(cvel, point, com):
     return cvel[..., 3:6] + _cross(angular, point - com), angular
 
 
+def track_relative(position, rotation, ref_position, ref_rotation, anchor):
+    """(positions (n, B, 3), rotations (n, B, 3, 3)) of the reference re-anchored under the robot: its bodies about
+    the robot anchor's xy at the clip anchor's height, turned by the yaw of R_robot·R_clipᵀ of the anchors
+    (BeyondMimic's body_pos_relative_w; track_errors' body terms, track_reach_distance)."""
+    xp = _module(position)
+    between = rotation[:, anchor] @ _transpose(ref_rotation[:, anchor])
+    turn = yaw_rotation(xp.arctan2(between[:, 1, 0], between[:, 0, 0]))
+    base = _cat([position[:, anchor, :2], ref_position[:, anchor, 2:3]], -1)
+    relative = base[:, None] + xp.einsum('nij,nbj->nbi', turn, ref_position - ref_position[:, anchor:anchor + 1])
+    return relative, xp.einsum('nij,nbjk->nbik', turn, ref_rotation)
+
+
+def track_reach_distance(position, rotation, ref_position, ref_rotation, anchor, bodies):
+    """(n, len(bodies)) the 3D distances (m) of the robot's bodies (indices among TRACK_BODIES) from their places in
+    the re-anchored reference (track_relative): track_end_reach's measure."""
+    xp = _module(position)
+    relative, _ = track_relative(position, rotation, ref_position, ref_rotation, anchor)
+    bodies = list(bodies)
+    return xp.sqrt(((relative[:, bodies] - position[:, bodies]) ** 2).sum(-1))
+
+
+def track_reach_terminated(distance, reach, active=None):
+    """(n,) bool, track_end_reach's end: any of distance (n, k) (track_reach_distance) beyond reach (m), where active
+    (n,) bool holds (None: everywhere; a bank start's first TRACK_GRACE_SECONDS do not count it)."""
+    off = (distance > reach).any(-1)
+    return off if active is None else off & active
+
+
 def track_errors(position, rotation, linear, angular, ref_position, ref_rotation, ref_linear, ref_angular, anchor):
     """(n,) squared errors of the tracking terms, a dict: the robot's TRACK_BODIES (position (n, B, 3), rotation (n, B,
     3, 3), linear, angular (n, B, 3) world) against clip_reference's; anchor: the anchor's index among them.
     anchor_pos ‖Δp‖² and anchor_ori θ² of the anchor in the world; body_pos and body_ori the mean over the bodies of
     ‖Δp‖² and θ² against the clip re-anchored under the robot (its anchor's xy, the clip anchor's height, turned by the
     yaw of R_robot·R_clipᵀ of the anchors); body_lin_vel and body_ang_vel the mean of ‖Δv‖², ‖Δω‖² in the world."""
-    xp = _module(position)
-    between = rotation[:, anchor] @ _transpose(ref_rotation[:, anchor])
-    turn = yaw_rotation(xp.arctan2(between[:, 1, 0], between[:, 0, 0]))
-    base = _cat([position[:, anchor, :2], ref_position[:, anchor, 2:3]], -1)
-    relative = base[:, None] + xp.einsum('nij,nbj->nbi', turn, ref_position - ref_position[:, anchor:anchor + 1])
-    relative_rotation = xp.einsum('nij,nbjk->nbik', turn, ref_rotation)
+    relative, relative_rotation = track_relative(position, rotation, ref_position, ref_rotation, anchor)
     return dict(anchor_pos=((ref_position[:, anchor] - position[:, anchor]) ** 2).sum(-1),
                 anchor_ori=rotation_angle(ref_rotation[:, anchor], rotation[:, anchor]) ** 2,
                 body_pos=((relative - position) ** 2).sum(-1).mean(-1),
@@ -1713,16 +1957,19 @@ def track_reward_components(errors, action, previous_action, position, soft_low,
     return components
 
 
-def track_terminated(position, rotation, ref_position, ref_rotation, anchor, ends, ends_active=None):
+def track_terminated(position, rotation, ref_position, ref_rotation, anchor, ends, ends_active=None,
+                     anchor_active=None):
     """(n,) bool, mjlab's tracking terminations: the anchor's height (position (n, B, 3) of TRACK_BODIES; anchor its
     index) off the reference's by more than TRACK_ANCHOR_Z, its projected gravity's z (−R[2, 2]) by more than
     TRACK_GRAVITY_Z, or any of the bodies `ends` (indices: ankles and hands) by more than TRACK_END_Z in height, where
-    ends_active (n,) bool holds (None: everywhere; a bank start's first TRACK_GRACE_SECONDS do not count it)."""
+    ends_active (n,) bool holds (None: everywhere; a bank start's first TRACK_GRACE_SECONDS do not count it); the
+    anchor's two rules where anchor_active (n,) bool holds (None: everywhere; track_handover_starts' grace)."""
     xp = _module(position)
     ends = list(ends)
     off = (xp.abs(ref_position[:, ends, 2] - position[:, ends, 2]) > TRACK_END_Z).any(-1)
-    return ((xp.abs(ref_position[:, anchor, 2] - position[:, anchor, 2]) > TRACK_ANCHOR_Z)
-            | (xp.abs(ref_rotation[:, anchor, 2, 2] - rotation[:, anchor, 2, 2]) > TRACK_GRAVITY_Z)
+    body = ((xp.abs(ref_position[:, anchor, 2] - position[:, anchor, 2]) > TRACK_ANCHOR_Z)
+            | (xp.abs(ref_rotation[:, anchor, 2, 2] - rotation[:, anchor, 2, 2]) > TRACK_GRAVITY_Z))
+    return ((body if anchor_active is None else body & anchor_active)
             | (off if ends_active is None else off & ends_active))
 
 
@@ -1767,12 +2014,18 @@ def quat_from_euler(roll, pitch, yaw):
                      cr * cp * sy - sr * sp * cy], -1)
 
 
-def track_start_pose(qpos, noise, joint_low, joint_high):
+def _noise_widths(scale):
+    """TRACK_START_NOISE's half-widths times scale (task_config track_noise; at 1 the very numbers)."""
+    return {key: value * scale for key, value in TRACK_START_NOISE.items()}
+
+
+def track_start_pose(qpos, noise, joint_low, joint_high, scale=1.):
     """(n, 36) a noisy clip start: qpos (n, 36) of the clip frame, noise (n, TRACK_POSE_NOISE) uniform in [−1, 1] times
-    TRACK_START_NOISE's half-widths: root xy and z added, roll / pitch / yaw a world rotation before the root's
-    (quat_from_euler·q, renormalized), joints added and kept within joint_low, joint_high (29,)."""
+    TRACK_START_NOISE's half-widths times scale (task_config track_noise): root xy and z added, roll / pitch / yaw a
+    world rotation before the root's (quat_from_euler·q, renormalized), joints added and kept within joint_low,
+    joint_high (29,)."""
     xp = _module(qpos)
-    width = TRACK_START_NOISE
+    width = _noise_widths(scale)
     delta = quat_from_euler(noise[:, 3] * width['tilt'], noise[:, 4] * width['tilt'], noise[:, 5] * width['yaw'])
     quat = quat_multiply(delta, qpos[:, 3:7])
     quat = quat / xp.sqrt((quat ** 2).sum(-1))[:, None]
@@ -1780,12 +2033,322 @@ def track_start_pose(qpos, noise, joint_low, joint_high):
     return _cat([qpos[:, 0:2] + noise[:, 0:2] * width['xy'], qpos[:, 2:3] + noise[:, 2:3] * width['z'], quat, joints])
 
 
-def track_start_speed(qvel, noise):
+def track_start_speed(qvel, noise, scale=1.):
     """(n, 35) qvel with the root's linear (world) and angular (body) velocity plus noise (n, TRACK_SPEED_NOISE)
-    uniform in [−1, 1] times TRACK_START_NOISE's linear and angular half-widths."""
-    width = TRACK_START_NOISE
+    uniform in [−1, 1] times TRACK_START_NOISE's linear and angular half-widths times scale."""
+    width = _noise_widths(scale)
     return _cat([qvel[:, 0:3] + noise[:, 0:3] * width['linear'], qvel[:, 3:6] + noise[:, 3:6] * width['angular'],
                  qvel[:, 6:]])
+
+
+# task_config track_sampling (iteration 77; SuperMimic, arXiv 2610.28480, appendix D.1): the RSI starts (TRACK_START_KINDS'
+# 'frame') favour the hard parts of the clip. Why (critic, it76): with RSI uniform over the clip the window 1.0-1.5 s of
+# the side clip, where the trackers fail, got ~4 % of the episodes. The clip's frames 0 … last (RSI's, not the hold) are
+# cut into bins of `bin` seconds (the last one shorter); each bin b keeps G_b, a running estimate of the normalized
+# discounted return of the episodes the policy started there from an RSI start: Σ γ^t r_t over the episode (cut short by
+# a termination, γ TRACK_SAMPLING_GAMMA, PPO's), over G_max of that episode, the most it could earn, every kernel term at
+# its weight on every step up to its limit (track_bin_return_max), so G_b/G_max lies in (−∞, 1] whatever the bin's
+# horizon. A bin's G is the plain mean of its first 1/TRACK_SAMPLING_RATE episodes, then an EMA of that rate per
+# episode; a bin never visited keeps 0, so it looks hard. An RSI start draws its part (uniform, hard, history: the
+# setting's shares) and its bin from that part's weights (track_bin_weights): uniform over the bins,
+# softmax(−temperature·G_b/G_max), or the running mean of the past softmax weights (an EMA of TRACK_SAMPLING_HISTORY_RATE
+# per control step, from uniform), then its frame uniform within the bin; noise and the floor lift as any RSI start.
+# Episodes from other starts, the first ones after a full reset (cut at a random step) and those ended by a non-finite
+# state do not count. Torch only (the full-GPU task); the draws come from a generator of their own
+# (TRACK_SAMPLING_STREAM), so the task's own stream stays the old one.
+TRACK_SAMPLING_GAMMA = .99  # every getting-up recipe's PPO γ (scripts/lab/getup_root.RECIPE)
+TRACK_SAMPLING_RATE = .01  # per episode of a bin: the plain mean of its first 100 episodes, then this EMA
+TRACK_SAMPLING_HISTORY_RATE = 2e-4  # per control step: ~5000 steps, ~20 M env steps at 4096 worlds
+TRACK_SAMPLING_STREAM = 77  # the sampler's generator seed: the task's seed + this
+TRACK_SAMPLING_PARTS = ('uniform', 'hard', 'history')
+
+
+def track_bins(frames, frame_steps):
+    """(starts, lengths) (B,) of the bins over a clip's `frames` frames (0 … frames − 1), frame_steps frames each, the
+    last one what is left; numpy int64."""
+    frame_steps = max(1, int(frame_steps))
+    starts = np.arange(0, int(frames), frame_steps, dtype=np.int64)
+    return starts, np.minimum(starts + frame_steps, int(frames)) - starts
+
+
+def track_bin_weights(g, history, temperature):
+    """(3, B) the mixture's rows (TRACK_SAMPLING_PARTS), each summing to 1: uniform over the bins, softmax(−temperature·g)
+    (g (B,) the bins' G_b/G_max) and history (B,) normalized; numpy or torch alike."""
+    xp = _module(g)
+    logits = -temperature * g
+    soft = xp.exp(logits - logits.max())
+    return xp.stack([xp.ones_like(g) / len(g), soft / soft.sum(), history / history.sum()])
+
+
+def track_bin_draw(rows, shares, part_draw, bin_draw, frame_draw, starts, lengths):
+    """(part, bin, frame) (n,) of n starts: part by part_draw (n,) uniform in [0, 1) against the cumulative shares
+    (uniform, hard, history), the bin by bin_draw against that part's row's cumulative weights (rows (3, B),
+    track_bin_weights), the frame starts[bin] + ⌊frame_draw·lengths[bin]⌋ (starts, lengths (B,) long, track_bins);
+    numpy or torch alike."""
+    xp = _module(rows)
+    first, second = shares[0], shares[0] + shares[1]
+    part = (part_draw >= first) * 1 + (part_draw >= second) * 1
+    cumulative = rows.cumsum(-1)[part]  # (n, B)
+    # The first bin whose cumulative weight exceeds the draw (≤: a bin of weight 0 is never drawn).
+    bin_ = (cumulative <= bin_draw[:, None] * cumulative[:, -1:]).sum(-1).clip(max=len(starts) - 1)
+    offset = xp.floor(frame_draw * lengths[bin_])
+    offset = offset.astype(np.int64) if xp is np else offset.long()
+    return part, bin_, starts[bin_] + xp.minimum(offset, lengths[bin_] - 1)
+
+
+def track_bin_return_max(weight, steps, gamma=TRACK_SAMPLING_GAMMA):
+    """The most discounted return an episode of `steps` control steps could earn: every kernel term at its weight
+    (weight, their sum) on every step, weight·(1 − γ^steps)/(1 − γ); numpy or torch alike."""
+    return weight * (1 - gamma ** steps) / (1 - gamma)
+
+
+def track_bin_update(g, count, sums, counts, rate=TRACK_SAMPLING_RATE):
+    """(g, count) of the bins after `counts` (B,) new episodes with these summed normalized returns `sums` (B,): each bin
+    moves toward their mean by counts / min(count + counts, 1/rate) (a plain mean of its first 1/rate episodes, then an
+    EMA of `rate` per episode); a bin without new episodes stays. numpy or torch alike."""
+    xp = _module(g)
+    total = count + counts
+    step = xp.where(counts > 0, counts / total.clip(min=1, max=1 / rate), 0 * g).clip(max=1)
+    return g + step * (sums / counts.clip(min=1) - g), total
+
+
+class TrackBinSampler:
+    """track_sampling's state on a device (torch): per bin G_b/G_max (g), its episodes so far (count) and the history
+    weights; per world the bin of its RSI start (−1: not counted), the discounted return so far, the discount of the
+    next reward and the episode's G_max; the RSI starts and those of the hard part since the last metrics. The CUDA task
+    calls draw at each training reset, start for the reset worlds, add after each step's reward, finish for the ended
+    worlds before they reset; state / restore go into a stage's training_state."""
+
+    def __init__(self, setting, frames, dt, weight, n, device, seed):
+        """setting: task_config track_sampling; frames: the clip's frames an RSI start draws from (last + 1), or with
+        track_clips each clip's, a sequence (track_clip_bins: every clip's bins in one table over all their RSI frames
+        laid one after another); dt: the control step (s); weight: the summed weights of the kernel terms; n worlds."""
+        self.shares = tuple(float(setting[key]) for key in TRACK_SAMPLING_PARTS)
+        self.temperature = float(setting['temperature'])
+        frame_steps = round(setting['bin'] / dt)
+        starts, lengths = (track_bins(frames, frame_steps) if np.ndim(frames) == 0
+                           else track_clip_bins(frames, frame_steps))
+        self.starts = torch.as_tensor(starts, device=device)
+        self.lengths = torch.as_tensor(lengths, device=device)
+        self.bins = len(starts)
+        self.weight = float(weight)
+        self.device = device
+        self.generator = torch.Generator(device=device).manual_seed(int(seed) + TRACK_SAMPLING_STREAM)
+        self.g = torch.zeros(self.bins, dtype=torch.float64, device=device)
+        self.count = torch.zeros(self.bins, dtype=torch.float64, device=device)
+        self.history = torch.full((self.bins,), 1 / self.bins, dtype=torch.float64, device=device)
+        self.world_bin = torch.full((n,), -1, dtype=torch.long, device=device)
+        self.returns = torch.zeros(n, dtype=torch.float64, device=device)
+        self.discount = torch.ones(n, dtype=torch.float64, device=device)
+        self.best = torch.ones(n, dtype=torch.float64, device=device)
+        self._rsi = torch.zeros((), device=device)
+        self._hard = torch.zeros((), device=device)
+
+    def weights(self):
+        """(3, B) float64 the mixture's rows now (track_bin_weights)."""
+        return track_bin_weights(self.g, self.history, self.temperature)
+
+    def draw(self, n):
+        """(part, bin, frame) (n,) long of n RSI draws (track_bin_draw, the sampler's own generator); the history weights
+        take one EMA step toward this softmax row (a call per control step: the training reset's)."""
+        rows = self.weights()
+        draws = [torch.rand(n, dtype=torch.float64, device=self.device, generator=self.generator) for _ in range(3)]
+        part, bin_, frame = track_bin_draw(rows, self.shares, *draws, self.starts, self.lengths)
+        self.history.add_(TRACK_SAMPLING_HISTORY_RATE * (rows[1] - self.history))
+        return part, bin_, frame
+
+    def start(self, mask, bins, part, limits):
+        """The masked worlds start their episode: bins (n,) long the bin of an RSI start, −1 for another start (not
+        counted); part (n,) its draw's part (counted for the hard share where bins ≥ 0); limits (n,) the episode's control
+        steps (G_max, track_bin_return_max)."""
+        counted = mask & (bins >= 0)
+        self._rsi.add_(counted.sum())
+        self._hard.add_((counted & (part == 1)).sum())
+        self.world_bin.copy_(torch.where(mask, bins, self.world_bin))
+        self.returns.masked_fill_(mask, 0)
+        self.discount.masked_fill_(mask, 1)
+        best = track_bin_return_max(self.weight, limits.double())
+        self.best.copy_(torch.where(mask, best, self.best))
+
+    def discard(self, mask):
+        """The masked worlds' current episodes do not count (a cut first episode, a probe's start)."""
+        self.world_bin.masked_fill_(mask, -1)
+
+    def add(self, reward):
+        """Each world's reward of this step (n,), discounted from its episode's start."""
+        self.returns.add_(self.discount * reward.double())
+        self.discount.mul_(TRACK_SAMPLING_GAMMA)
+
+    def finish(self, done):
+        """The ended worlds (done (n,) bool; non-finite ones left out by the caller) give their bins their normalized
+        returns (track_bin_update); their bins are cleared."""
+        counted = done & (self.world_bin >= 0)
+        index = self.world_bin.clamp(min=0)
+        sums = torch.zeros(self.bins, dtype=torch.float64, device=self.device).scatter_add_(
+            0, index, torch.where(counted, self.returns / self.best, 0.))
+        counts = torch.zeros(self.bins, dtype=torch.float64, device=self.device).scatter_add_(
+            0, index, counted.double())
+        g, count = track_bin_update(self.g, self.count, sums, counts)
+        self.g.copy_(g)
+        self.count.copy_(count)
+        self.world_bin.masked_fill_(done, -1)
+
+    def metrics(self):
+        """rollout/track_bin_hard_share (the share of the RSI starts since the last call drawn by the hard part; NaN
+        without one), rollout/track_bin_g_min and rollout/track_bin_g_mean (G_b/G_max over the bins with an episode;
+        NaN before any), rollout/track_bin_hardest (the bin of the smallest G among them, −1 before any); the counts
+        zeroed."""
+        rsi = self._rsi.item()
+        visited = self.count > 0
+        g = self.g[visited]
+        metrics = {'rollout/track_bin_hard_share': self._hard.item() / rsi if rsi else float('nan'),
+                   'rollout/track_bin_g_min': g.min().item() if len(g) else float('nan'),
+                   'rollout/track_bin_g_mean': g.mean().item() if len(g) else float('nan'),
+                   'rollout/track_bin_hardest': (float(torch.where(visited, self.g, math.inf).argmin().item())
+                                                 if len(g) else -1.)}
+        self._rsi.zero_(), self._hard.zero_()
+        return metrics
+
+    def state(self):
+        """training_state's entries: per bin G_b/G_max, its episodes and the history weights (Python floats)."""
+        return {'track_bin_g': [float(v) for v in self.g.cpu().tolist()],
+                'track_bin_count': [float(v) for v in self.count.cpu().tolist()],
+                'track_bin_history': [float(v) for v in self.history.cpu().tolist()]}
+
+    def restore(self, state):
+        """The bins' G, episodes and history weights from a stage's training_state; a stage without them, with another
+        number of bins or non-finite numbers starts afresh (False), else True."""
+        keys = ('track_bin_g', 'track_bin_count', 'track_bin_history')
+        if not all(key in state for key in keys):
+            return False
+        g, count, history = (np.asarray(state[key], dtype=np.float64) for key in keys)
+        if not all(v.shape == (self.bins,) and np.isfinite(v).all() for v in (g, count, history)) \
+                or (count < 0).any() or (history < 0).any() or history.sum() <= 0:
+            return False
+        for target, value in ((self.g, g), (self.count, count), (self.history, history)):
+            target.copy_(torch.as_tensor(value, dtype=torch.float64, device=self.device))
+        return True
+
+
+# task_config track_clips (g1_getup, iteration 78; Pavel 27.10 after SuperMimic, arXiv 2610.28480: one tracker of many
+# human rises). The clips' reference frames (each clip's and its hold frame) lie one after another in one array, clip c
+# from starts[c] (track_clip_frames); a world's reference at its clock is frame starts[c] + min(clock, last_c + 1) of its
+# own clip c (track_clips_index), turned and moved as track_clip's (clip_reference). Its RSI frames (0 … last_c of every
+# clip) lie one after another too, so a uniform RSI draw is uniform over all the clips' frames (longer clips more often)
+# and track_sampling's bins are one table over every clip (track_clip_bins: bins within each clip, none across two).
+# A clip's start class is its first frame's: the pelvis' gravity direction (projected_gravity) on its back (−x), front
+# (+x) or a side (±y), TRACK_CLASSES, by the largest component (track_start_class; upright, −1, when −z is larger). A
+# bank start takes the frame nearest to the row's pose (track_nearest_frame's score: the pelvis gravity and the free
+# joints, among the frames whose anchor height is within TRACK_NEAREST_ANCHOR of the row's) among the frames of the
+# clips of the row's bank class, every clip's where no clip has that class (track_nearest_clip). The critic also sees the
+# seconds left to its episode's end and the reference ahead, TRACK_FUTURE_SECONDS: the anchor's position and rotation in
+# the robot anchor's frame and the free joints relative to home (track_clips_critic_extras), which tell the clips apart
+# without a one-hot (new clips need no new inputs); their normalization is fixed (TRACK_FUTURE_NORMALIZATION). numpy or
+# torch alike.
+TRACK_CLASSES = ('back', 'front', 'side')
+# (mean, std) of the columns track_clips adds after track_critic_extras': the seconds left (clips of 2-7 s and the 3 s
+# hold), then per horizon the anchor's position (m) and rotation entries, the free joints (rad from home).
+TRACK_FUTURE_NORMALIZATION = dict(left=(4., 3.), position=(0., .5), rotation=(0., .5), joints=(0., .6))
+
+
+def track_clip_frames(lengths):
+    """(starts (C,), total) of clips of lengths (C,) frames laid one after another: clip c's frames start at
+    starts[c]; numpy int64."""
+    lengths = np.asarray(lengths, dtype=np.int64)
+    starts = np.concatenate([[0], np.cumsum(lengths)[:-1]]).astype(np.int64)
+    return starts, int(lengths.sum())
+
+
+def track_clip_bins(frames, frame_steps):
+    """(starts, lengths) (B,) of track_sampling's bins over clips of frames (C,) RSI frames each, laid one after another
+    (track_clip_frames): each clip's track_bins, shifted to its first frame; numpy int64."""
+    offsets, _ = track_clip_frames(frames)
+    parts = [track_bins(count, frame_steps) for count in frames]
+    return (np.concatenate([starts + offset for (starts, _), offset in zip(parts, offsets)]),
+            np.concatenate([lengths for _, lengths in parts]))
+
+
+def track_locate(index, starts):
+    """(clip, local) (n,) of indices (n,) into clips laid from starts (C,) (track_clip_frames): the clip of the last
+    start at or below each index and the index within it; numpy or torch alike."""
+    if isinstance(index, torch.Tensor):
+        clip = torch.searchsorted(starts, index, right=True) - 1
+    else:
+        clip = np.searchsorted(starts, index, side='right') - 1
+    return clip, index - starts[clip]
+
+
+def track_clips_index(start, clock, last):
+    """(n,) each world's reference frame in the clips' frames laid one after another: start (n,) its clip's first frame,
+    clock (n,) its clip clock, last (n,) its clip's last frame; the clock held at the clip's hold frame (last + 1)."""
+    held = clock.clamp(min=0) if isinstance(clock, torch.Tensor) else np.maximum(clock, 0)
+    return start + _module(clock).minimum(held, last + 1)
+
+
+def track_start_class(gravity):
+    """(n,) the start class of pelvis gravity directions (n, 3) (projected_gravity, in the pelvis frame): the index in
+    TRACK_CLASSES of the largest of −g_x (on its back: the pelvis' x axis up), g_x (front) and |g_y| (side); −1 where
+    |g_z| is larger than all three (upright: sitting, kneeling, standing)."""
+    xp = _module(gravity)
+    scores = xp.stack([-gravity[:, 0], gravity[:, 0], xp.abs(gravity[:, 1]), xp.abs(gravity[:, 2])], -1)
+    index = scores.argmax(-1)
+    return xp.where(index == 3, 0 * index - 1, index)
+
+
+def track_nearest_clip(gravity, position, anchor_height, start_class, frame_gravity, frame_position,
+                       frame_anchor_height, frame_class, joints):
+    """(frame (n,), found (n,) bool): each start's nearest frame among all clips' RSI frames (F,) laid one after another
+    (track_clip_frames): gravity (n, 3), position (n, 29), anchor_height (n,) the start's pelvis gravity, joints and
+    anchor height, start_class (n,) its class (TRACK_CLASSES' index, −1 for none); frame_gravity (F, 3), frame_position
+    (F, 29), frame_anchor_height (F,) the frames', frame_class (F,) their clip's start class; joints the free ones. The
+    largest track_nearest_frame score among the frames of the clips of the start's class (all frames where no clip has
+    it) whose anchor height is within TRACK_NEAREST_ANCHOR of the start's; found false, frame 0, where there is none."""
+    xp = _module(position)
+    angle, pose, _ = settle_errors(gravity, position, frame_gravity, frame_position, joints)
+    score = xp.exp(-angle ** 2 / SETTLE_ORI_STD ** 2) + xp.exp(-pose / SETTLE_POSE_STD ** 2)
+    same = frame_class[None] == start_class[:, None]
+    allowed = same | ~same.any(-1)[:, None]
+    near = (xp.abs(frame_anchor_height[None] - anchor_height[:, None]) <= TRACK_NEAREST_ANCHOR) & allowed
+    best = xp.where(near, score, -1.).argmax(-1)  # scores are positive: -1 never wins over a near frame
+    found = near.any(-1)
+    return xp.where(found, best, 0 * best), found
+
+
+def track_future_steps(dt):
+    """The control steps ahead of TRACK_FUTURE_SECONDS at control step dt (5, 25, 50 at 50 Hz)."""
+    return tuple(int(round(seconds / dt)) for seconds in TRACK_FUTURE_SECONDS)
+
+
+def track_clips_critic_extras(clock, last, end, dt, position, rotation, ref_position, ref_rotation, future_position,
+                              future_rotation, future_joints):
+    """(n, TRACK_CLIPS_CRITIC_EXTRAS) the critic's track_clips inputs after getup_critic_extras: track_critic_extras of
+    the world's own clip (clock, last (n,): its phase; position, rotation the robot anchor's, ref_position,
+    ref_rotation the reference anchor's now), the seconds left to the episode's end at the clip's (end (n,): its last
+    frame plus the hold), then per TRACK_FUTURE_SECONDS the reference anchor there in the robot anchor's frame
+    Rᵀ(p_f − p) (3) and its rotation there Rᵀ·R_f, first two columns (6), and the reference's free joints there relative
+    to home (9 + TRACK_FUTURE_JOINTS): future_position (n, H, 3), future_rotation (n, H, 3, 3), future_joints (n, H, J)."""
+    xp = _module(position)
+    n, horizons = future_position.shape[:2]
+    inverse = _transpose(rotation)
+    offset = xp.einsum('nij,nhj->nhi', inverse, future_position - position[:, None])
+    relative = xp.einsum('nij,nhjk->nhik', inverse, future_rotation)[..., :2].reshape(n, horizons, 6)
+    left = xp.clip(_like(end - clock, position) * dt, 0, None)
+    extras = _cat([track_critic_extras(clock, last, position, rotation, ref_position, ref_rotation), left[:, None],
+                   _cat([offset, relative, _like(future_joints, position)], -1).reshape(n, -1)], -1)
+    assert extras.shape[1] == TRACK_CLIPS_CRITIC_EXTRAS
+    return extras
+
+
+def track_clips_normalization():
+    """(mean, variance) (TRACK_CLIPS_CRITIC_EXTRAS − TRACK_CRITIC_EXTRAS,) float64: the fixed normalization of the
+    columns track_clips adds after track_critic_extras' (TRACK_FUTURE_NORMALIZATION, G1GetupEnv.fixed_normalization)."""
+    parts = [TRACK_FUTURE_NORMALIZATION['left']] + [
+        value for _ in TRACK_FUTURE_SECONDS for key, size in (('position', 3), ('rotation', 6),
+                                                               ('joints', TRACK_FUTURE_JOINTS))
+        for value in [TRACK_FUTURE_NORMALIZATION[key]] * size]
+    mean, std = np.array(parts, dtype=np.float64).T
+    assert len(mean) == TRACK_CLIPS_CRITIC_EXTRAS - TRACK_CRITIC_EXTRAS
+    return mean, std ** 2
 
 
 # task_config settle_clip (g1_getup, iteration 66; the user: get up from any fall pose, as a human does): the trackers of
@@ -1807,6 +2370,21 @@ SETTLE_ORI_STD, SETTLE_POSE_STD = .5, .5  # rad
 SETTLE_DONE_ANGLE, SETTLE_DONE_POSE = math.radians(25.), .3  # rad; mean |q − q0| over the free joints
 SETTLE_DONE_SPEED, SETTLE_DONE_SECONDS = .5, .3  # rad/s, every free joint; s on end
 SETTLE_CLASSES = ('back', 'front', 'side', 'fall', 'sit')
+# task_config settle_success (iteration 85, the critic's lab-critic/it85 basin85.py): the success rule by joints. The
+# old rule (25°, mean |q − q0| ≤ 0.3) passes poses the tracker cannot take (tracker 73 @ 730 from a still frame of its clip
+# with the free joints offset: a mean of 0.1-0.2 rad 8 of 8 up, 0.3 6 of 8), and a mean hides one arm far off, so a pose
+# counts as near only with the pelvis
+# within pelvis_degrees of the target, EVERY free arm joint (shoulders, elbows, wrist roll: settle_arm_worst) within
+# arm_joint, the mean over the free joints within mean, every free joint slower than SETTLE_DONE_SPEED for `still`
+# seconds (settle_near(…, success=)). The same near gates the stillness term, as the old rule does.
+SETTLE_SUCCESS_KEYS = ('pelvis_degrees', 'arm_joint', 'mean', 'still')
+# task_config settle_starts (iteration 85, a reverse curriculum): a share `target` of the training resets starts from a
+# target pose (a settle clip's first frame drawn uniformly) with track_start_pose / track_start_speed's noise times
+# `noise`, raised out of the floor by its deepest contact; the rest from the bank rows of `classes`. Its draws come from
+# a stream of their own (CPU numpy default_rng((seed, SETTLE_START_STREAM)); CUDA a generator seeded seed + this), after
+# the bank row the task draws as before, so every other draw stays the old one.
+SETTLE_START_STREAM = 85_000_000
+SETTLE_TARGET_CLASS = 'target'  # the start class of a target start (logs, info)
 
 
 def projected_gravity(rotation):
@@ -1844,9 +2422,27 @@ def _pick(values, index):
     return np.take_along_axis(values, index[:, None], 1)[:, 0]
 
 
-def settle_near(angle, deviation):
-    """(n,) bool: the pose near its target, the angle ≤ SETTLE_DONE_ANGLE and the mean |q − q0| ≤ SETTLE_DONE_POSE."""
-    return (angle <= SETTLE_DONE_ANGLE) & (deviation <= SETTLE_DONE_POSE)
+def settle_arm_worst(position, target_position, arms):
+    """(n, K) per world and target the largest |q − q0| over the joints `arms` (settle_success: the free arm joints),
+    position (n, joints), target_position (K, joints)."""
+    xp = _module(position)
+    difference = xp.abs(position[:, None, list(arms)] - target_position[None][:, :, list(arms)])
+    return difference.amax(-1) if isinstance(difference, torch.Tensor) else difference.max(-1)
+
+
+def settle_near(angle, deviation, arm_worst=None, success=None):
+    """(n,) bool: the pose near its target. Without success (task_config settle_success missing) the angle ≤
+    SETTLE_DONE_ANGLE and the mean |q − q0| ≤ SETTLE_DONE_POSE, bit for bit the old rule; with it (a dict of
+    SETTLE_SUCCESS_KEYS) the angle ≤ pelvis_degrees, arm_worst (n,) ≤ arm_joint and the mean ≤ mean."""
+    if success is None:
+        return (angle <= SETTLE_DONE_ANGLE) & (deviation <= SETTLE_DONE_POSE)
+    return ((angle <= math.radians(success['pelvis_degrees'])) & (arm_worst <= success['arm_joint'])
+            & (deviation <= success['mean']))
+
+
+def settle_hold_steps(dt, success=None):
+    """The control steps on end a success needs: SETTLE_DONE_SECONDS, or settle_success's `still`."""
+    return round((SETTLE_DONE_SECONDS if success is None else success['still']) / dt)
 
 
 def settle_update(count, near, joint_velocity, joints):
@@ -1860,8 +2456,9 @@ def settle_update(count, near, joint_velocity, joints):
 
 def settle_reward_components(angle, pose, deviation, joint_velocity, velocity, action, previous_action, position,
                              soft_low, soft_high, joints, weights=None, self_contact=None, impact=None,
-                             sole_impact=None):
-    """The settle_clip reward terms, each (n,), the nearest target (n,) and whether the pose is near it (n,) bool:
+                             sole_impact=None, arm_worst=None, success=None):
+    """The settle_clip reward terms, each (n,), the nearest target (n,) and whether the pose is near it (n,) bool
+    (settle_near; with settle_success `success` also arm_worst (n, K) of settle_arm_worst, the nearest target's taken):
     angle, pose, deviation (n, K) of settle_errors; joint_velocity, position (n, joints) after the step; velocity (n, 6)
     the pelvis object velocity as reward_components'; action, previous_action (n, joints) this step's applied action
     and the one before; soft_low, soft_high (joints,) soft_limits of the joint ranges (every joint); joints: the free
@@ -1879,7 +2476,7 @@ def settle_reward_components(angle, pose, deviation, joint_velocity, velocity, a
     xp = _module(position)
     nearest = settle_nearest(angle, pose)
     angle, pose, deviation = _pick(angle, nearest), _pick(pose, nearest), _pick(deviation, nearest)
-    near = settle_near(angle, deviation)
+    near = settle_near(angle, deviation, None if success is None else _pick(arm_worst, nearest), success)
     like = angle
     still = ((joint_velocity[:, list(joints)] ** 2).mean(-1) + (velocity[:, 3:6] ** 2).sum(-1)
              + (velocity[:, 0:3] ** 2).sum(-1))

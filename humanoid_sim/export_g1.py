@@ -70,6 +70,17 @@ last action. With flag 0 the slot is zeros and the graph acts as before. In depl
 time; the patch moves d to a pose when its keys are pressed, back home on ARM_RELEASE, then flag 0. The check takes half
 of each command's observations under arm targets drawn from the stage's pose libraries; ExportedPolicy gives the
 environment the residual back (the graph's output less d/scale).
+
+A g1_getup stage with task_config track_clip (a tracker of one human clip, iteration 64) goes out the same way: the
+clip's clock and reference are the critic's extras, so the actor's 490 inputs are the GetUp connector's. The ONNX
+properties and a deploy.yaml comment name the clip (file, md5, frames, hold). Its check takes the observations from
+the clip's own starts (TRACK_CHECK_FRAMES frames spread over the clip, the noisy start of each, the reset an
+evaluation's) and from the held-out bank rows of the stage's track_bank_classes (a bank start, the reference aligned to
+it), instead of every class lying: the states the tracker runs in. --handover-frame K (iteration 82, the getting-up
+chain of scripts/lab/probes/getup_chain.py, scripts/sim2sim/patches/g1_ctrl-getupchain.patch) also writes
+handover.yaml next to deploy.yaml: frame K's pelvis gravity and joint angles (the hand-over rule's target, the PD
+transition's goal), its targets as g1_ctrl clips them, the free and locked motors and the seconds from K to the clip's
+end plus the hold (the tracker state's time limit).
 """
 import argparse
 import copy
@@ -105,6 +116,10 @@ TRIM_FILE = 'stand_trim.json'
 GETUP_TASK = 'g1_getup'
 ZERO_RANGES = {'lin_vel_x': [0., 0.], 'lin_vel_y': [0., 0.], 'ang_vel_z': [0., 0.]}
 GETUP_CHECK_CLASSES = ('back', 'front', 'side', 'fall', 'sit')
+# A track_clip stage's check: this many clip frames spread over the clip (first and last included), each a noisy
+# clip start; the bank's held-out rows of its track_bank_classes as well. HANDOVER_FILE: --handover-frame's file.
+TRACK_CHECK_FRAMES = 12
+HANDOVER_FILE = 'handover.yaml'
 # task_config arm_targets: the slot's term name in deploy.yaml (registered by scripts/sim2sim/patches/g1_ctrl-arms.patch;
 # g1_ctrl-height.patch's upper_body_command stays the zeros of the other exports) and the arm poses g1_ctrl offers: name,
 # joystick keys (unitree_joystick_dsl expressions, held: the patch takes their rising edge at the policy's 50 Hz; LB is
@@ -547,7 +562,29 @@ def resolve_stage(path):
     return stages[-1]
 
 
-def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, commands=None, symmetric_walk=False):
+def handover_params(raw, frame):
+    """handover.yaml of a track_clip stage's export at clip frame `frame` (--handover-frame): the frame's pelvis
+    projected gravity and joint angles, its motor targets as the environment's PD takes them (_target of the applied
+    action for those angles: joint ranges, knee floor, locked wrists at home; deploy.yaml's clip gives the same), the
+    free motors (the hand-over rule's mean) and the locked ones, the seconds from the frame to the clip's last frame
+    and to the episode's end (the hold). Per SDK motor: the model's actuators are in the SDK order (deploy_config's
+    joint_ids_map is the identity)."""
+    if isinstance(frame, bool) or not isinstance(frame, (int, np.integer)) or not 0 <= frame <= raw.clip_last:
+        raise ValueError(f'Кадр передачи {frame!r} вне клипа трекера: от 0 до {raw.clip_last}')
+    q = raw.clip_joints[frame]
+    target = raw._target(raw.applied_action((q - raw.home) / raw.scale))
+    locked = raw.wrist_mask.numpy()
+    floats = lambda values: [float(v) for v in values]  # noqa: E731
+    return {'clip': raw.track_clip['file'], 'md5': raw.track_clip['md5'], 'frame': int(frame),
+            'frames': int(raw.clip_last + 1), 'dt': float(raw.dt),
+            'seconds': round(float((raw.clip_end - frame) * raw.dt), 6),
+            'clip_seconds': round(float((raw.clip_last - frame) * raw.dt), 6),
+            'gravity': floats(raw.clip_gravity[frame]), 'joints': floats(q), 'target': floats(target),
+            'free': [int(j) for j in np.flatnonzero(~locked)], 'locked': [int(j) for j in np.flatnonzero(locked)]}
+
+
+def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, commands=None, symmetric_walk=False,
+           handover_frame=None):
     """Writes policy.onnx and deploy.yaml for stage_dir into out_dir; returns paths, sizes and warnings.
     trim: (actions,) stand trim b in action units (stand_trim; its info dict goes into stand_trim.json too), baked
     into the graph; symmetric: export ½(π(o) + M_a·π(M_o·o)) instead of π (experiments); symmetric_walk: that mean
@@ -564,8 +601,14 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
     config = export_config(stage, identity)
     if not config['real_robot']:
         raise ValueError('Выгрузка в g1_ctrl — только для профиля real_robot (наблюдения как в deploy.yaml)')
+    if config.get('height_scan') is not None:  # g1_ctrl has no height map; the robot's is a depth-camera student's
+        raise ValueError('Этап видит карту высот (task_config height_scan), а у g1_ctrl её нет: карта высот на '
+                         'роботе — ученик по камере глубины, этап C; учителя с картой не выгружают')
     if getup and (trim is not None or symmetric or symmetric_walk or commands is not None):
         raise ValueError('Подстройка стоя, симметризация и сужение команд — только для ходьбы, не для вставания')
+    track = stage_task_config(stage).get('track_clip') if getup else None  # a tracker of one human clip
+    if handover_frame is not None and not track:
+        raise ValueError('Кадр передачи (--handover-frame) — только для трекера вставания с task_config track_clip')
     if trim is not None and symmetric:
         raise ValueError('Подстройка стоя и симметризация вместе не выгружаются: выберите одно')
     if symmetric and symmetric_walk:
@@ -595,6 +638,7 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
                 raise ValueError('Зеркало входа актёра задевает входы критика')
             mirror = (obs_index[:actor_inputs], obs_sign[:actor_inputs], action_index, action_sign)
         bound = pd_bound_inputs(raw, config, metadata)  # refused before anything is written
+        handover = None if handover_frame is None else handover_params(raw, handover_frame)  # likewise
         arm = None
         if config.get('arm_targets'):  # the newest slot offsets over the scale, added to the arm outputs last
             arm = (arm_command_inputs(raw), task.UPPER_BODY_FIRST, raw.scale[task.UPPER_BODY_FIRST:])
@@ -629,6 +673,12 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
                               arm_poses=json.dumps([pose['name'] for pose in poses['poses']]))
         if getup:  # the getting-up policy, for g1_ctrl's GetUp state; the graph is built as a walking one
             properties.update(task_id=identity['task_id'], getup='true')
+        if track:  # a tracker: its clip (the clock and the reference are the critic's, not in the graph)
+            properties.update(track_clip=track['file'], track_clip_md5=track['md5'],
+                              track_frames=json.dumps(raw.clip_last + 1),
+                              track_hold_seconds=json.dumps(task.TRACK_HOLD_SECONDS))
+            if handover is not None:
+                properties['handover_frame'] = json.dumps(handover['frame'])
         roll = config.get('hip_roll_out') if getup else None
         if roll is not None:  # g1_getup hip_roll_out: deploy.yaml's clip (target_low / target_high), the graph the same
             properties['hip_roll_out'] = json.dumps(roll)
@@ -643,6 +693,14 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
             header += ('\ng1_getup: a getting-up policy (task g1_getup) for g1_ctrl\'s GetUp state '
                        '(scripts/sim2sim/patches/g1_ctrl-getup.patch, its own policy_dir);\nno velocity command: '
                        'the command ranges are [0, 0], so velocity_commands reads 0 and the gait phase stays stopped')
+        if track:
+            header += (f"\ntrack_clip: a tracker of the human clip {track['file']} (md5 {track['md5']}, "
+                       f"{raw.clip_last + 1} frames at {1 / raw.dt:g} Hz, then {task.TRACK_HOLD_SECONDS:g} s held); its "
+                       "clock is not in the input, so g1_ctrl runs it as any policy state")
+            if handover is not None:
+                header += (f"\nhandover.yaml: frame {handover['frame']} for g1_ctrl's GetUpTrack after GetUpBlend "
+                           f"(scripts/sim2sim/patches/g1_ctrl-getupchain.patch), {handover['seconds']:g} s to the "
+                           'episode\'s end')
         if bound is not None:
             header += '\n' + pd_bound_comment(bound, raw)
         if roll is not None:
@@ -684,6 +742,16 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
                 f'\n  {name} [{training[name][0]:g}, {training[name][1]:g}] -> [{low:g}, {high:g}]'
                 for name, (low, high) in narrowed.items())
         write_yaml(deploy_config(raw, config, commands), yaml_path, header)
+        handover_path = out_dir / HANDOVER_FILE
+        if handover is not None:
+            write_yaml(handover, handover_path, (
+                f"humanoid_sim.export_g1 --handover-frame {handover['frame']}: {stage.resolve()}\n"
+                "the getting-up chain's hand-over frame (scripts/sim2sim/patches/g1_ctrl-getupchain.patch): gravity, "
+                "the pelvis projected gravity;\njoints, the joint angles (SDK order), the rule's and the PD "
+                "transition's goal; target, their motor targets after g1_ctrl's clip;\nfree, the motors of the rule's "
+                "mean |q - q0|; locked, held at default_joint_pos; seconds, from the frame to the episode's end"))
+        else:  # a hand-over file left by an earlier export into this folder would describe another frame or clip
+            handover_path.unlink(missing_ok=True)
         if trim is not None:
             write_json(trim_path, {
                 'stage': str(stage.resolve()), 'steps': metadata.get('steps'),
@@ -709,7 +777,7 @@ def export(stage_dir, out_dir, trim=None, trim_info=None, symmetric=False, comma
     return {'stage': stage, 'onnx': onnx_path, 'deploy': yaml_path, 'actor_inputs': actor_inputs,
             'actions': actions, 'history': config['history'], 'warnings': notes,
             'trim': None if trim is None else trim_path, 'symmetric': symmetric, 'symmetric_walk': symmetric_walk,
-            'commands': command_ranges(config, commands)}
+            'commands': command_ranges(config, commands), 'handover': None if handover is None else handover_path}
 
 
 def onnx_properties(onnx_path):
@@ -849,17 +917,23 @@ def check_getup(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
     session = onnxruntime.InferenceSession(str(onnx_path), providers=['CPUExecutionProvider'])
     model, norm = load_stage(stage)
     env = None
-    worst, worst_target, count = 0., 0., 0
+    worst, worst_target, count, resets = 0., 0., 0, 0
     try:
         env = make_task(GETUP_TASK, identity['robot_id'], stage_task_config(stage))
         raw = env.unwrapped
         bank = raw.bank
-        rows = [int(row) for kind in GETUP_CHECK_CLASSES for row in np.flatnonzero(
+        # A tracker (track_clip) runs in its clip's states: TRACK_CHECK_FRAMES noisy clip starts spread over the clip
+        # and the held-out bank rows of its own track_bank_classes; any other getting-up stage every class lying.
+        frames = [] if raw.clip is None else sorted({int(f) for f in np.linspace(0, raw.clip_last, TRACK_CHECK_FRAMES)
+                                                     .round()})
+        kinds = GETUP_CHECK_CLASSES if raw.clip is None else raw.track_classes
+        rows = [int(row) for kind in kinds for row in np.flatnonzero(
             bank['holdout'] & (bank['start_class'] == bank['classes'].index(kind)))]
-        per_start = math.ceil(samples / len(rows))
+        starts = [dict(track_frame=frame) for frame in frames] + [dict(start=row) for row in rows]
+        per_start = math.ceil(samples / len(starts))
         options = dict(assist_force=0., action_delay_steps=0, motor_friction_scale=1., pd_bound='min')
-        for number, row in enumerate(rows):
-            obs, _ = env.reset(seed=seed_start + number, options=dict(options, start=row))
+        for number, start in enumerate(starts):
+            obs, _ = env.reset(seed=seed_start + number, options=dict(options, **start))
             for step in range(per_start * stride):
                 expected = reference_action(model, norm, obs, config, raw)
                 if step % stride == 0 and count < samples:
@@ -869,14 +943,15 @@ def check_getup(stage_dir, onnx_path, samples=200, stride=5, seed_start=81000):
                     worst_target = max(worst_target, float(np.abs(deploy_target(got, deploy) - target).max()))
                     count += 1
                 obs, _, terminated, truncated, _ = env.step(expected)
-                if terminated or truncated:  # a joint past 50 rad/s: on from the same start
-                    obs, _ = env.reset(seed=seed_start + 1000 + number, options=dict(options, start=row))
+                if terminated or truncated:  # a joint past 50 rad/s (a tracker: its terminations): the same start
+                    resets += 1
+                    obs, _ = env.reset(seed=seed_start + 1000 + number, options=dict(options, **start))
     finally:
         if env is not None:
             env.close()
         norm.close()
     return {'samples': count, 'max_abs_diff': worst, 'max_target_diff': worst_target, 'tolerance': TOLERANCE,
-            'resets': 0, 'crouched': 0, 'zero_commands': zero, 'starts': len(rows),
+            'resets': resets, 'crouched': 0, 'zero_commands': zero, 'starts': len(rows), 'track_frames': frames,
             'pd_bound': None if config.get('pd_bound') is None else config['pd_bound'][1],
             'ok': count == samples and worst < TOLERANCE and worst_target < TOLERANCE and zero}
 
@@ -971,12 +1046,16 @@ def main(argv=None):
                         help='сузить диапазоны команд в deploy.yaml (g1_ctrl зажимает в них стик): вперёд '
                              'X_MIN…X_MAX м/с, вбок ±Y м/с, поворот ±YAW рад/с, только внутри диапазонов обучения '
                              'этапа (до проб на полу — как этап 1: -0.5 1 0.5 1)')
+    parser.add_argument('--handover-frame', type=int, metavar='K',
+                        help='трекер с track_clip: ещё handover.yaml — кадр K клипа для цепочки вставания '
+                             '(g1_ctrl-getupchain.patch: цель правила передачи и ПД-перехода; цепочка — кадр 18)')
     args = parser.parse_args(argv)
     if args.symmetric and args.symmetric_walk:
         parser.error('--symmetric и --symmetric-walk вместе нельзя: выберите одно')
     stage = resolve_stage(args.stage)
     trim, info = stand_trim(stage) if args.stand_trim else (None, None)
-    result = export(stage, args.out, trim, info, args.symmetric, args.command_ranges, args.symmetric_walk)
+    result = export(stage, args.out, trim, info, args.symmetric, args.command_ranges, args.symmetric_walk,
+                    args.handover_frame)
     print(f'Этап: {stage}')
     print(f'policy.onnx: {result["onnx"]} (вход obs [1, {result["actor_inputs"]}], выход actions '
           f'[1, {result["actions"]}])')
@@ -993,6 +1072,8 @@ def main(argv=None):
     if args.symmetric_walk:
         print('Симметризация на ходу: ½(π(o) + M·π(M·o)) при норме команды ≥ 0,1, стоя — π(o)'
               + (' с подстройкой стоя' if trim is not None else ''))
+    if result['handover'] is not None:
+        print(f'Кадр передачи: {result["handover"]} (кадр {args.handover_frame})')
     for warning in result['warnings']:
         print(f'Внимание: {warning}')
     if args.samples > 0:
@@ -1004,8 +1085,11 @@ def main(argv=None):
         if verdict.get('arm_targets'):
             crouched += f' (с целями рук {verdict["arm_targets"]})'
         if 'zero_commands' in verdict:  # g1_getup: observations lying, and no velocity command in deploy.yaml
-            crouched = (f' лёжа (стартов из отложенного банка {verdict["starts"]}); диапазоны команд '
-                        f'{"[0, 0]" if verdict["zero_commands"] else "НЕ НУЛЕВЫЕ"}')
+            frames = verdict['track_frames']
+            where = (f' на клипе трекера (стартов с кадров клипа {len(frames)}, {frames[0]}…{frames[-1]}, и '
+                     if frames else ' лёжа (')
+            crouched = (f'{where}стартов из отложенного банка {verdict["starts"]}; обрывов {verdict["resets"]}); '
+                        f'диапазоны команд {"[0, 0]" if verdict["zero_commands"] else "НЕ НУЛЕВЫЕ"}')
             if verdict['pd_bound'] is not None:
                 crouched += f'; граница ошибки ПД c = {verdict["pd_bound"]:g} (в графе и в среде)'
         print(f'Сверка с policy.predict{same}: {verdict["samples"]} наблюдений{crouched}, max |разница| = '

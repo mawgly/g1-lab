@@ -11,8 +11,9 @@ joints flip, pitch joints keep); signs are read from the model's joint axes, not
 (Unitree deploy layout, see tasks/g1_tensor_math.deploy_observation): angular velocity (−x, y, −z), gravity
 (x, −y, z), command (vx, −vy, −yaw rate), gait phase half a cycle later (−sin, −cos: the right foot runs half a
 cycle after the left), joint positions, velocities and last action by the joint map; the height command as it is,
-the upper-body slot's flag as it is and its waist and arm targets by the joint map; critic extras: linear velocity
-(x, −y, z) and height.
+the upper-body slot's flag as it is and its waist and arm targets by the joint map; the height scans (task_config
+height_scan, the actor's and the critic's) point by point onto their mirror images (x, −y), heights as they are;
+critic extras: linear velocity (x, −y, z) and height.
 """
 import numpy as np
 import torch
@@ -93,9 +94,17 @@ class Mirror:
                 for i in range(len(frame_index)):
                     index[position[frame][i]] = position[frame][frame_index[i]]
                     sign[position[frame][i]] = frame_sign[i]
+        scans = [getattr(raw, name, None) for name in ('scan_grid', 'critic_grid')]
+        scans = [() if grid is None else grid for grid in scans]
+        if len(scans[0]):  # task_config height_scan: heights at the mirror image of each point, (x, −y)
+            index += [len(index) + int(k) for k in task.scan_mirror(scans[0])]
+            sign += [1] * len(scans[0])
         if raw.critic_extras:
             index += [len(index) + k for k in range(4)]
             sign += [1, -1, 1, 1]
+        if len(scans[1]):  # the critic's scan, after the critic extras
+            index += [len(index) + int(k) for k in task.scan_mirror(scans[1])]
+            sign += [1] * len(scans[1])
         if len(index) != raw.observation_space.shape[0]:
             raise ValueError('Раскладка наблюдений не совпадает с зеркалом')
         self.obs_index, self.obs_sign = torch.tensor(index), torch.tensor(sign, dtype=torch.float32)

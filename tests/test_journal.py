@@ -198,3 +198,21 @@ def test_council_iterations_keep_who_said_what_newest_first(tmp_path):
     for messages in ([], [{'role': 'boss', 'text': 'x'}], [{'role': 'lead', 'text': ''}]):
         with pytest.raises(ValueError):
             journal.add_iteration(root, 'iter-3', 'Т', 'В', messages)
+
+
+def test_an_entry_keeps_several_clips_with_captions(tmp_path):
+    from humanoid_sim import i18n
+    clip, poster = tmp_path / 'a.webp', tmp_path / 'a.jpg'
+    clip.write_bytes(b'RIFF')
+    poster.write_bytes(b'\xff\xd8')
+    journal.add_entry(tmp_path, 'many', 'Ролики', 'Текст', at=1, clip=None)
+    journal.add_entry_clips(tmp_path, 'many', [(clip, poster, 'Первый'), (clip, poster, 'Второй')], keep_main=False)
+    entry = journal.load(tmp_path)['entries'][0]
+    assert [c['clip'] for c in entry['clips']] == ['many-clip-1.webp', 'many-clip-2.webp']
+    assert [c['caption'] for c in entry['clips']] == ['Первый', 'Второй'] and 'clip' not in entry
+    assert (journal.folder(tmp_path) / 'many-clip-2.jpg').is_file()
+    seen = []
+    i18n.map_journal(journal.load(tmp_path), lambda text, kind, field: seen.append((kind, text)) or text)
+    assert ('clips', 'Второй') in seen  # captions go to the translator like any lab text
+    with pytest.raises(ValueError, match='не найдена'):
+        journal.add_entry_clips(tmp_path, 'none', [(clip, poster, 'x')])

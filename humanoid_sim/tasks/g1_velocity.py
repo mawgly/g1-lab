@@ -14,8 +14,11 @@ import mujoco
 import numpy as np
 import torch
 from .config import (ARM_PERTURB_RADIANS, ARM_PERTURB_RADIANS_RANGE, CRITIC_EXTRAS, CROUCH_HEIGHTS, FORCE_PUSH_RANGE,
-                     MOTOR_FRICTION_RANGE, g1_commands, g1_gait, g1_reward_weights, load_curve_setting)
+                     MOTOR_FRICTION_RANGE, TERRAIN_GENERATOR, TERRAIN_LEVELS, TERRAIN_SEED, g1_commands, g1_gait,
+                     g1_reward_weights, height_scan_setting, load_curve_setting, terrain_generator,
+                     terrain_pelvis_support, terrain_seed, terrain_setting)
 from . import g1_tensor_math as task
+from . import g1_terrain
 
 ASSETS = Path(__file__).resolve().parents[2] / 'assets' / 'robots' / 'g1'
 LEG_JOINTS = tuple(f'{side}_{joint}_joint' for side in ('left', 'right')
@@ -136,14 +139,17 @@ def _batch(value):
     return torch.from_numpy(np.asarray(value, dtype=np.float64))[None]
 
 
-def load_model(legs_only=False, foot_collision=False, hand_collision=False):
+def load_model(legs_only=False, foot_collision=False, hand_collision=False, terrain=False, terrain_seed=TERRAIN_SEED,
+               terrain_generator=TERRAIN_GENERATOR):
     """The G1 scene and the indices of its actuators in the 29-DoF controller.json order; foot_collision adds Unitree's
     foot capsules (FOOT_CAPSULES), which collide only foot with foot, hand_collision Unitree's hand capsules
-    (HAND_CAPSULES; 29-DoF only), which collide with the floor and the robot. Without any, the files as they are."""
+    (HAND_CAPSULES; 29-DoF only), which collide with the floor and the robot, terrain the rough-ground heightfield
+    beside the plane (g1_terrain), its map g1_terrain.terrain_grid(terrain_seed, terrain_generator). Without any, the
+    files as they are."""
     path = str(ASSETS / 'scene_29dof.xml')
     if legs_only and hand_collision:
         raise ValueError('hand_collision needs the arms of the 29-DoF G1')
-    if not legs_only and not foot_collision and not hand_collision:
+    if not legs_only and not foot_collision and not hand_collision and not terrain:
         model = mujoco.MjModel.from_xml_path(path)
         return model, list(range(model.nu))
     spec = mujoco.MjSpec.from_file(path)
@@ -176,6 +182,11 @@ def load_model(legs_only=False, foot_collision=False, hand_collision=False):
                 size=[HAND_CAPSULE_RADIUS, 0., 0.], fromto=fromto, contype=1, conaffinity=1,
                 condim=HAND_CAPSULE_CONTACT['condim'], priority=HAND_CAPSULE_CONTACT['priority'], group=3, density=0.,
                 rgba=[.2, .6, .2, .2])
+    if terrain:
+        g1_terrain.add_terrain(spec, terrain_seed, terrain_generator)
+        model = spec.compile()
+        g1_terrain.write_terrain(model, terrain_seed, terrain_generator)
+        return model, kept
     return spec.compile(), kept
 
 
@@ -189,8 +200,19 @@ class G1VelocityEnv(gym.Env):
                  force_push=0., feet_flat_stance=False, foot_collision=False, side_heading_hold=True,
                  motor_friction=0., height_command=False, upper_body_slot=False,
                  arm_perturb_radians=ARM_PERTURB_RADIANS, arm_perturb_contact_mask=False, arm_blind=False,
-                 hand_collision=False, arm_targets=False, load_curve=None):
+                 hand_collision=False, arm_targets=False, load_curve=None, terrain=None, height_scan=None):
         self.real_robot = bool(real_robot)
+        # height_scan: the ground's heights for the actor (a grid ahead, noised in training) and the critic (a grid
+        # around the pelvis, exact), observation terms after the actor's and after the critic extras
+        # (config.height_scan_setting, task.height_scan / critic_scan); needs terrain, the deploy layout and the critic
+        # extras. None: the old layout, bit for bit.
+        self.height_scan = height_scan_setting(height_scan)
+        if self.height_scan is not None and (terrain is None or not real_robot or not critic_extras):
+            raise ValueError('height_scan requires terrain, real_robot and critic_extras')
+        # terrain: the rough-ground heightfield beside the plane (g1_terrain), its curriculum settings
+        # (config.terrain_setting) and its map's seed (config.terrain_seed, g1_terrain.terrain_grid; the CUDA task uses
+        # this model); None: the plane alone, bit for bit.
+        self.terrain = terrain_setting(terrain)
         # load_curve: the full-GPU trainer's block rule for the hand load ceiling (TensorG1Env.rollout_metrics); kept
         # here for it, nothing on the CPU changes (this task keeps the ceiling it is given).
         self.load_curve = load_curve_setting(load_curve)
@@ -289,7 +311,9 @@ class G1VelocityEnv(gym.Env):
         if render_mode not in (None, 'rgb_array'):
             raise ValueError('Unsupported render mode')
         self.render_mode = render_mode
-        self.model, kept = load_model(self.legs_only, self.foot_collision, self.hand_collision)
+        self.model, kept = load_model(self.legs_only, self.foot_collision, self.hand_collision,
+                                      self.terrain is not None, terrain_seed(self.terrain),
+                                      terrain_generator(self.terrain))
         self.model.opt.timestep = .002
         self.model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         self.model.opt.solver = mujoco.mjtSolver.mjSOL_NEWTON
@@ -412,15 +436,26 @@ class G1VelocityEnv(gym.Env):
                     self.hand_above[body, side] = 1.
                     body = self.model.body_parentid[body] if body else -1
         self._setup_arm_targets(names)
+        self._setup_terrain()
         self.action_space = spaces.Box(-self.action_limit, self.action_limit, (self.model.nu,), dtype=np.float32)
         # Simulation profile: body angular+linear velocity, gravity, command, joint offsets/velocities,
         # previous action, gait clock. Real robot: the controller's layout without linear velocity, then the extra
         # terms (height_command, upper_body_slot).
         self.frame_size = (11 if self.real_robot else 14) + 3*self.model.nu + sum(self.extra_sizes)
         size = self.frame_size * self.history
-        self.actor_inputs = size  # what the robot measures; critic extras follow
+        # height_scan: the actor's grid (scan_grid, its points after the history) and the critic's (critic_grid, after
+        # the critic extras), (k, 2) offsets in the pelvis yaw frame; (0, 2) without it. Whether this episode's scan
+        # is noised (a training reset; set_command ends it).
+        self.scan_grid = self.critic_grid = torch.zeros((0, 2), dtype=torch.float64)
+        if self.height_scan is not None:
+            self.scan_grid = task.scan_grid(self.height_scan['x'], self.height_scan['y'], self.height_scan['step'])
+            self.critic_grid = task.critic_scan_grid()
+        self.scan_noised = False
+        size += len(self.scan_grid)
+        self.actor_inputs = size  # what the robot measures (and the height scan); critic extras follow
         self.frames = None  # (1, history, frame size) torch buffer, oldest first; filled at reset
         size += CRITIC_EXTRAS if self.critic_extras else 0
+        size += len(self.critic_grid)
         self.observation_space = spaces.Box(-np.inf, np.inf, (size,), dtype=np.float32)
         self.command = np.zeros(3)
         # With heading hold, the observed/rewarded command replaces a zero yaw rate with steering back
@@ -468,6 +503,100 @@ class G1VelocityEnv(gym.Env):
             raise ValueError('The carry poses of the arm pose library are not those of task.ARM_CARRY: make it again')
         self.arm_poses, self.arm_carry = (torch.from_numpy(self._arm_offsets(columns, rows)) for rows in (poses, carry))
         self.arm_state = self._arm_still(np.zeros(self.model.nu))
+
+    def _setup_terrain(self):
+        """task_config terrain: the ground's heights as MuJoCo's heightfield has them (g1_terrain.model_heights, for
+        task.terrain_height), each tile's centre and spawn height (its platform's), the generator's tile types
+        (terrain_names) and their shares, and the episode state: its tile (type index into terrain_names and level;
+        None: the plane at the origin), the level a training reset takes (terrain_level: 0 fresh, a stage's
+        restore_training_state, set_terrain_level; the CPU task runs no curriculum), the path commanded and walked along
+        the commands this episode (task.terrain_progress) and the terrain's own random stream (the tile type of a
+        training reset). Without the setting only the empty state."""
+        self.terrain_type, self.terrain_level, self.tile_level = None, 0, 0
+        self.terrain_path = np.zeros(2)
+        self.terrain_random = None
+        if self.terrain is None:
+            return
+        spec = g1_terrain.generator(terrain_generator(self.terrain))
+        self.terrain_names, self.terrain_shares = spec.types, spec.shares
+        heights, self.terrain_corner, self.terrain_cell, self.terrain_lift = g1_terrain.model_heights(self.model)
+        self.terrain_heights = torch.from_numpy(heights)
+        self.tile_centres = g1_terrain.tile_centres(spec.number)
+        self.tile_spawn = self._ground(self.tile_centres.reshape(-1, 2)).reshape(self.tile_centres.shape[:2])
+
+    def _ground(self, xy):
+        """Ground height (m) under world points xy (..., 2) (numpy or torch), a float64 tensor (task.terrain_height)."""
+        return task.terrain_height(torch.as_tensor(np.asarray(xy, dtype=np.float64)), self.terrain_heights,
+                                   self.terrain_corner, self.terrain_cell, self.terrain_lift)
+
+    def set_terrain_level(self, level):
+        """The level later training resets put the robot on (task_config terrain; probes, tests): a whole number in
+        [0, TERRAIN_LEVELS)."""
+        if self.terrain is None:
+            raise ValueError('a terrain level needs task_config terrain')
+        if isinstance(level, bool) or not isinstance(level, (int, np.integer)) or not 0 <= level < TERRAIN_LEVELS:
+            raise ValueError(f'terrain level must be a whole number in [0, {TERRAIN_LEVELS})')
+        self.terrain_level = int(level)
+
+    def _terrain_reset(self, options, seed):
+        """task_config terrain, at a reset: the tile and the start on it. A training reset (no command given) takes a
+        type drawn by its generator's shares from the terrain's own stream and terrain_level; options terrain_type
+        (a name) and terrain_level put any reset on that tile (the other one as a training reset's); a reset with a
+        command and neither starts on the plane at the origin, as without the setting. On a tile the robot starts at
+        its centre, as high above the platform as above the plane."""
+        if seed is not None or self.terrain_random is None:
+            self.terrain_random = np.random.default_rng(None if seed is None else (seed, task.TERRAIN_STREAM))
+        kind, level = options.get('terrain_type'), options.get('terrain_level')
+        self.terrain_path = np.zeros(2)
+        if kind is None and level is None and options.get('command') is not None:
+            self.terrain_type = None
+            return
+        if kind is None:
+            self.terrain_type = int(task.terrain_type_draw(lambda n: torch.from_numpy(self.terrain_random.random(n)), 1,
+                                                           self.terrain_shares)[0])
+        elif kind in self.terrain_names:
+            self.terrain_type = self.terrain_names.index(kind)
+        else:
+            raise ValueError('terrain_type must be one of ' + ', '.join(self.terrain_names))
+        if level is None:
+            level = self.terrain_level
+        if isinstance(level, bool) or not isinstance(level, (int, np.integer)) or not 0 <= level < TERRAIN_LEVELS:
+            raise ValueError(f'terrain_level must be a whole number in [0, {TERRAIN_LEVELS})')
+        self.tile_level = int(level)
+        self.data.qpos[:2] = self.tile_centres[self.tile_level, self.terrain_type]
+        self.data.qpos[2] += float(self.tile_spawn[self.tile_level, self.terrain_type])
+
+    def _cap_command(self):
+        """terrain: a training command on a tile of slow_level or above at most slow_speed
+        (task.terrain_command_cap)."""
+        if self.terrain is not None and self.terrain_type is not None and not self.fixed_command:
+            capped = task.terrain_command_cap(_batch(self.command.copy()), torch.tensor([self.tile_level]),
+                                              self.terrain['slow_level'], self.terrain['slow_speed'])
+            self.command[:] = capped[0].numpy()
+
+    def _ground_terms(self):
+        """task_config terrain: the reward's heights above the ground under the body and the feet's ground normals,
+        reward_components' height (1,), foot_height (1, 2), sole spheres' height above the ground (1, 2, k) and
+        floor_normal (1, 2, 3)."""
+        feet = self.data.xpos[self.feet]
+        spheres = self.data.geom_xpos[self.soles]
+        return dict(height=_batch(self.pelvis_height()),
+                    foot_height=_batch(feet[:, 2]) - self._ground(feet[:, :2])[None],
+                    spheres=_batch(spheres[..., 2]) - self._ground(spheres[..., :2])[None],
+                    floor_normal=task.terrain_normal(torch.from_numpy(feet[None, :, :2].copy()), self.terrain_heights,
+                                                     self.terrain_corner, self.terrain_cell))
+
+    def pelvis_height(self):
+        """The pelvis height (m) the reward, the fall and the critic see: with task_config terrain above the ground
+        under it, or with its pelvis_support above the mean ground under the feet (task.pelvis_ground), else its world
+        height."""
+        if self.terrain is None:
+            return float(self.data.qpos[2])
+        ground = task.pelvis_ground(torch.as_tensor(np.asarray(self.data.qpos[:2], dtype=np.float64)),
+                                    torch.as_tensor(np.asarray(self.data.xpos[self.feet, :2], dtype=np.float64)),
+                                    self.terrain_heights, self.terrain_corner, self.terrain_cell, self.terrain_lift,
+                                    terrain_pelvis_support(self.terrain))
+        return float(self.data.qpos[2] - float(ground))
 
     def _arm_offsets(self, columns, poses):
         """(L, nu) offsets from home of library poses (L, len(columns)) of the joints `columns`; 0 elsewhere."""
@@ -580,18 +709,26 @@ class G1VelocityEnv(gym.Env):
 
     @property
     def keeps_training_state(self):
-        """Whether stages keep this task's training state (train.keeps_training_state): the load ceiling of arm_targets."""
-        return self.arm_targets
+        """Whether stages keep this task's training state (train.keeps_training_state): the load ceiling of arm_targets,
+        the terrain level of terrain."""
+        return self.arm_targets or self.terrain is not None
 
     def training_state(self):
-        """What a stage keeps of this training beyond the weights (arm_targets): the hand load ceiling m_max."""
-        return {'load_max': [self.load_max]}
+        """What a stage keeps of this training beyond the weights: the hand load ceiling m_max (arm_targets); the level
+        training resets take and the current tile type (terrain; one world, as the full-GPU task's per-world lists)."""
+        state = {'load_max': [self.load_max]} if self.arm_targets else {}
+        if self.terrain is not None:
+            state.update(terrain_level=[self.terrain_level],  # on the plane (a reset with a command): flat, 0
+                         terrain_type=[0 if self.terrain_type is None else self.terrain_type])
+        return state
 
     def restore_training_state(self, state, index=0, count=1):
-        """The hand load ceiling from a stage's training_state (their mean, within [0, LOAD_LIMIT]); nothing without
-        arm_targets or a saved ceiling."""
+        """The hand load ceiling from a stage's training_state (their mean, within [0, LOAD_LIMIT]); the terrain level
+        (saved_terrain_level: the median of the worlds' levels); nothing without the settings or saved values."""
         if self.arm_targets and 'load_max' in state:
             self.load_max = saved_load(state)
+        if self.terrain is not None and 'terrain_level' in state:
+            self.terrain_level = saved_terrain_level(state)
 
     def set_command(self, command):
         command = np.asarray(command, dtype=float)
@@ -604,6 +741,7 @@ class G1VelocityEnv(gym.Env):
         self.yaw_drift_error = torch.zeros(1, dtype=torch.float64)
         self.perturb_live, self.perturb_steps = False, 0  # evaluation and scenarios: the policy drives the arms
         self.push_live, self.push_left = False, 0  # and nothing pushes the pelvis
+        self.scan_noised = False  # and the height scan is exact
 
     def set_height(self, height):
         """Pelvis height command c (m, within the crouch table's range, CROUCH_HEIGHTS) from the next observation on
@@ -649,9 +787,23 @@ class G1VelocityEnv(gym.Env):
             mean += [0.] * len(columns)
             variance += [task.ARM_TARGET_VARIANCE[term] for term in task.ARM_BLIND_TERMS
                          for _ in range(len(columns) // len(task.ARM_BLIND_TERMS))]
+        if self.height_scan is not None:  # the actor's scan, then the critic's, at mean 0 (task.HEIGHT_SCAN_VARIANCE)
+            for columns, value in zip(self.scan_columns, (task.HEIGHT_SCAN_VARIANCE, task.CRITIC_SCAN_VARIANCE)):
+                positions += columns
+                mean += [0.] * len(columns)
+                variance += [value] * len(columns)
         if not positions:
             return None
         return np.array(positions, dtype=np.int64), np.array(mean), np.array(variance)
+
+    @property
+    def scan_columns(self):
+        """height_scan: positions in the observation of the actor's scan (right after the history) and of the critic's
+        (last), two lists; both empty without it."""
+        actor = self.frame_size * self.history
+        critic = self.observation_space.shape[0] - len(self.critic_grid)
+        return (list(range(actor, actor + len(self.scan_grid))),
+                list(range(critic, critic + len(self.critic_grid))))
 
     @property
     def arm_columns(self):
@@ -710,6 +862,9 @@ class G1VelocityEnv(gym.Env):
         command = task.sample_commands(1, uniform, previous=_batch(self.command.copy()) if resample else None,
                                        **self.commands)
         self.command[:] = command[0].numpy()
+        if self.terrain is not None:  # terrain: the cap of slow_level's tiles (deterministic, no draw)
+            self._cap_command()
+            command = _batch(self.command.copy())
         self.yaw_drift_error = torch.zeros(1, dtype=torch.float64)
         if self.commands.get('straight_probability') and bool(task.straight_walking(command)[0]):
             rotation = self.data.xmat[self.pelvis].reshape(3, 3)  # walk straight on from here
@@ -724,7 +879,10 @@ class G1VelocityEnv(gym.Env):
         return task.gait_phase(torch.tensor([self.steps + self.phase_steps]), self.dt, self.gait['period'])
 
     def _sole_height(self):
-        """(1, 2) lowest sole point of each foot, m."""
+        """(1, 2) lowest sole point of each foot, m; with task_config terrain above the ground under each sphere."""
+        if self.terrain is not None:
+            spheres = self.data.geom_xpos[self.soles]
+            return task.sole_height(_batch(spheres[..., 2]) - self._ground(spheres[..., :2])[None], self.sole_radius)
         return task.sole_height(_batch(self.data.geom_xpos[self.soles, 2]), self.sole_radius)
 
     def _self_contact_force(self):
@@ -772,9 +930,28 @@ class G1VelocityEnv(gym.Env):
             else:
                 self.frames[:, -1] = observed
             observed = task.history_observation(self.frames, self.model.nu, self.extra_sizes)
-        if self.critic_extras:
-            observed = torch.cat((observed, task.critic_extras(velocity, _batch(self.data.qpos[2]))), dim=1)
+        if self.height_scan is not None:  # the newest frame only, noised in a training episode (np_random)
+            scan = task.height_scan(*self._scan_pose(), self.scan_grid, *self._terrain_grid())
+            if self.scan_noised and self.height_scan['noise']:
+                scan = scan + task.scan_noise(lambda shape: torch.from_numpy(self.np_random.random(shape)), scan.shape,
+                                              self.height_scan['noise'])
+            observed = torch.cat((observed, scan), dim=1)
+        if self.critic_extras:  # the pelvis height above the ground under it with terrain (pelvis_height)
+            height = _batch(self.data.qpos[2]) if self.terrain is None else _batch(self.pelvis_height())
+            observed = torch.cat((observed, task.critic_extras(velocity, height)), dim=1)
+        if self.height_scan is not None:  # exact, around the pelvis, above the feet's ground
+            feet = torch.from_numpy(self.data.xpos[self.feet, :2].copy())[None]
+            observed = torch.cat((observed, task.critic_scan(*self._scan_pose(), feet, self.critic_grid,
+                                                             *self._terrain_grid())), dim=1)
         return observed[0].numpy().astype(np.float32)
+
+    def _scan_pose(self):
+        """height_scan: the pelvis position (1, 3) and rotation (1, 3, 3) its grids are laid around."""
+        return _batch(self.data.qpos[:3]), _batch(self.data.xmat[self.pelvis].reshape(3, 3))
+
+    def _terrain_grid(self):
+        """task.terrain_height's heights, corner, cell and lift of task_config terrain."""
+        return self.terrain_heights, self.terrain_corner, self.terrain_cell, self.terrain_lift
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -820,6 +997,8 @@ class G1VelocityEnv(gym.Env):
         self.data.qpos[3:7] = [1., 0., 0., 0.]
         self.data.qpos[self.qadr] = self.home + self.np_random.uniform(-.01, .01, self.model.nu)
         self.data.qvel[:] = 0
+        if self.terrain is not None:  # its own stream, so the draws above and below stay the old ones
+            self._terrain_reset(options, seed)
         self.steps = 0
         self.previous_action[:] = 0
         if (options or {}).get('command') is not None:
@@ -863,6 +1042,9 @@ class G1VelocityEnv(gym.Env):
             self.set_height(options['height'])
         elif self.height_command and options.get('command') is None:
             self._draw_height()
+        # height_scan: a training reset (no command given) noises the actor's scan, drawn with np_random in every
+        # observation from this one on, after every other draw; set_command ends it.
+        self.scan_noised = self.height_scan is not None and options.get('command') is None
         return self._observation('fill'), {'x_position': float(self.data.qpos[0])}
 
     def _target(self, action, offset=None):
@@ -890,6 +1072,10 @@ class G1VelocityEnv(gym.Env):
         if self.lock_wrists:
             action = task.lock_joints(_batch(action), self.wrist_mask)[0].numpy()
         return action
+
+    def _before_physics(self, pushes):
+        """A hook right before the step's physics, after the step's draws (world model collector, scripts/lab/wm):
+        pushes (frame_skip, 3) the pelvis force of each substep, None without a push. Does nothing here."""
 
     def step(self, action):
         action = np.asarray(action, dtype=float)
@@ -932,7 +1118,9 @@ class G1VelocityEnv(gym.Env):
             pushes, left = task.force_push_substeps(_batch(self.push_force), torch.tensor([self.push_left]),
                                                     self.frame_skip)
             pushes, self.push_left = pushes[0].numpy(), int(left[0])
+        self._before_physics(pushes)
         feet_before = self.data.xpos[self.feet, :2].copy()
+        pelvis_before = self.data.qpos[:2].copy()
         # self_contact: the largest robot-robot contact force of each substep, read after it (its contacts and
         # constraint forces), only while that weight is non-zero.
         self_force = np.zeros(self.frame_skip) if self.reward_weights['self_contact'] else None
@@ -989,28 +1177,44 @@ class G1VelocityEnv(gym.Env):
             if self.reward_weights['arm_error']:
                 arms.update(arm_error=torch.zeros(1, dtype=torch.float64) if error is None else error,
                             arm_hold=torch.tensor([hold]))
+        # terrain: the heights above the ground under the body and the feet's ground normals.
+        ground = {}
+        if self.terrain is not None:
+            ground = self._ground_terms()
+            sole = task.sole_height(ground['spheres'], self.sole_radius)
         # Rewarded for the command the policy observed when it chose this action.
         components, fell = task.reward_components(
-            _batch(velocity), _batch(self.data.xmat[self.pelvis].reshape(3, 3)), _batch(self.data.qpos[2]),
+            _batch(velocity), _batch(self.data.xmat[self.pelvis].reshape(3, 3)),
+            ground['height'] if ground else _batch(self.data.qpos[2]),
             _batch(self.observed_command), _batch(self.data.ctrl), _batch(action), _batch(self.previous_action),
-            _batch(self.data.xpos[self.feet, 2]), self._phase(), _batch(self.data.qpos[self.qadr]),
+            ground['foot_height'] if ground else _batch(self.data.xpos[self.feet, 2]), self._phase(),
+            _batch(self.data.qpos[self.qadr]),
             _batch(self.home), _batch(self.data.xmat[self.torso].reshape(3, 3)), weights=self.reward_weights,
             posture_joints=self.posture_joints, heading_target=_batch(self.heading_target),
             stance_fraction=self.gait['stance_fraction'], hip_joints=self.hip_joints,
             foot_speed=_batch(np.linalg.norm(self.data.xpos[self.feet, :2] - feet_before, axis=1) / self.dt),
             foot_rotation=_batch(self.data.xmat[self.feet].reshape(len(self.feet), 3, 3)),
-            sole_height=(self._sole_height() if self.sole_contact or self.reward_weights['clearance']
-                         else None), sole_contact=self.sole_contact,
+            sole_height=((sole if ground else self._sole_height())
+                         if self.sole_contact or self.reward_weights['clearance'] else None),
+            sole_contact=self.sole_contact,
             yaw_drift_error=yaw_drift, requested_command=_batch(self.command.copy()),
             self_contact=None if self_force is None else task.self_contact_share(_batch(self_force)),
             arm_press=arm_press, feet_flat_stance=self.feet_flat_stance, height_command=height_command,
-            stand_home=stand_home, **arms)
+            stand_home=stand_home, **arms, **({'floor_normal': ground['floor_normal']} if ground else {}))
         components = {key: float(value[0]) for key, value in components.items()}
         fell = bool(fell[0])
         info = dict(x_position=float(self.data.qpos[0]), fell=fell,
                     command=self.observed_command.copy(), velocity=velocity[3:5].copy(), reward_components=components)
         if self.height_command:
             info['height_command'] = self.height
+        if self.terrain is not None:  # the tile (None: the plane), and the path commanded and walked along it, m
+            commanded, walked = task.terrain_progress(_batch(self.data.qpos[:2] - pelvis_before),
+                                                      _batch(self.data.xmat[self.pelvis].reshape(3, 3)),
+                                                      _batch(self.command.copy()), self.dt)
+            self.terrain_path += [float(commanded[0]), float(walked[0])]
+            info.update(terrain_type=None if self.terrain_type is None else self.terrain_names[self.terrain_type],
+                        terrain_level=None if self.terrain_type is None else self.tile_level,
+                        terrain_path=self.terrain_path.copy(), pelvis_height=float(ground['height'][0]))
         if self.arm_targets:  # the flag, the arms' mean |error| (rad) with flag 1, the hand loads (kg), the hold
             info.update(arm_flag=offset is not None, hand_load=self.hand_load.copy(),
                         arm_error=None if error is None else float(error[0]), arm_track=float(tracked[0]),
@@ -1047,6 +1251,57 @@ class G1VelocityEnv(gym.Env):
         if self.renderer is not None:
             self.renderer.close()
             self.renderer = None
+
+
+def saved_terrain_level(state):
+    """The level (task_config terrain) the CPU task takes from a stage's training_state: the median of the worlds'
+    levels, checked whole numbers within [0, TERRAIN_LEVELS)."""
+    values = np.asarray(state['terrain_level'])
+    if values.ndim != 1 or not len(values) or not np.isin(values, np.arange(TERRAIN_LEVELS)).all():
+        raise ValueError('Invalid saved terrain levels')
+    return int(np.median(values) // 1)
+
+
+def restored_terrain_levels(state, types):
+    """(n,) levels (task_config terrain) for worlds of tile types `types` (n,) from a stage's training_state, type by
+    type: the saved levels of worlds of the same type (all saved levels if none had it; level 0 for a type the state
+    lists in terrain_new_types, carried_terrain_state's mark of a generator's new types) spread over this type's worlds
+    in order, so another world count keeps each type's distribution; checked as saved_terrain_level."""
+    saved_terrain_level(state)
+    levels = np.asarray(state['terrain_level'], dtype=np.int64)
+    kinds = np.asarray(state.get('terrain_type', np.zeros(len(levels))), dtype=np.int64)
+    if kinds.shape != levels.shape:
+        raise ValueError('Invalid saved terrain types')
+    new = set(state.get('terrain_new_types', ()))
+    types = np.asarray(types, dtype=np.int64)
+    result = np.zeros(len(types), dtype=np.int64)
+    for kind in np.unique(types):
+        worlds = np.flatnonzero(types == kind)
+        own = levels[kinds == kind]
+        own = own if len(own) else np.zeros(1, np.int64) if int(kind) in new else levels
+        result[worlds] = own[np.arange(len(worlds)) * len(own) // len(worlds)]
+    return result
+
+
+def carried_terrain_state(state, old_names, new_names):
+    """A stage's training_state (task_config terrain) moved from a generator with tile types old_names to one with
+    new_names (warm_start.carry_over): each world's tile type mapped by name (the same index for the types generator 3
+    shares with 2), worlds of a type the new generator lacks left out, and terrain_new_types listing the new types no
+    saved world had, which restored_terrain_levels starts at level 0. The same names: the state as it is."""
+    if not state or 'terrain_level' not in state or tuple(old_names) == tuple(new_names):
+        return state
+    levels = list(state['terrain_level'])
+    kinds = list(state.get('terrain_type', [0] * len(levels)))
+    if len(kinds) != len(levels) or any(not 0 <= kind < len(old_names) for kind in kinds):
+        raise ValueError('Invalid saved terrain types')
+    kept = [(level, new_names.index(old_names[kind])) for level, kind in zip(levels, kinds)
+            if old_names[kind] in new_names]
+    if not kept:  # no world on a shared type: the levels start afresh
+        return {key: value for key, value in state.items()
+                if key not in ('terrain_level', 'terrain_type', 'terrain_new_types')}
+    return {**{key: value for key, value in state.items() if key != 'terrain_new_types'},
+            'terrain_level': [level for level, _ in kept], 'terrain_type': [kind for _, kind in kept],
+            'terrain_new_types': [k for k, name in enumerate(new_names) if name not in old_names]}
 
 
 def saved_load(state):

@@ -16,7 +16,10 @@ runs/humanoid_lab/getup_track/<name>.npz (its md5 read from the file) with impac
 sees TRACK_CRITIC_EXTRAS more inputs.
 --settle-clip <name> (iteration 66; repeated for several clips): the settling mode, task_config settle_clip of those
 clips (their md5s read from the files): from any fall pose into the nearest of their first frames, impact 2,
-sole_impact 1, assist 0; the contract the getting-up one's."""
+sole_impact 1, assist 0; the contract the getting-up one's.
+--settle-success <JSON>, --settle-starts <JSON> (iteration 85; with --settle-clip): task_config settle_success (the
+success by joints) and settle_starts (a share of the starts from the target pose with noise, the rest from the bank's
+classes), checked by the lab's schema."""
 import argparse
 import json
 import sys
@@ -44,9 +47,17 @@ parser.add_argument('--track-clip', metavar='NAME',
 parser.add_argument('--settle-clip', metavar='NAME', action='append', default=[],
                     help='укладка в первый кадр клипа runs/humanoid_lab/getup_track/<NAME>.npz (итерация 66; '
                          'несколько раз — цель ближайший из кадров)')
+parser.add_argument('--settle-success', metavar='JSON',
+                    help='укладка: успех по суставам, task_config settle_success (итерация 85), например '
+                         '\'{"pelvis_degrees": 10, "arm_joint": 0.35, "mean": 0.15, "still": 0.3}\'')
+parser.add_argument('--settle-starts', metavar='JSON',
+                    help='укладка: старты от цели, task_config settle_starts (итерация 85), например '
+                         '\'{"target": 0.5, "noise": 1, "classes": ["front"]}\'')
 args = parser.parse_args()
 if args.track_clip and args.settle_clip:
     raise SystemExit('--track-clip и --settle-clip — разные задачи, выберите одну')
+if (args.settle_success or args.settle_starts) and not args.settle_clip:
+    raise SystemExit('--settle-success и --settle-starts — настройки укладки: нужен --settle-clip')
 
 task_config = {}
 if args.track_clip:  # iteration 64: follow a human clip, the hardware's impact terms kept
@@ -58,6 +69,12 @@ if args.settle_clip:  # iteration 66: settle into the nearest clip start, the ha
     from humanoid_sim.tasks import g1_getup_track
     task_config = dict(settle_clip=[{'file': name, 'md5': g1_getup_track.load(name)['md5']} for name in args.settle_clip],
                        assist_force=0., reward_weights={'impact': 2., 'sole_impact': 1.})
+    for key, text in (('settle_success', args.settle_success), ('settle_starts', args.settle_starts)):
+        if text:  # iteration 85: the success by joints, the starts from the target (validate_config checks them)
+            try:
+                task_config[key] = json.loads(text)
+            except json.JSONDecodeError as error:
+                raise SystemExit(f'--{key.replace("_", "-")}: не JSON ({error})')
 config = dict(name=args.name, backend='full_gpu', envs=4096, steps=1_000_000_000, hours=3, every=10_000_000, seed=42,
               preset='custom', robot_id='g1_29dof', task_id='g1_getup', task_config=task_config, max_std=1.,
               mirror_coef=0., **RECIPE)
@@ -106,6 +123,9 @@ if args.settle_clip:
     note = (f'Корень укладки g1_getup (итерация 66): из любой позы падения в ближайший первый кадр клипов {clips}, '
             f'impact 2, sole_impact 1, без подтяжки, full_gpu, {checked["envs"]} сред, рецепт PPO ходьбы '
             f'({json.dumps(ppo, ensure_ascii=False)}), начальная σ {INITIAL_STD:g}, сеть {NET_ARCH}. {args.note}')
+    for key, title in (('settle_success', 'успех по суставам'), ('settle_starts', 'старты от цели')):
+        if checked['task_config'][key] is not None:
+            note += f' {title} (итерация 85): {json.dumps(checked["task_config"][key], ensure_ascii=False)}.'
 if args.dry_run:
     _, info = first_stage()
     print('dry run, nothing created:', checked['name'])

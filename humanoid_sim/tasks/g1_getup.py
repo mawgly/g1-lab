@@ -21,7 +21,11 @@ g1_getup_style; g1_tensor_math.style_features / style_distance); head_rise (iter
 than GETUP_HEAD_RISE_SPEED (g1_tensor_math.head_rise). With task_config track_clip (iteration 64) the task is motion
 tracking instead (BeyondMimic / mjlab): the policy follows one human clip getting up (g1_getup_track), then holds its
 last frame; the tracking terms replace the getting-up ones, mjlab's terminations end an episode early, the critic also
-sees the clip's phase and the anchor's errors (_clip_reset, _clip_step). With task_config settle_clip (iteration 66)
+sees the clip's phase and the anchor's errors (_clip_reset, _clip_step). With task_config track_clips (iteration 78) one
+policy follows many clips, one per episode (_select_clip), the critic also seeing the reference ahead
+(g1_tensor_math.track_clips_critic_extras). With task_config track_handover_starts (iteration 83) a share of the
+training resets starts from the state another getting-up policy hands over in (g1_getup_handover). With task_config
+settle_clip (iteration 66)
 the task is settling instead: from the bank's fall classes the policy rolls and lays its limbs into the nearest of the
 clips' first frames, where a tracker of that clip takes over (_settle_reset, _settle_step; the success the switch).
 Equations live in g1_tensor_math, shared with the CUDA task.
@@ -34,10 +38,10 @@ import mujoco
 import numpy as np
 import torch
 
-from . import g1_getup_bank, g1_getup_human, g1_getup_style, g1_getup_track
+from . import g1_getup_bank, g1_getup_handover, g1_getup_human, g1_getup_style, g1_getup_track
 from . import g1_tensor_math as task
 from .config import (G1_GETUP_DEFAULTS, G1_GETUP_PROFILE, G1_GETUP_SETTLE_WEIGHTS, G1_GETUP_TRACK_WEIGHTS,
-                     GETUP_CRITIC_EXTRAS, TRACK_CRITIC_EXTRAS, g1_getup_config)
+                     GETUP_CRITIC_EXTRAS, TRACK_CLIPS_CRITIC_EXTRAS, TRACK_CRITIC_EXTRAS, g1_getup_config)
 from .g1_getup_bank import instabilities
 from .g1_velocity import G1VelocityEnv
 
@@ -45,6 +49,8 @@ EPISODE_STEPS = round(task.GETUP_EPISODE_SECONDS / .02)  # 500 at the walking co
 SETTLE_STEPS = round(task.SETTLE_EPISODE_SECONDS / .02)  # 350: settle_clip's episodes
 # human_starts on CUDA: the human start draws come from a generator of their own, seeded seed + this.
 HUMAN_START_STREAM = 56_000_000
+# track_handover_starts on CUDA: the hand-over start draws come from a generator of their own, seeded seed + this.
+HANDOVER_START_STREAM = 83_000_000
 HIP_ROLL_PART = 'hip_roll'  # task_config hip_roll_out's joints, by name
 
 
@@ -84,8 +90,12 @@ class G1GetupEnv(G1VelocityEnv):
     velocities: reference state init) and track_noise (default true: mjlab's start noise on a clip start); start is
     then a bank row the reference is aligned to (track_align); without any of them a training reset draws its start
     (TRACK_START_SHARES), an evaluation one (assist force or bound set) starts from the clip's first frame with noise.
-    With settle_clip: start (any bank row; default a training row of SETTLE_CLASSES), assist_force, pd_bound and the
-    randomization options as above."""
+    With track_clip also track_handover (_handover_state: a row of the hand-over bank or a probe's own state, as
+    track_handover_starts' training starts: no noise, the actions in flight given, the clock at the bank's frame).
+    With track_clips also track_clip_index (the clip of this episode, with track_frame its frame, alone its first
+    frame; not with start, whose clip is its nearest); without it track_frame is the first clip's, an evaluation reset
+    draws its clip uniformly and a training one draws as track_clip's over every clip (_clip_reset). With settle_clip: start (any bank row; default a training row of SETTLE_CLASSES), assist_force, pd_bound and the
+    randomization options as above, settle_target (a target's index or True: a settle_starts target start)."""
 
     keeps_training_state = True  # stages save its assist force and bound (training_state), resumed runs restore them
     asymmetric_critic = True  # the actor sees the first actor_inputs only (policies.CriticExtrasPolicy), on CPU too
@@ -100,11 +110,23 @@ class G1GetupEnv(G1VelocityEnv):
                  human_starts=G1_GETUP_DEFAULTS['human_starts'], human_bank=None,
                  stance_pelvis=G1_GETUP_DEFAULTS['stance_pelvis'], hip_roll_out=G1_GETUP_DEFAULTS['hip_roll_out'],
                  track_clip=G1_GETUP_DEFAULTS['track_clip'], track_bank=None,
-                 settle_clip=G1_GETUP_DEFAULTS['settle_clip'], settle_bank=None):
-        # style_judge and the amp weight act on the full-GPU path only (g1_getup_tensor_env, getup_amp): validated
-        # here, nothing on the CPU. human_bank: the human starts (g1_getup_human.load's dict; tests) instead of the file
+                 settle_clip=G1_GETUP_DEFAULTS['settle_clip'], settle_bank=None,
+                 track_starts=G1_GETUP_DEFAULTS['track_starts'], track_noise=G1_GETUP_DEFAULTS['track_noise'],
+                 track_bank_classes=G1_GETUP_DEFAULTS['track_bank_classes'],
+                 track_bank_nearest=G1_GETUP_DEFAULTS['track_bank_nearest'],
+                 track_sampling=G1_GETUP_DEFAULTS['track_sampling'],
+                 track_clips=G1_GETUP_DEFAULTS['track_clips'], track_clips_bank=None,
+                 track_end_reach=G1_GETUP_DEFAULTS['track_end_reach'],
+                 track_weights=G1_GETUP_DEFAULTS['track_weights'],
+                 track_handover_starts=G1_GETUP_DEFAULTS['track_handover_starts'], handover_bank=None,
+                 settle_success=G1_GETUP_DEFAULTS['settle_success'],
+                 settle_starts=G1_GETUP_DEFAULTS['settle_starts']):
+        # style_judge, the amp weight and track_sampling act on the full-GPU path only (g1_getup_tensor_env,
+        # getup_amp): validated here, nothing on the CPU. human_bank: the human starts (g1_getup_human.load's dict; tests) instead of the file
         # human_starts names; track_bank likewise the clip (g1_getup_track's arrays) instead of the file track_clip names;
-        # settle_bank the clips (a list, in settle_clip's order) instead of the files settle_clip names.
+        # settle_bank the clips (a list, in settle_clip's order) instead of the files settle_clip names; track_clips_bank
+        # the clips (a list, in track_clips' order) instead of the files track_clips names; handover_bank the hand-over
+        # bank (g1_getup_handover's dict with its header) instead of the file track_handover_starts names.
         settings = g1_getup_config(dict(reward_weights=reward_weights or {}, assist_force=assist_force,
                                         action_delay=action_delay, motor_friction=motor_friction,
                                         body_friction=list(body_friction), pd_bound=pd_bound,
@@ -112,7 +134,13 @@ class G1GetupEnv(G1VelocityEnv):
                                         action_change_unbounded=action_change_unbounded,
                                         style_library=style_library, style_judge=style_judge,
                                         human_starts=human_starts, stance_pelvis=stance_pelvis,
-                                        hip_roll_out=hip_roll_out, track_clip=track_clip, settle_clip=settle_clip))
+                                        hip_roll_out=hip_roll_out, track_clip=track_clip, settle_clip=settle_clip,
+                                        track_starts=track_starts, track_noise=track_noise,
+                                        track_bank_classes=track_bank_classes,
+                                        track_bank_nearest=track_bank_nearest, track_sampling=track_sampling,
+                                        track_clips=track_clips, track_end_reach=track_end_reach,
+                                        track_weights=track_weights, track_handover_starts=track_handover_starts,
+                                        settle_success=settle_success, settle_starts=settle_starts))
         if settings['settle_clip'] is not None:  # settling episodes are shorter (SETTLE_EPISODE_SECONDS)
             max_episode_steps = min(max_episode_steps, SETTLE_STEPS)
         super().__init__(max_episode_steps, render_mode, action_delay=settings['action_delay'],
@@ -212,12 +240,49 @@ class G1GetupEnv(G1VelocityEnv):
         # checked; track_bank: a clip's arrays instead, tests); None while off: nothing loaded, the task the old one.
         self.track_clip = settings['track_clip']
         self.clip = None
+        # Its training starts (iteration 68): the shares of TRACK_START_KINDS (track_starts; TRACK_START_SHARES while
+        # missing), the clip starts' noise multiple (track_noise), the bank classes a bank start draws from
+        # (track_bank_classes; TRACK_BANK_CLASS alone while missing) and whether it starts at its nearest clip frame.
+        starts = settings['track_starts']
+        self.track_shares = task.TRACK_START_SHARES if starts is None else tuple(starts[key] for key in (
+            'first', 'rsi', 'bank'))
+        self.track_noise = settings['track_noise']
+        self.track_classes = tuple(settings['track_bank_classes'] or (task.TRACK_BANK_CLASS,))
+        self.track_nearest = settings['track_bank_nearest']
+        # track_sampling (iteration 77): the RSI starts' bins by difficulty (g1_tensor_math.TrackBinSampler). Kept for
+        # the CUDA task, which reads it here and acts on it; this task does not: one world's own episodes, a separate
+        # estimate in every SubprocVecEnv process, and its training resets are also evaluate_stage's, which must stay
+        # uniform. So a CPU run with the setting trains with the uniform RSI, its draws bit for bit the old ones.
+        self.track_sampling = settings['track_sampling']
+        # track_end_reach (iteration 78): an ankle farther than this (m) from its place in the re-anchored clip ends the
+        # episode (task.track_reach_distance of TRACK_REACH_BODIES); None while off: nothing computed.
+        self.track_reach = settings['track_end_reach']
+        # track_weights (iteration 80): the tracking weights over G1_GETUP_TRACK_WEIGHTS (_setup_clip); None: the
+        # constant's.
+        self.track_overrides = settings['track_weights'] or {}
+        # track_handover_starts (iteration 83): {share, file, md5} or None; the hand-over bank (g1_getup_handover.load
+        # of the setting's file, its md5 checked; handover_bank: its dict instead, tests), read at the first reset that
+        # needs it (the handover property, which checks its clip against track_clip's); None while off: nothing read.
+        self.track_handover = settings['track_handover_starts']
+        self._handover = handover_bank
+        self.handover_row = None  # this episode's hand-over row (-2: a probe's own state), None for another start
         if self.track_clip is not None:
             self._setup_clip(track_bank if track_bank is not None
                              else g1_getup_track.load(self.track_clip['file'], self.track_clip['md5']))
+        # track_clips (iteration 78): many clips, one per episode (each md5 checked; clips: their constants, _setup_clips);
+        # None while off: nothing loaded.
+        self.track_clips = settings['track_clips']
+        self.clips = None
+        if self.track_clips is not None:
+            self._setup_clips(track_clips_bank if track_clips_bank is not None
+                              else [g1_getup_track.load(entry['file'], entry['md5']) for entry in self.track_clips])
         # settle_clip (iteration 66): the clips whose first frames are the settling targets (each md5 checked);
         # None while off: nothing loaded, the task the old one.
         self.settle_clip = settings['settle_clip']
+        # settle_success, settle_starts (iteration 85): the success rule by joints and the starts from the target
+        # (_setup_settle); None while off: the old rule and starts, bit for bit.
+        self.settle_success = settings['settle_success']
+        self.settle_starts = settings['settle_starts']
         self.settle = None
         if self.settle_clip is not None:
             self._setup_settle(settle_bank if settle_bank is not None
@@ -231,7 +296,7 @@ class G1GetupEnv(G1VelocityEnv):
         target and still (settle_count), when the success came (settle_at, s; None before) and into which target."""
         if len(clips) != len(self.settle_clip):
             raise ValueError('settle_clip: one clip per setting entry')
-        gravity, position = [], []
+        gravity, position, starts = [], [], []
         for clip in clips:
             g1_getup_track.check(clip)
             first = np.asarray(clip['qpos'][0], dtype=np.float64)
@@ -239,12 +304,24 @@ class G1GetupEnv(G1VelocityEnv):
             mujoco.mju_quat2Mat(rotation, first[3:7] / np.linalg.norm(first[3:7]))
             gravity.append(task.projected_gravity(rotation.reshape(1, 3, 3))[0])
             position.append(first[7:])
-        self.settle = dict(gravity=np.array(gravity), position=np.array(position),
+            starts.append(first)
+        # qpos: each target's whole first frame (settle_starts' target starts).
+        self.settle = dict(gravity=np.array(gravity), position=np.array(position), qpos=np.array(starts),
                            names=tuple(entry['file'] for entry in self.settle_clip))
         self.settle_joints = self.style_joints  # the free joints
+        # settle_success: the free arm joints every one of which the rule bounds (as arm_press's: shoulders, elbows,
+        # wrist roll).
+        self.settle_arms = self.press_joints
         self.settle_weights = {**G1_GETUP_SETTLE_WEIGHTS, 'impact': self.getup_weights['impact'],
                                'sole_impact': self.getup_weights['sole_impact']}
-        self.settle_hold = round(task.SETTLE_DONE_SECONDS / self.dt)
+        self.settle_hold = task.settle_hold_steps(self.dt, self.settle_success)
+        # settle_starts: the bank classes of the bank starts, the target starts' joint ranges and their own stream
+        # (seeded by a reset's seed, never drawn from np_random); this episode's start class.
+        self.settle_classes = (task.SETTLE_CLASSES if self.settle_starts is None
+                               else tuple(self.settle_starts['classes']))
+        self.range_low, self.range_high = (self.model.jnt_range[self.joints, 0].copy(),
+                                           self.model.jnt_range[self.joints, 1].copy())
+        self.settle_random = None
         self.self_force = np.zeros(self.frame_skip) if self.settle_weights['self_contact'] else None
         names = [self.model.body(b).name for b in range(self.model.nbody)]
         self.hand_geoms = self.robot_geoms & np.array([task.TRACK_HAND_PART in names[b] for b in self.model.geom_bodyid])
@@ -256,7 +333,8 @@ class G1GetupEnv(G1VelocityEnv):
         """track_clip's constants and state: the clip and its reference frames (g1_getup_track.hold_frames), its last
         frame and the clock that ends an episode (TRACK_HOLD_SECONDS later), the tracked bodies (TRACK_BODIES' ids, the
         anchor's and the ends' indices among them), the hand geoms (rollout/hand_force: bodies named TRACK_HAND_PART),
-        the weights (G1_GETUP_TRACK_WEIGHTS with reward_weights' impact and sole_impact), the critic's wider
+        the weights (G1_GETUP_TRACK_WEIGHTS with track_weights' overrides and reward_weights' impact and
+        sole_impact; a zero self_contact reads no contact forces for it), the critic's wider
         observation; no assist (0 N, no curriculum). Per episode: the clip clock (control steps from the clip's start),
         the reference's yaw and xy offset, how it started and whether the clock reached the clip's last frame."""
         g1_getup_track.check(clip)
@@ -265,24 +343,123 @@ class G1GetupEnv(G1VelocityEnv):
         self.clip_last = len(clip['qpos']) - 1
         self.clip_end = self.clip_last + round(task.TRACK_HOLD_SECONDS / self.dt)
         self.clip_grace = round(task.TRACK_GRACE_SECONDS / self.dt)  # a bank start's steps without the ends' rule
+        # A hand-over start's grace: the ends' and reach rules' steps, with track_handover_starts' grace the anchor's too
+        # (handover_body).
+        grace = None if self.track_handover is None else self.track_handover.get('grace')
+        self.handover_grace = round((task.TRACK_HANDOVER_GRACE_SECONDS if grace is None else grace) / self.dt)
+        self.handover_body = grace is not None
         names =[self.model.body(b).name for b in range(self.model.nbody)]
         self.track_bodies = np.array([self.model.body(name).id for name in task.TRACK_BODIES])
         self.track_anchor = task.TRACK_BODIES.index(task.TRACK_ANCHOR)
         self.track_ends = tuple(task.TRACK_BODIES.index(name) for name in task.TRACK_END_BODIES)
+        self.track_reach_bodies = tuple(task.TRACK_BODIES.index(name) for name in task.TRACK_REACH_BODIES)
         self.track_root = int(self.model.body_rootid[self.pelvis])
         self.hand_geoms = self.robot_geoms & np.array([task.TRACK_HAND_PART in names[b] for b in self.model.geom_bodyid])
-        self.track_weights = {**G1_GETUP_TRACK_WEIGHTS, 'impact': self.getup_weights['impact'],
-                              'sole_impact': self.getup_weights['sole_impact']}
+        self.track_weights = {**G1_GETUP_TRACK_WEIGHTS, **self.track_overrides,
+                              'impact': self.getup_weights['impact'], 'sole_impact': self.getup_weights['sole_impact']}
         self.self_force = np.zeros(self.frame_skip) if self.track_weights['self_contact'] else None
         # The joint ranges a noisy clip start keeps the joints in (task.track_start_pose).
         self.range_low, self.range_high = (self.model.jnt_range[self.joints, 0].copy(),
                                            self.model.jnt_range[self.joints, 1].copy())
         self.observation_space = spaces.Box(-np.inf, np.inf, (
             self.actor_inputs + GETUP_CRITIC_EXTRAS + TRACK_CRITIC_EXTRAS,), dtype=np.float32)
+        # track_bank_nearest: the clip frames' pelvis projected gravity (K, 3), joints (K, 29) and anchor height (K,)
+        # (task.track_nearest_frame; the pelvis is TRACK_BODIES' first), the free joints compared.
+        frames = slice(0, self.clip_last + 1)
+        self.clip_gravity = task.projected_gravity(self.clip_frames['rot'][frames, 0])
+        self.clip_joints = np.asarray(clip['qpos'], dtype=np.float64)[:, 7:]
+        self.clip_anchor_height = self.clip_frames['pos'][frames, self.track_anchor, 2]
+        self.nearest_joints = tuple(int(j) for j in np.flatnonzero(~self.wrist_mask.numpy()))
         self.assist = 0.
-        self.clip_rows = None  # the bank's training rows lying on the back (TRACK_BANK_CLASS), read at a reset
+        # The bank's training rows of track_classes (TRACK_BANK_CLASS, the back's, while track_bank_classes is
+        # missing), read at a reset.
+        self.clip_rows = None
         self.clip_clock, self.clip_yaw, self.clip_offset = 0, 0., np.zeros(2)
         self.clip_start, self.clip_frame, self.clip_reached = None, 0, False
+
+    def _setup_clips(self, clips):
+        """track_clips' constants: _setup_clip's of the first clip (the tracked bodies, weights, joint ranges and hand
+        geoms are every clip's), then per clip (in track_clips' order) its arrays, reference frames
+        (g1_getup_track.hold_frames), last frame, end, qpos with its hold row, the frames' pelvis gravity, joints and
+        anchor heights, its start class (task.track_start_class of its first frame) and name; every clip's RSI frames
+        laid one after another (rsi_starts, rsi_frames: task.track_clip_frames) with their clip, pelvis gravity, joints,
+        anchor height and clip class (clips_frame_*: a bank start's nearest frame, task.track_nearest_clip); the critic's
+        wider observation (TRACK_CLIPS_CRITIC_EXTRAS) and the steps of the reference ahead (task.track_future_steps);
+        this episode's clip (_select_clip: the first until a reset picks one)."""
+        if len(clips) != len(self.track_clips):
+            raise ValueError('track_clips: one clip per setting entry')
+        self._setup_clip(clips[0])
+        hold = round(task.TRACK_HOLD_SECONDS / self.dt)
+        self.clips = []
+        for entry, clip in zip(self.track_clips, clips):
+            g1_getup_track.check(clip)
+            frames = g1_getup_track.hold_frames(clip)
+            last = len(clip['qpos']) - 1
+            gravity = task.projected_gravity(frames['rot'][:last + 1, 0])
+            qpos = np.asarray(clip['qpos'], dtype=np.float64)
+            self.clips.append(dict(clip=clip, frames=frames, last=last, end=last + hold, gravity=gravity,
+                                   joints=qpos[:, 7:], anchor_height=frames['pos'][:last + 1, self.track_anchor, 2],
+                                   qpos=np.concatenate([qpos, qpos[-1:]]),
+                                   start_class=int(task.track_start_class(gravity[:1])[0]), name=entry['file']))
+        self.rsi_starts, self.rsi_frames = task.track_clip_frames([entry['last'] + 1 for entry in self.clips])
+        self.clips_frame_clip = np.concatenate([np.full(entry['last'] + 1, c) for c, entry in enumerate(self.clips)])
+        self.clips_frame_gravity = np.concatenate([entry['gravity'] for entry in self.clips])
+        self.clips_frame_joints = np.concatenate([entry['joints'] for entry in self.clips])
+        self.clips_frame_anchor = np.concatenate([entry['anchor_height'] for entry in self.clips])
+        self.clip_classes = np.array([entry['start_class'] for entry in self.clips])
+        self.clips_frame_class = self.clip_classes[self.clips_frame_clip]
+        self.future_steps = task.track_future_steps(self.dt)
+        self.observation_space = spaces.Box(-np.inf, np.inf, (
+            self.actor_inputs + GETUP_CRITIC_EXTRAS + TRACK_CLIPS_CRITIC_EXTRAS,), dtype=np.float32)
+        self._nearest_data = mujoco.MjData(self.model)
+        self._select_clip(0)
+
+    def _select_clip(self, index):
+        """Clip `index` of track_clips as this episode's: clip, clip_frames, clip_last, clip_end and the nearest-frame
+        arrays (clip_gravity, clip_joints, clip_anchor_height), which the single clip's code and the probes read."""
+        entry = self.clips[index]
+        self.clip_index = int(index)
+        self.clip, self.clip_frames = entry['clip'], entry['frames']
+        self.clip_last, self.clip_end = entry['last'], entry['end']
+        self.clip_gravity, self.clip_joints = entry['gravity'], entry['joints']
+        self.clip_anchor_height = entry['anchor_height']
+
+    def bank_row_poses(self, rows):
+        """(gravity (n, 3), joints (n, 29), anchor height (n,), start class (n,)) of bank rows as a reset puts them
+        (the quaternion normalized), by mj_kinematics in a data of its own: the pelvis gravity (task.projected_gravity),
+        the joints, the anchor's height and TRACK_CLASSES' index of the row's bank class (−1: fall, sit, stand), what
+        task.track_nearest_clip compares (track_clips; the CUDA task's table of its bank rows too)."""
+        bank, data = self.bank, self._nearest_data
+        anchor = self.track_bodies[self.track_anchor]
+        gravity, joints, heights = [], [], []
+        for row in rows:
+            qpos = bank['qpos'][row].copy()
+            qpos[3:7] /= np.linalg.norm(qpos[3:7])
+            data.qpos[:] = qpos
+            mujoco.mj_kinematics(self.model, data)
+            gravity.append(task.projected_gravity(data.xmat[self.pelvis].reshape(1, 3, 3))[0])
+            joints.append(data.qpos[self.qadr].copy())
+            heights.append(float(data.xpos[anchor, 2]))
+        names = [bank['classes'][int(c)] for c in bank['start_class'][np.asarray(rows, dtype=np.int64)]]
+        classes = np.array([task.TRACK_CLASSES.index(name) if name in task.TRACK_CLASSES else -1 for name in names],
+                           dtype=np.int64)
+        return (np.array(gravity).reshape(-1, 3), np.array(joints).reshape(-1, self.model.nu), np.array(heights),
+                classes)
+
+    def _bank_clip(self, row):
+        """(clip, frame) of track_clips' bank start from bank row `row`: the nearest frame among the clips of its class
+        (task.track_nearest_clip on bank_row_poses), or where none lies within the anchor's reach frame 0 of a clip of
+        its class drawn uniformly (any clip where none has its class)."""
+        gravity, joints, anchor, start_class = self.bank_row_poses([row])
+        frame, found = task.track_nearest_clip(gravity, joints, anchor, start_class, self.clips_frame_gravity,
+                                               self.clips_frame_joints, self.clips_frame_anchor,
+                                               self.clips_frame_class, self.nearest_joints)
+        if found[0]:
+            clip, local = task.track_locate(frame, self.rsi_starts)
+            return int(clip[0]), int(local[0])
+        candidates = np.flatnonzero(self.clip_classes == start_class[0])
+        candidates = candidates if len(candidates) else np.arange(len(self.clips))
+        return int(candidates[self.np_random.integers(len(candidates))]), 0
 
     def _clip_reference(self):
         """(1, B, …) the reference at this episode's clip clock (task.clip_reference)."""
@@ -298,9 +475,21 @@ class G1GetupEnv(G1VelocityEnv):
                 angular[None].copy())
 
     def _clip_extras(self):
-        """(1, TRACK_CRITIC_EXTRAS) the critic's track_clip inputs (task.track_critic_extras)."""
+        """(1, TRACK_CRITIC_EXTRAS) the critic's track_clip inputs (task.track_critic_extras); with track_clips (1,
+        TRACK_CLIPS_CRITIC_EXTRAS), the reference ahead too (task.track_clips_critic_extras)."""
         anchor = self.track_bodies[self.track_anchor]
         position, rotation, _, _ = self._clip_reference()
+        if self.clips is not None:
+            index = np.minimum(np.array([self.clip_clock + steps for steps in self.future_steps]), self.clip_last + 1)
+            ahead, turned, _, _ = task.clip_reference(self.clip_frames, index, np.full(len(index), self.clip_yaw),
+                                                      np.repeat(self.clip_offset[None], len(index), 0))
+            free = list(self.nearest_joints)
+            joints = self.clips[self.clip_index]['qpos'][index][:, 7:][:, free] - self.home[free]
+            return task.track_clips_critic_extras(
+                np.array([self.clip_clock]), np.array([self.clip_last]), np.array([self.clip_end]), self.dt,
+                self.data.xpos[anchor][None], self.data.xmat[anchor].reshape(1, 3, 3), position[:, self.track_anchor],
+                rotation[:, self.track_anchor], ahead[None, :, self.track_anchor], turned[None, :, self.track_anchor],
+                joints[None])
         return task.track_critic_extras(np.array([self.clip_clock]), self.clip_last, self.data.xpos[anchor][None],
                                         self.data.xmat[anchor].reshape(1, 3, 3), position[:, self.track_anchor],
                                         rotation[:, self.track_anchor])
@@ -326,6 +515,21 @@ class G1GetupEnv(G1VelocityEnv):
         return self._bank
 
     @property
+    def track_rows(self):
+        """track_clip's bank starts: the bank's training rows of track_classes (track_bank_classes; the back's alone
+        while it is missing), read at the first bank start."""
+        if self.clip_rows is None:
+            bank = self.bank
+            missing = [name for name in self.track_classes if name not in bank['classes']]
+            if missing:
+                raise ValueError(f"the start bank has no class {', '.join(missing)}")
+            classes = [bank['classes'].index(name) for name in self.track_classes]
+            self.clip_rows = np.flatnonzero(~bank['holdout'] & np.isin(bank['start_class'], classes))
+            if not len(self.clip_rows):
+                raise ValueError('the start bank has no training row of track_bank_classes')
+        return self.clip_rows
+
+    @property
     def human(self):
         """The human starts (g1_getup_human.load of the file human_starts names, md5 checked), read when first needed."""
         if self._human is None:
@@ -333,10 +537,59 @@ class G1GetupEnv(G1VelocityEnv):
         return self._human
 
     @property
+    def handover(self):
+        """The hand-over bank (g1_getup_handover.load of the file track_handover_starts names, md5 checked), read when
+        first needed; its clip must be this task's (track_clip's md5) and its clock frame one of the clip's."""
+        if self._handover is None:
+            if self.track_handover is None:
+                raise ValueError('hand-over starts from the bank need task_config track_handover_starts')
+            self._handover = g1_getup_handover.load(self.track_handover['file'], self.track_handover['md5'])
+        header = self._handover['header']
+        if self.track_clip is None or header['clip']['md5'] != self.track_clip['md5']:
+            raise ValueError(f"hand-over bank of clip {header['clip']['file']} ({header['clip']['md5']}), the task "
+                             f"follows {None if self.track_clip is None else self.track_clip['file']}")
+        if not 0 <= header['frame'] <= self.clip_last:
+            raise ValueError(f"hand-over bank frame {header['frame']} is not a frame of the clip")
+        return self._handover
+
+    def _handover_state(self, start):
+        """(qpos, qvel, actions in flight (k, 29) newest first, clock frame, row) of a hand-over start: a row of the
+        hand-over bank (int; its frame the bank's), or a probe's own state, a dict of qpos, qvel, actions (the first
+        policy's last applied actions, newest first; missing: none, zeros in flight) and frame (missing: the bank's),
+        row −2."""
+        if isinstance(start, dict):
+            if set(start) - {'qpos', 'qvel', 'actions', 'frame'} or 'qpos' not in start or 'qvel' not in start:
+                raise ValueError('track_handover must be a hand-over bank row or {qpos, qvel[, actions][, frame]}')
+            qpos = np.array(start['qpos'], dtype=np.float64)
+            qvel = np.array(start['qvel'], dtype=np.float64)
+            actions = np.array(start.get('actions', np.zeros((0, self.model.nu))), dtype=np.float64).reshape(
+                -1, self.model.nu)
+            frame = start['frame'] if 'frame' in start else self.handover['header']['frame']
+            if qpos.shape != (self.model.nq,) or qvel.shape != (self.model.nv,) or not np.isfinite(qpos).all() \
+                    or not np.isfinite(qvel).all() or not np.isfinite(actions).all():
+                raise ValueError('track_handover: qpos (nq,), qvel (nv,) and actions (k, nu), finite')
+            if isinstance(frame, bool) or not isinstance(frame, (int, np.integer)) or not 0 <= frame <= self.clip_last:
+                raise ValueError('track_handover frame must be a frame of the clip')
+            return qpos, qvel, actions, int(frame), -2
+        bank = self.handover
+        if isinstance(start, bool) or not isinstance(start, (int, np.integer)) or not 0 <= start < len(bank['qpos']):
+            raise ValueError('track_handover must be a row of the hand-over bank')
+        return (bank['qpos'][start].copy(), bank['qvel'][start].copy(), np.array(bank['actions'][start]),
+                int(bank['header']['frame']), int(start))
+
+    @property
     def fixed_normalization(self):
-        """The command and gait phase columns (task.zero_term_columns, always 0 here) at mean 0, variance 1."""
+        """The command and gait phase columns (task.zero_term_columns, always 0 here) at mean 0, variance 1; with
+        track_clips also the critic columns it adds after track_clip's (the seconds left, the reference ahead) at
+        task.track_clips_normalization's (a stage moved there by warm_start.insert_terms would never estimate them)."""
         columns = task.zero_term_columns(self.model.nu, self.history, self.extra_sizes)
-        return np.array(columns, dtype=np.int64), np.zeros(len(columns)), np.ones(len(columns))
+        fixed = np.array(columns, dtype=np.int64), np.zeros(len(columns)), np.ones(len(columns))
+        if self.clips is None:
+            return fixed
+        first = self.actor_inputs + GETUP_CRITIC_EXTRAS + TRACK_CRITIC_EXTRAS
+        mean, variance = task.track_clips_normalization()
+        return (np.concatenate([fixed[0], np.arange(first, first + len(mean))]), np.concatenate([fixed[1], mean]),
+                np.concatenate([fixed[2], variance]))
 
     def set_command(self, command):
         """g1_getup has no command: only (0, 0, 0) is accepted (the walking scenario runners set one)."""
@@ -449,7 +702,7 @@ class G1GetupEnv(G1VelocityEnv):
         if self.clip is not None:
             return self._clip_reset(options)
         if self.settle is not None:
-            return self._settle_reset(options)
+            return self._settle_reset(options, seed)
         bank = self.bank
         # The episode that just ended steps this world's assist down (assist_update); a set force replaces it. An
         # episode from a human start (human_starts) steps neither the assist nor the bound.
@@ -562,9 +815,10 @@ class G1GetupEnv(G1VelocityEnv):
         self.set_body_friction(friction)
 
     def _clip_reset(self, options):
-        """track_clip's reset: the start (a bank row, a clip frame or a training draw, TRACK_START_SHARES), its noise
-        (task.track_start_pose / track_start_speed; then raised out of the floor by its deepest contact), the
-        reference's alignment (a bank row: task.track_align; a clip start: none) and the clock at its frame; the
+        """track_clip's reset: the start (a bank row, a clip frame or a training draw, track_shares), its noise
+        (task.track_start_pose / track_start_speed times track_noise; then raised out of the floor by its deepest
+        contact), the reference's alignment (a bank row: task.track_align, to frame 0 or with track_bank_nearest to its
+        nearest frame, where its clock starts; a clip start: none) and the clock at its frame; the
         domain randomization as the getting-up reset's; no assist unless a probe sets one, no curriculum."""
         bank = self.bank
         if 'assist_force' in options:
@@ -579,59 +833,109 @@ class G1GetupEnv(G1VelocityEnv):
         if type(noisy) is not bool:
             raise ValueError('track_noise must be true or false')
         row, frame = -1, 0
-        if 'start' in options:
+        handover = None  # a hand-over start's (qpos, qvel, actions in flight, clock frame, row or -2)
+        if 'track_handover' in options:  # a row of the hand-over bank, or a probe's own state
+            if self.clip is None or self.clips is not None:
+                raise ValueError('track_handover needs task_config track_clip (one clip)')
+            if any(key in options for key in ('start', 'track_frame', 'track_clip_index')):
+                raise ValueError('track_handover does not go with start, track_frame or track_clip_index')
+            handover = self._handover_state(options['track_handover'])
+        # track_clips: the episode's clip (track_clip_index: a probe's; else a draw below, or a bank row's nearest).
+        index = options.get('track_clip_index')
+        if 'track_clip_index' in options:
+            if self.clips is None:
+                raise ValueError('track_clip_index needs task_config track_clips')
+            if isinstance(index, bool) or not isinstance(index, (int, np.integer)) or not 0 <= index < len(self.clips):
+                raise ValueError('track_clip_index must be a clip of track_clips')
+            if 'start' in options:
+                raise ValueError('track_clip_index does not go with start: a bank start takes its nearest clip')
+            self._select_clip(int(index))
+        if handover is not None:
+            kind = 'handover'
+        elif 'start' in options:
             kind, row = 'bank', options['start']
             if isinstance(row, bool) or not isinstance(row, (int, np.integer)) or not 0 <= row < len(bank['qpos']):
                 raise ValueError('start must be a row of the start bank')
         elif 'track_frame' in options:
+            if self.clips is not None and index is None:  # track_clips: the first clip's frame
+                index = 0
+                self._select_clip(0)
             kind, frame = 'frame', options['track_frame']
             if isinstance(frame, bool) or not isinstance(frame, (int, np.integer)) or not 0 <= frame <= self.clip_last:
                 raise ValueError('track_frame must be a frame of the clip')
-        elif 'assist_force' in options or 'pd_bound' in options:  # evaluation, probes: the clip's first frame
-            kind = 'clip'
+        elif 'assist_force' in options or 'pd_bound' in options or index is not None:
+            kind = 'clip'  # evaluation, probes: the clip's first frame (track_clips: a clip drawn uniformly)
+            if self.clips is not None and index is None:
+                index = int(self.np_random.integers(len(self.clips)))
+        elif self.track_handover is not None and self.np_random.random() < self.track_handover['share']:
+            # track_handover_starts: a training reset starts from a hand-over row with probability share, drawn
+            # first (nothing drawn without the setting), the other starts as track_starts' within the rest.
+            kind = 'handover'
+            handover = self._handover_state(int(self.np_random.integers(len(self.handover['qpos']))))
         else:  # a training reset draws its start
             draw = self.np_random.random()
-            shares = np.cumsum(task.TRACK_START_SHARES)
-            kind = task.TRACK_START_KINDS[int(np.searchsorted(shares, draw, side='right'))]
-            if kind == 'frame':
+            shares = np.cumsum(self.track_shares)
+            kind = task.TRACK_START_KINDS[min(int(np.searchsorted(shares, draw, side='right')), 2)]
+            if self.clips is not None and kind == 'frame':  # uniform over every clip's frames
+                clip, local = task.track_locate(np.array([self.np_random.integers(self.rsi_frames)]), self.rsi_starts)
+                index, frame = int(clip[0]), int(local[0])
+            elif self.clips is not None and kind == 'clip':  # the first frame of a clip drawn uniformly
+                index = int(self.np_random.integers(len(self.clips)))
+            elif kind == 'frame':
                 frame = int(self.np_random.integers(self.clip_last + 1))
             elif kind == 'bank':
-                if self.clip_rows is None:
-                    self.clip_rows = np.flatnonzero(~bank['holdout'] & (
-                        bank['start_class'] == bank['classes'].index(task.TRACK_BANK_CLASS)))
-                row = int(self.clip_rows[self.np_random.integers(len(self.clip_rows))])
+                row = int(self.track_rows[self.np_random.integers(len(self.track_rows))])
+        if self.clips is not None and kind != 'bank':
+            self._select_clip(index)
         noise = None
-        if kind != 'bank' and noisy:
+        if kind in ('clip', 'frame') and noisy:  # a bank or hand-over start is a state as it was: no noise
             noise = (self.np_random.uniform(-1., 1., task.TRACK_POSE_NOISE),
                      self.np_random.uniform(-1., 1., task.TRACK_SPEED_NOISE))
         self._randomize(options)
         if kind == 'bank':
             qpos, qvel = bank['qpos'][row].copy(), bank['qvel'][row].copy()
             qpos[3:7] /= np.linalg.norm(qpos[3:7])
+        elif kind == 'handover':  # the state as handed over, the first policy's actions still in flight
+            qpos, qvel, actions, frame, _ = handover
+            qpos[3:7] /= np.linalg.norm(qpos[3:7])
+            self.delay_actions = [actions[k].copy() if k < len(actions) else np.zeros(self.model.nu)
+                                  for k in range(len(self.delay_actions))]
         else:
             qpos = self.clip['qpos'][frame].copy()
             qvel = self.clip['qvel'][frame].copy() if kind == 'frame' else np.zeros(self.model.nv)
             if noise is not None:
-                qpos = task.track_start_pose(qpos[None], noise[0][None], self.range_low, self.range_high)[0]
-                qvel = task.track_start_speed(qvel[None], noise[1][None])[0]
+                qpos = task.track_start_pose(qpos[None], noise[0][None], self.range_low, self.range_high,
+                                             self.track_noise)[0]
+                qvel = task.track_start_speed(qvel[None], noise[1][None], self.track_noise)[0]
         self.data.qpos[:], self.data.qvel[:] = qpos, qvel
         mujoco.mj_forward(self.model, self.data)
         raised = 0.
-        if kind != 'bank':  # out of the floor by the deepest contact the noise (or the clip) left
+        if kind in ('clip', 'frame'):  # out of the floor by the deepest contact the noise (or the clip) left
             raised = -g1_getup_track.floor_depth(self.model, self.data, self.robot_geoms, self.floor)
             if raised > 0:
                 self.data.qpos[2] += raised
                 mujoco.mj_forward(self.model, self.data)
-        if kind == 'bank':
+        # A bank row and a hand-over start (its clock at the bank's frame, set above) align the reference under them.
+        if kind in ('bank', 'handover'):
+            if kind == 'bank' and self.clips is not None:  # track_clips: the nearest clip and frame
+                index, frame = self._bank_clip(row)
+                self._select_clip(index)
+            elif kind == 'bank' and self.track_nearest:  # the nearest clip frame (task.track_nearest_frame)
+                anchor = self.track_bodies[self.track_anchor]
+                frame = int(task.track_nearest_frame(
+                    task.projected_gravity(self.data.xmat[self.pelvis].reshape(1, 3, 3)),
+                    self.data.qpos[self.qadr][None], self.data.xpos[anchor, 2:3], self.clip_gravity, self.clip_joints,
+                    self.clip_anchor_height, self.nearest_joints)[0])
             yaw, offset = task.track_align(self.data.xpos[self.pelvis][None],
-                                           self.data.xmat[self.pelvis].reshape(1, 3, 3), self.clip_frames['pos'][0, 0],
-                                           self.clip_frames['rot'][0, 0])
+                                           self.data.xmat[self.pelvis].reshape(1, 3, 3),
+                                           self.clip_frames['pos'][frame, 0], self.clip_frames['rot'][frame, 0])
             self.clip_yaw, self.clip_offset = float(yaw[0]), offset[0].copy()
         else:
             self.clip_yaw, self.clip_offset = 0., np.zeros(2)
         self.clip_clock, self.clip_frame, self.clip_start = int(frame), int(frame), kind
         self.clip_reached = self.clip_clock >= self.clip_last
         self.human_start = None
+        self.handover_row = None if handover is None else handover[4]
         if kind == 'bank':
             self.start_row, self.start_class = int(row), bank['classes'][int(bank['start_class'][row])]
         else:
@@ -655,6 +959,16 @@ class G1GetupEnv(G1VelocityEnv):
         info = dict(x_position=float(self.data.qpos[0]), start=self.start_row, start_class=self.start_class,
                     assist_force=self.assist, body_friction=self.friction, head_height=self.head, pd_bound=self.bound,
                     track_start=kind, track_frame=self.clip_frame, track_lift=raised)
+        if handover is not None:  # the hand-over row (-2: a probe's own state) and, from the bank, its start class
+            info['track_handover'] = self.handover_row
+            if self.handover_row >= 0:
+                header = self.handover['header']
+                info['handover_class'] = header['classes'][int(self.handover['start_class'][self.handover_row])]
+        if self.clips is not None:  # track_clips: this episode's clip, its name and start class
+            entry = self.clips[self.clip_index]
+            info.update(track_clip_index=self.clip_index, track_clip=entry['name'],
+                        track_clip_class=task.TRACK_CLASSES[entry['start_class']] if entry['start_class'] >= 0
+                        else None)
         return self._observation('fill'), info
 
     def _clip_step(self, action):
@@ -662,7 +976,8 @@ class G1GetupEnv(G1VelocityEnv):
         one), each substep's impact / sole_impact speeds while weighted, its self-contact force (self_contact) and the
         floor's force on the hands; then the clock on, the tracking errors against the reference there
         (task.track_errors), the reward (task.track_reward_components), mjlab's terminations (task.track_terminated)
-        and, after the hold, the end."""
+        with track_end_reach's (task.track_reach_terminated; info track_end_reach, track_reach) and, after the hold,
+        the end."""
         unbounded = self.unbounded_action(action) if self.change_unbounded else None
         action = self.applied_action(action)
         target = self._target(action)
@@ -711,8 +1026,21 @@ class G1GetupEnv(G1VelocityEnv):
             self.soft_high, self.track_weights, self_contact=self_contact, impact=impact, sole_impact=sole_impact)
         components = {key: float(value[0]) for key, value in components.items()}
         grace = self.clip_start == 'bank' and self.steps <= self.clip_grace  # a bank start's limbs: not yet
+        body = None  # the anchor's rules: from the first step, but for track_handover_starts' grace
+        if self.clip_start == 'handover':  # a hand-over start's: longer (handover_grace)
+            grace = self.steps <= self.handover_grace
+            if self.handover_body:
+                body = np.array([not grace])
         failed = bool(task.track_terminated(robot[0], robot[1], reference[0], reference[1], self.track_anchor,
-                                            self.track_ends, np.array([not grace]))[0])
+                                            self.track_ends, np.array([not grace]), body)[0])
+        reach = None
+        if self.track_reach is not None:  # track_end_reach: an ankle too far from its place in the clip
+            distance = task.track_reach_distance(robot[0], robot[1], reference[0], reference[1], self.track_anchor,
+                                                 self.track_reach_bodies)
+            reach = dict(track_end_reach=bool(task.track_reach_terminated(distance, self.track_reach,
+                                                                          np.array([not grace]))[0]),
+                         track_reach=float(distance.max()))
+            failed = failed or reach['track_end_reach']
         self.clip_reached = self.clip_reached or self.clip_clock >= self.clip_last
         head = self._head()
         height, rotation = self.data.qpos[2:3], self.data.xmat[self.torso].reshape(1, 3, 3)
@@ -736,6 +1064,10 @@ class G1GetupEnv(G1VelocityEnv):
                     track_done=self.clip_reached, track_failed=failed, track_standing=standing,
                     hand_force=float(hand.max()),
                     track_errors={key: float(np.sqrt(value[0])) for key, value in errors.items()})
+        if self.clips is not None:
+            info['track_clip_index'] = self.clip_index
+        if reach is not None:  # the end's cause: track_failed without track_end_reach is mjlab's height rules alone
+            info.update(reach)
         return self._observation('push'), sum(components.values()), terminated, truncated, info
 
     def settle_errors(self):
@@ -745,10 +1077,24 @@ class G1GetupEnv(G1VelocityEnv):
                                   self.data.qpos[self.qadr][None], self.settle['gravity'], self.settle['position'],
                                   self.settle_joints)
 
-    def _settle_reset(self, options):
-        """settle_clip's reset: a bank row (option start, any row; else a training row of SETTLE_CLASSES), the domain
-        randomization as the getting-up reset's (_randomize), no assist unless a probe sets one, no curriculum."""
+    def _settle_reset(self, options, seed=None):
+        """settle_clip's reset: a bank row (option start, any row; else a training row of SETTLE_CLASSES, with
+        settle_starts of its classes), the domain randomization as the getting-up reset's (_randomize), no assist unless
+        a probe sets one, no curriculum. With settle_starts a training reset (no start, assist_force, pd_bound or
+        settle_target option) starts from a target pose with probability target instead (_target_start, its own
+        stream); the option settle_target (a target's index, or True: drawn) forces one (tests, probes)."""
         bank = self.bank
+        if self.settle_starts is not None and (seed is not None or self.settle_random is None):
+            self.settle_random = np.random.default_rng(None if seed is None else (seed, task.SETTLE_START_STREAM))
+        target = options.get('settle_target')
+        if 'settle_target' in options:
+            if 'start' in options:
+                raise ValueError('settle_target does not go with start')
+            if not (target is True or (not isinstance(target, bool) and isinstance(target, (int, np.integer))
+                                       and 0 <= target < len(self.settle['names']))):
+                raise ValueError('settle_target must be true or the index of a settle_clip target')
+            if self.settle_random is None:  # also without the setting (probes): a stream of its own
+                self.settle_random = np.random.default_rng(None if seed is None else (seed, task.SETTLE_START_STREAM))
         if 'assist_force' in options:
             force = options['assist_force']
             if isinstance(force, bool) or not isinstance(force, (int, float, np.floating)) or not np.isfinite(force) \
@@ -763,16 +1109,32 @@ class G1GetupEnv(G1VelocityEnv):
                 raise ValueError('start must be a row of the start bank')
         else:
             if self.settle_rows is None:
-                classes = [bank['classes'].index(kind) for kind in task.SETTLE_CLASSES if kind in bank['classes']]
+                classes = [bank['classes'].index(kind) for kind in self.settle_classes if kind in bank['classes']]
                 self.settle_rows = np.flatnonzero(~bank['holdout'] & np.isin(bank['start_class'], classes))
+                if not len(self.settle_rows):
+                    raise ValueError('settle_starts: the bank has no training rows of these classes')
             row = int(self.settle_rows[self.np_random.integers(len(self.settle_rows))])
+            training = not any(key in options for key in ('assist_force', 'pd_bound', 'settle_target'))
+            if self.settle_starts is not None and training \
+                    and self.settle_random.random() < self.settle_starts['target']:
+                target = True
+        if target is True:
+            target = int(self.settle_random.integers(len(self.settle['names'])))
+        noise = None
+        if target is not None:  # its noise drawn before _randomize, from its own stream
+            noise = (self.settle_random.uniform(-1., 1., task.TRACK_POSE_NOISE),
+                     self.settle_random.uniform(-1., 1., task.TRACK_SPEED_NOISE))
         self._randomize(options)
-        qpos = bank['qpos'][row].copy()
-        qpos[3:7] /= np.linalg.norm(qpos[3:7])
-        self.data.qpos[:], self.data.qvel[:] = qpos, bank['qvel'][row]
-        mujoco.mj_forward(self.model, self.data)
+        if target is None:
+            qpos = bank['qpos'][row].copy()
+            qpos[3:7] /= np.linalg.norm(qpos[3:7])
+            self.data.qpos[:], self.data.qvel[:] = qpos, bank['qvel'][row]
+            mujoco.mj_forward(self.model, self.data)
+            self.start_row, self.start_class = int(row), bank['classes'][int(bank['start_class'][row])]
+        else:
+            self._target_start(target, noise)
+            self.start_row, self.start_class = -1, task.SETTLE_TARGET_CLASS
         self.human_start = None
-        self.start_row, self.start_class = int(row), bank['classes'][int(bank['start_class'][row])]
         self.command[:] = 0
         self.fixed_command = True
         rotation = self.data.xmat[self.pelvis].reshape(3, 3)
@@ -795,7 +1157,29 @@ class G1GetupEnv(G1VelocityEnv):
         info = dict(x_position=float(self.data.qpos[0]), start=self.start_row, start_class=self.start_class,
                     assist_force=self.assist, body_friction=self.friction, head_height=self.head, pd_bound=self.bound,
                     settle_angle=float(np.degrees(angle[0, nearest])), settle_deviation=float(deviation[0, nearest]))
+        if self.settle_success is not None:
+            info['settle_arm_worst'] = float(self.settle_arm_worst()[0, nearest])
         return self._observation('fill'), info
+
+    def settle_arm_worst(self):
+        """(1, K) the largest |q − q0| over the free arm joints against each settle_clip target (task.settle_arm_worst,
+        settle_success's arm rule). Probes read it too."""
+        return task.settle_arm_worst(self.data.qpos[self.qadr][None], self.settle['position'], self.settle_arms)
+
+    def _target_start(self, target, noise):
+        """settle_starts' start: target `target`'s first frame at rest with the tracking starts' noise (noise: the
+        uniform draws of task.TRACK_POSE_NOISE and TRACK_SPEED_NOISE) times the setting's multiple (1 without it), then
+        raised out of the floor by its deepest contact, as a noisy track_clip start."""
+        scale = 1. if self.settle_starts is None else self.settle_starts['noise']
+        qpos = task.track_start_pose(self.settle['qpos'][target][None], noise[0][None], self.range_low, self.range_high,
+                                     scale)[0]
+        qvel = task.track_start_speed(np.zeros((1, self.model.nv)), noise[1][None], scale)[0]
+        self.data.qpos[:], self.data.qvel[:] = qpos, qvel
+        mujoco.mj_forward(self.model, self.data)
+        raised = -g1_getup_track.floor_depth(self.model, self.data, self.robot_geoms, self.floor)
+        if raised > 0:
+            self.data.qpos[2] += raised
+            mujoco.mj_forward(self.model, self.data)
 
     def _settle_step(self, action):
         """settle_clip's step: the getting-up step's action, delay queue, PD and substeps (the assist only if a probe set
@@ -845,10 +1229,11 @@ class G1GetupEnv(G1VelocityEnv):
             self.sole_impact_substeps.max(0)[None], task.GETUP_SOLE_IMPACT_SPEED)
         self_contact = None if self.self_force is None else task.self_contact_share(
             torch.from_numpy(self.self_force[None].copy())).numpy()
+        arm_worst = None if self.settle_success is None else self.settle_arm_worst()
         components, nearest, near = task.settle_reward_components(
             angle, pose, deviation, joint_velocity, self._velocity()[None], action[None], self.previous_action[None],
             position, self.soft_low, self.soft_high, self.settle_joints, self.settle_weights, self_contact=self_contact,
-            impact=impact, sole_impact=sole_impact)
+            impact=impact, sole_impact=sole_impact, arm_worst=arm_worst, success=self.settle_success)
         components = {key: float(value[0]) for key, value in components.items()}
         nearest = int(nearest[0])
         self.settle_count = int(task.settle_update(np.array([self.settle_count]), near, joint_velocity,
@@ -871,6 +1256,8 @@ class G1GetupEnv(G1VelocityEnv):
                     settle_angle=float(np.degrees(angle[0, nearest])), settle_deviation=float(deviation[0, nearest]),
                     settle_near=bool(near[0]), settle_count=self.settle_count, settle_done=self.settle_at is not None,
                     settle_seconds=self.settle_at, settle_target=self.settle_target)
+        if arm_worst is not None:
+            info['settle_arm_worst'] = float(arm_worst[0, nearest])
         return self._observation('push'), sum(components.values()), terminated, truncated, info
 
     def step(self, action):
